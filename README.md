@@ -1,535 +1,1579 @@
-# SO101 Closed-Loop Typing
+# SO-101 Closed-Loop Typing
 
-A closed-loop robotic typing system for the SO-101 arm using multi-camera perception, ACT-based motion policies, wrist-camera visual servoing, and screen-based visual self-verification.
+A hybrid learned/classical robotic typing system for the SO-101 arm,
+combining **ACT-based coarse motion**, **appearance-based key
+recognition**, **wrist-camera visual servoing**, and **independent
+screen-based verification**.
 
-## Overview
+The project is designed as a compact embodied-AI system in which learned
+policies and deterministic algorithms have explicit responsibilities,
+explicit interfaces, and observable handoff points.
 
-This project explores how a low-cost SO-101 robotic arm can perform reliable keyboard typing through a combination of:
+> **Core principle:** solve deterministic problems deterministically,
+> and use learning where learning provides real value.
 
-* visual perception
-* imitation learning
-* visual servoing
-* action chunking
-* multi-camera observation
-* screen-based result verification
-* automatic error recovery
+------------------------------------------------------------------------
 
-The goal is **not** to build the fastest robotic typist.
+## Project Goal
 
-The goal is to build a small but complete embodied control system that can:
+The goal is **not** to build the fastest robotic typist and **not** to
+hide the task behind a pre-programmed keyboard map.
 
-1. understand which key should be pressed,
-2. visually locate the keyboard and target key,
-3. move the SO-101 near the target using a learned policy,
-4. refine alignment through closed-loop visual servoing,
-5. physically press the key,
-6. observe the computer screen,
-7. determine whether the action succeeded,
-8. automatically recover from mistakes,
-9. continue until the requested text is correctly typed.
+The goal is to build a reliable and interpretable physical closed loop
+that can:
+
+1.  receive a target string such as `ROBOT`,
+2.  choose the next requested key,
+3.  use ACT to move the SO-101 into a useful local neighborhood,
+4.  visually recognize the requested key from its actual appearance,
+5.  hand control from ACT to a classical visual-servo controller,
+6.  align the physical tool with the target key,
+7.  press the key using a bounded deterministic motion,
+8.  observe the MacBook screen through an independent camera,
+9.  verify whether the intended character actually appeared,
+10. recover automatically from wrong key presses,
+11. repeat until the requested string is correct.
 
 A typical final task is:
 
-```text
+``` text
 TARGET: ROBOT
 ```
 
-The robot should eventually produce:
+and the robot should physically produce:
 
-```text
+``` text
 ROBOT
 ```
 
-on the target computer screen using only physical keyboard interaction.
+on the MacBook using only physical keyboard interaction.
 
----
+------------------------------------------------------------------------
 
-# Motivation
+## Current Project Status
 
-The original project explored robotic USB insertion.
+The project is no longer at the mechanical-feasibility stage.
 
-That task exposed an important limitation of the SO-101 platform: many manipulation tasks are dominated by mechanical constraints rather than perception or control.
+The current physical setup has already demonstrated:
 
-USB connectors and power plugs require reliable grasping, precise orientation, structural rigidity, and insertion force. These factors make it difficult to isolate and study the software topics that are the actual focus of this project.
+- a calibrated SO-101 follower/leader setup,
+- stable teleoperation,
+- a previous ACT block-manipulation demo,
+- a pencil mechanically attached to the gripper with cable ties,
+- successful physical MacBook key presses using that tool,
+- three simultaneous camera streams,
+- a fixed MacBook and robot workspace.
 
-The current project therefore intentionally avoids demanding grasping and insertion tasks.
+Therefore, the main engineering risk has shifted away from *“can the
+SO-101 physically press a key?”* toward:
 
-Instead, keyboard typing provides a low-force physical interaction task while still requiring a complete perception-action-feedback loop.
+- local visual recognition of key identity,
+- robust ACT-to-visual-servo handoff,
+- image-space closed-loop alignment,
+- screen verification,
+- runtime ownership and failure handling,
+- reproducible data collection and evaluation.
 
-The project is specifically intended to study:
+------------------------------------------------------------------------
 
-```text
-Perception
-    ↓
-State estimation
-    ↓
-Learned motion policy
-    ↓
-Visual servo correction
-    ↓
-Physical interaction
-    ↓
-Environmental observation
-    ↓
-Verification
-    ↓
-Recovery / next action
+## Research Questions
+
+The central research question is:
+
+> **Can a learned coarse-motion policy and a classical closed-loop
+> visual controller cooperate to perform reliable physical interaction,
+> while an independent visual observer verifies the real-world result
+> and drives recovery?**
+
+The project also studies several more specific questions:
+
+- Can ACT learn a **perception-aware approach pose** rather than needing
+  millimeter-level final accuracy?
+- Can classical vision recognize the requested key locally after ACT has
+  reduced the search space?
+- Can an image-based visual-servo controller reliably remove the
+  residual positioning error of a low-cost arm?
+- What is the best interface between a chunked learned policy and a
+  high-frequency deterministic controller?
+- Does independent screen verification substantially improve final task
+  success?
+- How do learned visual representations and explicit classical visual
+  features complement each other?
+- How much does visual servoing improve over ACT-only execution?
+
+Primary controller comparison:
+
+| System             | Learned coarse motion | Appearance-based local vision | Closed-loop fine correction | External screen verification | Recovery |
+|--------------------|----------------------:|------------------------------:|----------------------------:|-----------------------------:|---------:|
+| Classical baseline |                    No |                           Yes |                         Yes |                          Yes |      Yes |
+| ACT only           |                   Yes |            Limited/diagnostic |                          No |                          Yes |      Yes |
+| ACT + Visual Servo |                   Yes |                           Yes |                         Yes |                          Yes |      Yes |
+
+Possible future comparisons include SmolVLA and other learned policies,
+but they are not dependencies of V0.
+
+------------------------------------------------------------------------
+
+# Design Constraints
+
+## 1. Key identity must come from visual appearance
+
+A deliberate project constraint is:
+
+> **The system must not identify a key solely from a pre-encoded
+> keyboard layout or from its row/column position.**
+
+For example, the system should not conclude that a key is `F` only
+because it is the fourth key in a known row.
+
+Keyboard geometry may still be used for:
+
+- finding keycap candidates,
+- rejecting implausible contours,
+- grouping nearby keycaps,
+- geometric normalization,
+- estimating local orientation.
+
+However, the final key identity must be supported by the visible
+glyph/appearance of the key itself.
+
+This keeps the perception problem real and makes the interaction between
+learned and classical vision meaningful.
+
+## 2. V0 is a fixed-environment system
+
+The first reliable version intentionally assumes:
+
+- one fixed MacBook,
+- fixed laptop position,
+- fixed screen angle,
+- fixed robot base,
+- fixed camera mounts,
+- fixed lighting as far as practical,
+- fixed wrist-camera/tool geometry during a run.
+
+V0 is intended to establish a reliable closed loop before introducing
+generalization.
+
+## 3. Screen verification is external to the motor policy
+
+The screen camera is not part of the initial ACT observation.
+
+ACT should learn **how to approach a requested key**, not infer success
+from the MacBook display.
+
+The screen is observed by the supervisor after physical execution.
+
+------------------------------------------------------------------------
+
+# Hardware Setup
+
+## Robot
+
+- SO-101 arm
+- calibrated follower/leader system
+- Feetech servos
+- physical tool currently implemented as a pencil attached to the side
+  of the gripper with multiple cable ties
+- MacBook fixed in the workspace
+
+The current pencil mount is sufficient for V0 because physical key
+pressing has already been demonstrated.
+
+A rigid/custom printed mount can be introduced later to improve
+repeatability of the camera-to-tool transform, but it is not a
+prerequisite for starting the software pipeline.
+
+## Cameras
+
+The current three-camera configuration is:
+
+``` bash
+--robot.cameras='{
+  top: {
+    type: opencv,
+    index_or_path: 2,
+    width: 640,
+    height: 480,
+    fps: 30,
+    fourcc: "MJPG"
+  },
+  wrist: {
+    type: opencv,
+    index_or_path: 0,
+    width: 640,
+    height: 480,
+    fps: 30,
+    fourcc: "YUYV"
+  },
+  side: {
+    type: opencv,
+    index_or_path: 4,
+    width: 640,
+    height: 480,
+    fps: 30,
+    fourcc: "YUYV"
+  }
+}'
 ```
 
-The keyboard is the experimental environment, not the research objective itself.
+The logical name `side` is retained for compatibility with the existing
+setup, but in this project its primary role becomes **screen
+verification**.
 
----
+### Physical camera layout
 
-# Core Research Question
-
-The central question is:
-
-> Can a learned motion policy and classical visual servo controller work together to achieve reliable physical interaction, while external visual feedback is used to verify and recover from execution errors?
-
-The project compares different control strategies:
-
-```text
-Classical Control
-ACT
-ACT + Visual Servo
+``` text
+                         TOP CAMERA
+                             │
+                             ▼
+                 robot + keyboard workspace
+                             │
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+           SO-101                        MacBook
+              │                             │
+          WRIST CAMERA                  display
+              │                             ▲
+              ▼                             │
+       local keyboard                  SIDE CAMERA
+       / tool region                  (~45° allowed)
 ```
 
-with possible future comparison against:
+The current physical layout is considered suitable for V0.
 
-```text
-SmolVLA
-SmolVLA + Visual Servo
-```
+------------------------------------------------------------------------
 
-The primary architecture is intentionally modular so that the learned policy can later be replaced without redesigning the entire system.
+# Camera Responsibilities
 
----
+The cameras intentionally have asymmetric roles.
 
-# Target System
+## TOP — global learned-motion context
 
-The intended hardware configuration is:
+The TOP camera should prioritize visibility of:
 
-```text
-SO-101 Robot Arm
-        │
-        ├── Wrist Camera
-        │
-        ├── Workspace Camera
-        │
-        └── Screen Camera
-
-External MacBook
-        │
-        ├── Keyboard
-        └── Screen
-```
-
-The MacBook is treated as an external physical environment.
-
-The robot should not rely on operating-system keyboard events to determine whether typing succeeded.
-
-Instead, the system should visually observe the screen after each action.
-
-This creates a true external feedback loop:
-
-```text
-robot action
-    ↓
-physical key press
-    ↓
-computer state changes
-    ↓
-screen image changes
-    ↓
-camera observes result
-    ↓
-system decides next action
-```
-
----
-
-# Camera Roles
-
-The three cameras have different responsibilities.
-
-## Workspace Camera
-
-The workspace camera observes the complete keyboard and the approximate robot workspace.
-
-Its main responsibilities are:
-
-* detect keyboard location,
-* estimate keyboard orientation,
-* locate the approximate target key,
-* provide global spatial context,
-* tolerate moderate keyboard translation and rotation.
-
-It is responsible for answering:
-
-> Where should the robot go?
-
-The workspace camera is used mainly for coarse localization.
-
----
-
-## Wrist Camera
-
-The wrist camera observes the local area around the end effector.
-
-Its main responsibilities are:
-
-* detect the current target key,
-* estimate target-key center,
-* estimate local alignment error,
-* perform fine visual servo correction before pressing.
-
-It is responsible for answering:
-
-> How far am I from the exact target?
-
-The wrist camera is the primary sensor for precision control.
-
----
-
-## Screen Camera
-
-The screen camera observes a fixed region of the MacBook display.
-
-Its responsibilities are:
-
-* detect the typed-text region,
-* recognize currently displayed text,
-* verify whether the previous action succeeded,
-* provide feedback to the task supervisor.
+- the SO-101,
+- the keyboard,
+- the useful robot motion volume,
+- the spatial relationship between robot and laptop.
 
 It answers:
 
-> Did the robot actually do what it intended to do?
+> **Where should the robot move globally?**
 
-The screen camera is deliberately separated from the learned motor policy in the initial system.
+The TOP camera does **not** need to resolve individual glyphs.
 
-It acts as an external verification sensor.
+The MacBook display may remain visible in the TOP image. In the current
+geometry it is strongly overexposed, and physically hiding it is not
+worth sacrificing robot-workspace coverage.
 
----
+For experimental rigor, preprocessing should support an optional fixed
+screen mask:
+
+``` text
+TOP raw
+   │
+   ├── raw mode ──────────────► ACT
+   │
+   └── screen-mask mode ──────► ACT
+```
+
+This enables a later leakage/ablation experiment without changing the
+physical setup.
+
+## WRIST — local perception and precision control
+
+The WRIST camera is the primary precision sensor.
+
+It is responsible for:
+
+- observing a small neighborhood of keys,
+- detecting keycap candidates,
+- recognizing visible key glyphs,
+- finding the requested target key,
+- estimating the target center in image coordinates,
+- determining whether the target is suitable for controller handoff,
+- measuring image-space alignment error during visual servoing.
+
+It answers:
+
+> **Which key am I looking at, and how far is the tool from the desired
+> alignment?**
+
+The wrist camera is shared by ACT and classical perception, but the two
+consumers use it differently:
+
+``` text
+WRIST RGB
+   │
+   ├──► ACT
+   │      implicit visual representation
+   │      coarse approach behavior
+   │
+   └──► Classical Perception
+          explicit key candidates
+          explicit glyph labels
+          explicit pixel coordinates
+```
+
+## SIDE / SCREEN — independent outcome verification
+
+The SIDE camera is positioned as close to the MacBook screen as the
+robot workspace safely permits. A view around 45° is acceptable.
+
+It answers:
+
+> **Did the physical action actually produce the intended result?**
+
+Because the MacBook and camera are fixed, perspective distortion can be
+removed with a one-time screen homography:
+
+``` text
+SIDE raw frame
+      ↓
+fixed screen quadrilateral
+      ↓
+perspective rectification
+      ↓
+canonical screen image
+      ↓
+fixed text ROI
+      ↓
+OCR / text recognition
+      ↓
+observed string
+```
+
+The SIDE/SCREEN stream should remain outside the initial ACT
+observation.
+
+------------------------------------------------------------------------
 
 # System Architecture
 
-The initial architecture is:
+The primary architecture is:
 
-```text
-                    Target Text
-                     "ROBOT"
-                        │
-                        ▼
-                ┌────────────────┐
-                │ Task Supervisor│
-                └────────────────┘
-                        │
-                current target = R
-                        │
-              ┌─────────┴─────────┐
-              │                   │
-              ▼                   ▼
-     Workspace Perception    Screen Perception
-              │                   │
-      approximate target       OCR result
-              │                   │
-              ▼                   │
-             ACT                  │
-       coarse motion              │
-              │                   │
-              ▼                   │
-        Wrist Camera              │
-              │                   │
-              ▼                   │
-        Visual Servo              │
-         fine alignment           │
-              │                   │
-              ▼                   │
-            PRESS                 │
-              │                   │
-              └──── observe ──────┘
+``` text
+                         TARGET TEXT
+                           "ROBOT"
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │ Task Supervisor │
+                     └────────┬────────┘
+                              │
+                       target key = R
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+              ▼                               │
+      target-key encoding                     │
+              │                               │
+       TOP RGB + WRIST RGB                    │
+       + robot joint state                    │
+              │                               │
+              ▼                               │
+          ┌───────┐                           │
+          │  ACT  │                           │
+          └───┬───┘                           │
+              │ coarse joint actions          │
+              ▼                               │
+       perception-aware                       │
+        approach region                       │
+              │                               │
+              ▼                               │
+     WRIST KEY PERCEPTION                     │
+   keycaps → glyphs → target                  │
+              │                               │
+        target acquired?                      │
+              │ yes                           │
+              ▼                               │
+        CONTROLLER HANDOFF                    │
+      stop/reset ACT execution                │
+              │                               │
+              ▼                               │
+       VISUAL SERVO (XY)                      │
+              │                               │
+        alignment stable?                     │
+              │ yes                           │
+              ▼                               │
+      DETERMINISTIC PRESS                     │
+              │                               │
+              ▼                               │
+            RETRACT                           │
+              │                               │
+              └───────────────┐               │
+                              ▼               │
+                       SCREEN CAMERA           │
+                              │               │
+                    rectify + OCR              │
+                              │               │
+                success / wrong / uncertain   │
+                              │               │
+                              └───────────────►│
+                                      Task Supervisor
 ```
 
-The four major control components are intentionally separated.
+The important architectural property is **controller ownership**:
 
----
+- ACT owns coarse motion.
+- Visual servo owns fine XY alignment.
+- Press control owns the bounded downward/retract motion.
+- Screen perception never commands the robot directly.
+- The supervisor is the only module that changes high-level task state.
 
-# Responsibility of Each Module
+------------------------------------------------------------------------
+
+# Runtime State Machine
+
+The runtime should be implemented as an explicit state machine rather
+than a loose sequence of function calls.
+
+``` text
+IDLE
+  │
+  ▼
+SET_TARGET
+  │
+  ▼
+ACT_APPROACH
+  │
+  ├── target not visible / not ready ───────► continue ACT
+  │
+  ▼
+TARGET_ACQUIRED
+  │
+  ▼
+HANDOFF
+  │
+  ├── stop ACT
+  │
+  ├── clear pending action chunk
+  │
+  ├── refresh joint state
+  │
+  └── acquire fresh wrist frame
+  │
+  ▼
+SERVO_ALIGN
+  │
+  ├── target lost ─────────────► REACQUIRE
+  │
+  ├── timeout ─────────────────► RETRY / ABORT
+  │
+  ▼
+ALIGNED
+  │
+  ▼
+PRESS
+  │
+  ▼
+RETRACT
+  │
+  ▼
+WAIT_SCREEN
+  │
+  ▼
+VERIFY
+  │
+  ├── SUCCESS ────────────────► NEXT_TARGET
+  │
+  ├── WRONG ──────────────────► RECOVERY
+  │
+  └── UNCERTAIN ──────────────► REOBSERVE
+  │
+  ▼
+DONE
+```
+
+`TARGET_ACQUIRED` and `ALIGNED` are intentionally different states:
+
+- `TARGET_ACQUIRED`: the system knows where the requested key is in the
+  wrist image.
+- `ALIGNED`: the physical tool has converged to the calibrated press
+  reference.
+
+------------------------------------------------------------------------
+
+# Module Responsibilities and Interfaces
 
 ## Task Supervisor
 
-The supervisor manages the high-level task.
+The supervisor owns:
+
+- target string,
+- current expected character,
+- task progress,
+- controller transitions,
+- verification interpretation,
+- retry limits,
+- recovery sequence,
+- terminal success/failure.
 
 Example:
 
-```text
+``` text
 target = "ROBOT"
+
+R → O → B → O → T
 ```
 
-The supervisor decomposes it into:
+The learned policy does not need to understand the word `ROBOT`. It
+receives one requested primitive at a time.
 
-```text
-R
-O
+## Target Encoding
+
+Initial supported actions:
+
+``` text
+A-Z
+SPACE
+BACKSPACE
+```
+
+A simple symbolic encoding is sufficient for V0, for example:
+
+``` text
+A         → 0
+B         → 1
+...
+Z         → 25
+SPACE     → 26
+BACKSPACE → 27
+```
+
+The implementation may use one-hot or another low-dimensional encoding.
+
+The important requirement is that the target condition is explicitly
+recorded in the dataset and explicitly supplied to the policy at
+inference time.
+
+## ACT Coarse Controller
+
+ACT is responsible for:
+
+> **Move the robot from a valid initial configuration into a viewpoint
+> from which the requested key can be reliably acquired by the wrist
+> perception system.**
+
+This is intentionally different from:
+
+> move the pencil tip perfectly to the key center.
+
+Recommended ACT observations:
+
+``` text
+TOP RGB
+WRIST RGB
+robot joint state
+target-key condition
+```
+
+Recommended action:
+
+``` text
+SO-101 joint-position command / action chunk
+```
+
+The existing joint-space ACT path should be retained initially because
+the platform has already been demonstrated with ACT.
+
+### Perception-aware approach
+
+A successful ACT terminal state should make the next deterministic stage
+easy:
+
+- requested key is visible,
+- glyph is recognizable,
+- key is sufficiently large in the wrist image,
+- target is not heavily occluded by the pencil or arm,
+- target is not too close to the image boundary,
+- end effector remains at a safe pre-press height.
+
+This is a **perception-aware approach pose**.
+
+## ACT → Visual Servo Handoff
+
+The handoff must be triggered by perception, not by a fixed time or a
+fixed number of ACT steps.
+
+A conceptual observation is:
+
+``` python
+TargetObservation(
+    target="R",
+    detected=True,
+    bbox=(x, y, w, h),
+    center=(u, v),
+    class_confidence=0.96,
+    keycap_quality=0.93,
+    occluded=False,
+    stable=True,
+    servo_ready=True,
+)
+```
+
+A first `servo_ready` rule can require:
+
+``` text
+correct target label
+AND confidence >= threshold
+AND key size >= threshold
+AND center inside acquisition zone
+AND stable for N consecutive fresh frames
+```
+
+When `servo_ready` becomes true:
+
+1.  stop ACT,
+2.  clear/reset any pending ACT action chunk,
+3.  prevent any stale ACT action from reaching the robot,
+4.  read the latest robot state,
+5.  wait for/obtain a fresh wrist frame,
+6.  transfer exclusive control ownership to visual servo.
+
+This boundary is critical. ACT and visual servo must never command the
+robot concurrently in V0.
+
+------------------------------------------------------------------------
+
+# Wrist Key Perception
+
+The wrist perception problem is intentionally local.
+
+ACT reduces:
+
+``` text
+search the entire keyboard for R
+```
+
+to:
+
+``` text
+inspect a small local neighborhood and identify R
+```
+
+This is an important interaction between learning and classical
+perception: the learned policy actively creates an easier perception
+problem.
+
+## Proposed pipeline
+
+``` text
+WRIST YUYV frame
+       ↓
+grayscale / illumination normalization
+       ↓
+dark keycap segmentation
+       ↓
+morphology
+       ↓
+contours / connected components
+       ↓
+geometric keycap filtering
+       ↓
+quadrilateral fitting
+       ↓
+per-key perspective normalization
+       ↓
+canonical key crop
+       ↓
+glyph recognition
+       ↓
+label + confidence + center
+```
+
+### Keycap detection
+
+V0 should first attempt classical methods:
+
+- grayscale/intensity segmentation,
+- adaptive or fixed thresholding,
+- morphology,
+- contour extraction,
+- area/aspect-ratio filtering,
+- quadrilateral/rounded-rectangle geometry,
+- local consistency checks.
+
+A large object detector is not the default starting point because the
+current fixed MacBook scene has strong keycap/background contrast.
+
+### Glyph recognition
+
+The project should compare at least:
+
+1.  template matching,
+2.  HOG + linear SVM,
+3.  a small CNN.
+
+Recommended classification space:
+
+``` text
+A-Z + OTHER
+```
+
+`OTHER` prevents number keys and modifier keys from being forcibly
+classified as letters.
+
+For `SPACE` and `BACKSPACE`, dedicated visual handling may be required
+because they are not ordinary single-letter glyphs.
+
+### Important constraint
+
+Perspective rectification of an individual key is allowed.
+
+Pre-programmed row/column identity is not.
+
+The classifier must infer identity from visible appearance.
+
+------------------------------------------------------------------------
+
+# Visual Servo
+
+The visual-servo stage performs only local closed-loop alignment.
+
+V0 should separate:
+
+``` text
+XY ALIGNMENT
+    ↓
+ALIGNED
+    ↓
+Z PRESS
+```
+
+Do not simultaneously perform lateral correction and downward pressing.
+
+## Tool reference point
+
+The desired image location should not be assumed to be the center of the
+wrist image.
+
+Instead, calibrate a reference point:
+
+``` text
+p* = (u*, v*)
+```
+
+where `p*` is the observed target-key center when the physical pencil
+tip is correctly aligned above that key.
+
+For a detected target center:
+
+``` text
+p = (u, v)
+```
+
+the image error is:
+
+``` text
+e = p - p*
+```
+
+or:
+
+\[ e =
+\]
+
+The controller drives:
+
+\[ e \]
+
+## Local image Jacobian
+
+For V0, the local mapping from small Cartesian robot motion to image
+motion can be estimated experimentally.
+
+Apply small safe perturbations around a representative pre-press pose:
+
+``` text
++x
+-x
++y
+-y
+```
+
+and measure the corresponding target-center displacement in the wrist
+image.
+
+Estimate:
+
+\[ J =
+\]
+
+Then a local controller can use:
+
+\[ X = -J^{+} e \]
+
+with:
+
+- bounded Cartesian step size,
+- damping if necessary,
+- maximum iteration count,
+- convergence threshold,
+- target-loss handling,
+- fresh-frame requirement.
+
+The Cartesian correction can then be converted to safe robot commands
+through the chosen kinematic/IK path.
+
+## Alignment acceptance
+
+Do not declare alignment from one frame.
+
+A robust rule should require:
+
+``` text
+||e|| < epsilon
+for N consecutive fresh frames
+```
+
+before entering `PRESS`.
+
+------------------------------------------------------------------------
+
+# Deterministic Press Controller
+
+The press stage should not be learned in V0.
+
+Conceptually:
+
+``` text
+aligned pre-press pose
+        ↓
+bounded downward motion
+        ↓
+short hold
+        ↓
+retract to safe height
+```
+
+The controller must define:
+
+- maximum downward displacement,
+- maximum press duration,
+- speed/acceleration limits,
+- workspace bounds,
+- timeout behavior,
+- abort behavior.
+
+The pencil/tool should never move downward if target confidence or
+alignment state is invalid.
+
+------------------------------------------------------------------------
+
+# Screen Perception and Verification
+
+The screen camera is an independent observer.
+
+Because the SIDE camera may view the screen at approximately 45°, V0
+should explicitly rectify the screen before OCR.
+
+## Calibration
+
+Record the four screen corners once:
+
+``` text
+raw SIDE frame
+      ↓
+screen quadrilateral
+      ↓
+homography H_screen
+      ↓
+canonical screen
+```
+
+Then use a fixed typing ROI.
+
+## Verification states
+
+Screen verification should not be binary.
+
+Use:
+
+``` text
+CONFIRMED_SUCCESS
+CONFIRMED_WRONG
+UNCERTAIN
+```
+
+`UNCERTAIN` is important because an OCR fluctuation must not immediately
+trigger destructive recovery such as `BACKSPACE`.
+
+Example:
+
+``` text
+expected prefix: ROBO
+observed text:   ROBO
+
+→ CONFIRMED_SUCCESS
+```
+
+If the screen result is uncertain:
+
+``` text
+wait / reacquire / OCR again
+```
+
+rather than modifying the typed string immediately.
+
+------------------------------------------------------------------------
+
+# Automatic Recovery
+
+Recovery semantics belong to the supervisor.
+
+Example:
+
+``` text
+target   = ROBOT
+observed = ROBOR
+```
+
+Longest correct prefix:
+
+``` text
+ROBO
+```
+
+Recovery plan:
+
+``` text
+BACKSPACE
+T
+```
+
+Another example:
+
+``` text
+target   = ROBOT
+observed = ROXX
+```
+
+Longest correct prefix:
+
+``` text
+RO
+```
+
+Recovery plan:
+
+``` text
+BACKSPACE
+BACKSPACE
 B
 O
 T
 ```
 
-The learned policy does not need to understand the concept of a word.
+Division of responsibility:
 
-It only needs to execute a primitive such as:
-
-```text
-PRESS_KEY("R")
-```
-
-This separation makes the system easier to understand, test, and debug.
-
----
-
-## ACT
-
-ACT is responsible for learned coarse motor behavior.
-
-Example input:
-
-```text
-workspace image
-wrist image
-joint state
-target key condition
-```
-
-Example output:
-
-```text
-action chunk
-```
-
-The objective of ACT is not necessarily to land perfectly on the center of a key.
-
-Instead, ACT should learn to move the robot into a useful neighborhood around the target.
-
-A possible target condition can be represented as:
-
-```text
-A = 0
-B = 1
-...
-Z = 25
-SPACE = 26
-BACKSPACE = 27
-```
-
-The first implementation therefore does not require natural-language conditioning.
-
----
-
-## Visual Servo
-
-Visual servoing performs local closed-loop correction.
-
-Suppose the wrist camera detects:
-
-```text
-target key center = (u_t, v_t)
-tool reference    = (u_e, v_e)
-```
-
-The image-space error is:
-
-```text
-e = [
-    u_t - u_e,
-    v_t - v_e
-]
-```
-
-The controller repeatedly performs:
-
-```text
-observe
-   ↓
-measure image error
-   ↓
-command small motion
-   ↓
-observe again
-```
-
-until the alignment error is below a defined threshold.
-
-Only then should the system press the key.
-
-The initial implementation should use staged control:
-
-```text
-ACT
- ↓
-Visual Servo
- ↓
-PRESS
-```
-
-rather than combining both control outputs continuously.
-
-A later experiment may investigate residual control:
-
-```text
-u = u_ACT + λ u_VS
-```
-
----
-
-# Screen Verification
-
-After each key press, the robot does not assume that the action succeeded.
-
-Instead:
-
-```text
-press key
-   ↓
-wait for screen update
-   ↓
-capture screen image
-   ↓
-OCR
-   ↓
-compare observed text with target
-```
-
-For example:
-
-```text
-target:
-ROBOT
-
-observed:
-ROBO
-```
-
-The supervisor determines that the next expected key is:
-
-```text
-T
-```
-
-and continues.
-
----
-
-# Automatic Error Recovery
-
-Recovery is automatic, but its semantics are deterministic.
-
-The system must know that:
-
-```text
-BACKSPACE
-```
-
-removes the previous character.
-
-ACT does not need to understand the linguistic meaning of deletion.
-
-ACT only needs to learn how to physically press the Backspace key when requested.
-
-For example:
-
-```text
-target   = ROBOT
-observed = ROBOR
-```
-
-The longest correct prefix is:
-
-```text
-ROBO
-```
-
-Therefore the supervisor generates:
-
-```text
-PRESS_BACKSPACE
-PRESS_T
-```
-
-Another example:
-
-```text
-target   = ROBOT
-observed = ROXX
-```
-
-The correct prefix is:
-
-```text
-RO
-```
-
-The supervisor generates:
-
-```text
-PRESS_BACKSPACE
-PRESS_BACKSPACE
-PRESS_B
-PRESS_O
-PRESS_T
-```
-
-Recovery logic therefore belongs to the task supervisor rather than ACT.
-
-The division of responsibility is:
-
-```text
-OCR
+``` text
+Screen Perception
 "What happened?"
 
 Supervisor
 "What should happen next?"
 
 ACT
-"How do I approximately perform that action?"
+"How do I move into a useful neighborhood?"
+
+Wrist Perception
+"Which visible key is the requested key?"
 
 Visual Servo
-"How do I execute it accurately?"
+"How do I remove the remaining local alignment error?"
+
+Press Controller
+"How do I execute the physical press safely?"
 ```
 
----
+------------------------------------------------------------------------
 
-# Initial Supported Keys
+# Camera Calibration and Sanity Checks
 
-The first version should intentionally support only:
+Before collecting the typing dataset, freeze the camera positions and
+validate all three roles.
 
-```text
-A-Z
-SPACE
-BACKSPACE
+## Camera position acceptance
+
+### TOP
+
+Pass if:
+
+- keyboard remains visible,
+- useful robot workspace remains visible,
+- normal arm elevation does not destroy the majority of useful context,
+- the camera mount is mechanically stable.
+
+The screen does not need to be physically removed from view.
+
+### WRIST
+
+Pass if:
+
+- near an intended handoff pose, several local keys are visible,
+- glyphs contain enough pixels for classification,
+- the pencil/arm does not consistently hide the requested key,
+- the camera-to-tool relationship remains stable during a run.
+
+### SIDE / SCREEN
+
+Pass if:
+
+- the robot never collides with or requires the screen camera’s space,
+- the relevant screen region remains visible,
+- text remains recoverable after perspective rectification,
+- exposure can be configured for readable screen text.
+
+## Exposure and focus
+
+Where supported, prefer stable settings for:
+
+- exposure,
+- gain,
+- white balance,
+- focus.
+
+Each camera should be optimized for its own role rather than forced to
+share identical settings.
+
+- TOP: robot + keyboard context
+- WRIST: black keycaps + white glyph detail
+- SIDE: display text
+
+## TOP screen-leakage test
+
+Physical masking is not required.
+
+For rigor, keep a software mask option and test whether the overexposed
+TOP display still carries measurable information.
+
+Example test states:
+
+``` text
+blank
+R
+RO
+ROB
+ROBOT
 ```
 
-Future versions may add:
+with the robot fixed.
 
-```text
-ENTER
-SHIFT
-numbers
-punctuation
+Measure within the TOP screen ROI:
+
+- saturated-pixel ratio,
+- mean/std,
+- frame-to-frame noise,
+- inter-state pixel differences.
+
+If the states are indistinguishable from noise, raw TOP can be used with
+evidence that the screen carries no practical task signal.
+
+If they remain distinguishable, enable the fixed software mask for ACT.
+
+------------------------------------------------------------------------
+
+# Timing, Freshness, and Controller Ownership
+
+Visual servoing is more sensitive to latency than coarse ACT motion.
+
+Every camera frame used by the runtime should carry:
+
+``` text
+camera_name
+frame_id
+capture_timestamp
+processing_timestamp
+frame_age_ms
 ```
 
-The initial task length should also remain small.
+Robot commands should carry:
 
-Recommended first target:
-
-```text
-1-5 characters
+``` text
+command_timestamp
+controller_owner
+sequence_id
 ```
 
-Example tasks:
+The servo controller should reject frames that are too old.
 
-```text
+This prevents a failure mode such as:
+
+``` text
+robot moves
+   ↓
+controller processes an old image
+   ↓
+computes correction for the previous pose
+   ↓
+oscillation / wrong correction
+```
+
+At any instant, exactly one motion controller should own robot commands.
+
+------------------------------------------------------------------------
+
+# Recommended Runtime Data Contracts
+
+These are conceptual contracts; exact implementation may use
+dataclasses, Pydantic models, or typed dictionaries.
+
+## `TargetObservation`
+
+``` python
+@dataclass
+class TargetObservation:
+    target: str
+    detected: bool
+    bbox: tuple[int, int, int, int] | None
+    center: tuple[float, float] | None
+    class_confidence: float
+    keycap_quality: float
+    occluded: bool
+    stable: bool
+    servo_ready: bool
+    frame_id: int
+    timestamp: float
+```
+
+## `AlignmentResult`
+
+``` python
+@dataclass
+class AlignmentResult:
+    converged: bool
+    error_px: tuple[float, float]
+    error_norm_px: float
+    iterations: int
+    elapsed_s: float
+    target_confidence: float
+    timeout: bool
+```
+
+## `PressResult`
+
+``` python
+@dataclass
+class PressResult:
+    completed: bool
+    downward_command: float
+    hold_s: float
+    retracted: bool
+    timeout: bool
+```
+
+## `VerificationResult`
+
+``` python
+class VerificationStatus(Enum):
+    CONFIRMED_SUCCESS = "confirmed_success"
+    CONFIRMED_WRONG = "confirmed_wrong"
+    UNCERTAIN = "uncertain"
+
+@dataclass
+class VerificationResult:
+    status: VerificationStatus
+    observed_text: str
+    confidence: float
+    frame_id: int
+    timestamp: float
+```
+
+------------------------------------------------------------------------
+
+# Event Logging and Replay
+
+Every key attempt should produce a trace that can be inspected after
+failure.
+
+Example:
+
+``` text
+target=R
+
+0.000  state=ACT_APPROACH
+0.033  act_action=[...]
+1.820  target=R confidence=0.91 center=(411,231)
+1.821  transition=ACT_APPROACH->HANDOFF
+1.830  act_queue=cleared
+1.850  transition=HANDOFF->SERVO_ALIGN
+1.870  servo_error=(+34,-19)
+1.930  servo_error=(+22,-12)
+2.040  servo_error=(+5,-3)
+2.105  servo_error=(+1,+1)
+2.205  transition=SERVO_ALIGN->PRESS
+2.600  press=complete
+3.010  screen_text="R"
+3.011  verification=CONFIRMED_SUCCESS
+```
+
+Recommended logged signals:
+
+- state transitions,
+- target key,
+- ACT actions,
+- joint observations,
+- frame IDs/timestamps,
+- target detections,
+- confidence values,
+- servo errors,
+- controller ownership,
+- press commands,
+- OCR output,
+- recovery decisions,
+- failure reason.
+
+A replay/debug viewer is highly valuable for both engineering and the
+final demonstration.
+
+------------------------------------------------------------------------
+
+# Dataset Design
+
+## Wrist perception dataset
+
+Before training a new ACT typing policy, collect a small dedicated wrist
+dataset.
+
+For each target region:
+
+- move the robot near different letters through teleoperation,
+- vary XY offset,
+- vary safe pre-press height slightly,
+- include moderate viewpoint variation,
+- include partial occlusion,
+- collect non-letter keys for `OTHER`.
+
+The first goal is not large-scale learning. It is to measure whether
+keycap detection and glyph recognition are reliable under the actual
+wrist-camera distribution.
+
+Evaluate:
+
+``` text
+Template Matching
+vs
+HOG + Linear SVM
+vs
+Tiny CNN
+```
+
+using held-out frames/episodes rather than adjacent frames from the same
+recording whenever possible.
+
+## ACT typing dataset
+
+After the local deterministic loop is reliable, collect
+target-conditioned demonstrations.
+
+Recommended policy observations:
+
+``` text
+observation.top
+observation.wrist
+robot joint state
+target-key condition
+```
+
+Recommended action:
+
+``` text
+SO-101 joint command
+```
+
+Do not include the SIDE/SCREEN camera in the initial policy input.
+
+### Demonstration endpoint
+
+Teleoperation demonstrations should end at a **servo-ready viewpoint**,
+not at an arbitrary pose and not necessarily at physical contact.
+
+Good endpoints have:
+
+- target visible,
+- target recognizable,
+- useful target pixel size,
+- limited tool occlusion,
+- safe press clearance.
+
+This teaches ACT to hand the problem to classical perception rather than
+to solve the entire contact task itself.
+
+------------------------------------------------------------------------
+
+# Development Roadmap
+
+The roadmap is updated to reflect the current physical progress.
+
+## Phase 0 — Mechanical Feasibility — **Completed**
+
+Goal:
+
+> Verify that the existing SO-101/tool setup can physically press
+> MacBook keys.
+
+Already demonstrated through teleoperation.
+
+No redesign of the end effector is required before software work begins.
+
+------------------------------------------------------------------------
+
+## Phase 1 — Freeze Camera Geometry and Build Camera Sanity Tool
+
+Goal:
+
+> Validate the final physical camera layout and all preprocessing
+> assumptions.
+
+Implement a tool that displays:
+
+``` text
+TOP raw
+TOP optional screen mask / leakage statistics
+
+WRIST raw
+WRIST candidate keycap overlays
+
+SIDE raw
+SIDE rectified screen
+SIDE text ROI
+```
+
+Acceptance:
+
+- all three cameras stable at 30 FPS under the intended configuration,
+- TOP covers useful robot/keyboard workspace,
+- WRIST resolves local keycaps/glyphs,
+- SIDE rectification produces readable screen text,
+- frame timestamps are available,
+- camera mounts are frozen after acceptance.
+
+------------------------------------------------------------------------
+
+## Phase 2 — Wrist Keycap Detection and Glyph Recognition
+
+Goal:
+
+> Given a wrist frame and a requested character, visually locate that
+> character without using a pre-programmed keyboard-position identity.
+
+Implement:
+
+``` text
+keycap segmentation
+      ↓
+candidate extraction
+      ↓
+per-key rectification
+      ↓
+glyph recognition
+      ↓
+TargetObservation
+```
+
+Compare:
+
+``` text
+Template Matching
+HOG + SVM
+Tiny CNN
+```
+
+Acceptance should measure:
+
+- keycap detection precision/recall,
+- character classification accuracy,
+- target acquisition success rate,
+- false acquisition rate,
+- confidence calibration,
+- performance under small pose/exposure variations.
+
+------------------------------------------------------------------------
+
+## Phase 3 — Tool Reference and Visual Servo
+
+Goal:
+
+> Starting from a teleoperated local pose, converge the target key to
+> the calibrated tool reference point.
+
+Tasks:
+
+1.  calibrate `p*`,
+2.  estimate local image Jacobian,
+3.  implement bounded XY correction,
+4.  reject stale frames,
+5.  detect target loss,
+6.  require stable multi-frame convergence.
+
+Acceptance should include:
+
+- convergence rate,
+- final pixel error,
+- convergence time,
+- servo iterations,
+- failure/timeout rate,
+- no unsafe downward motion.
+
+No ACT is required for this phase.
+
+------------------------------------------------------------------------
+
+## Phase 4 — Screen Rectification and Verification
+
+Goal:
+
+> Reliably determine whether a physical key press changed the screen as
+> expected.
+
+Pipeline:
+
+``` text
+SIDE
+  ↓
+screen homography
+  ↓
+canonical screen
+  ↓
+fixed typing ROI
+  ↓
+OCR / text recognition
+  ↓
+SUCCESS / WRONG / UNCERTAIN
+```
+
+Acceptance:
+
+- controlled test strings,
+- stable perspective rectification,
+- high character recognition accuracy,
+- low false-WRONG rate,
+- explicit uncertainty behavior.
+
+------------------------------------------------------------------------
+
+## Phase 5 — Deterministic Local Single-Key Closed Loop
+
+Goal:
+
+> From a safe pose near a requested key, visually acquire, align, press,
+> retract, and verify one character.
+
+Example:
+
+``` text
+target=G
+   ↓
+wrist recognizes G
+   ↓
+visual servo
+   ↓
+aligned
+   ↓
+press
+   ↓
+retract
+   ↓
+screen verify
+   ↓
+SUCCESS
+```
+
+This proves the local perception-action-verification loop before learned
+coarse motion is introduced.
+
+------------------------------------------------------------------------
+
+## Phase 6 — Target-Conditioned ACT Dataset
+
+Goal:
+
+> Collect demonstrations that move the arm from valid starts to
+> perception-aware handoff poses.
+
+Record:
+
+- TOP RGB,
+- WRIST RGB,
+- joint state,
+- target key,
+- action,
+- timestamps.
+
+The target condition must be part of every episode’s data schema.
+
+Do not include screen-camera pixels in the ACT observation.
+
+------------------------------------------------------------------------
+
+## Phase 7 — ACT Coarse Policy
+
+Goal:
+
+> Given TOP + WRIST + robot state + requested key, move to a servo-ready
+> local viewpoint.
+
+Evaluate:
+
+- target-neighborhood arrival rate,
+- target acquisition rate after ACT,
+- servo-ready rate,
+- target visibility,
+- target pixel size,
+- occlusion rate,
+- time to handoff.
+
+ACT does not need to press the key.
+
+------------------------------------------------------------------------
+
+## Phase 8 — ACT + Visual Servo Handoff
+
+Goal:
+
+> Integrate the learned and deterministic controllers without command
+> overlap.
+
+Pipeline:
+
+``` text
+ACT_APPROACH
+     ↓
+target perception
+     ↓
+servo_ready
+     ↓
+flush/reset ACT
+     ↓
+SERVO_ALIGN
+     ↓
+PRESS
+     ↓
+SCREEN_VERIFY
+```
+
+Acceptance must explicitly test:
+
+- no stale ACT commands after handoff,
+- deterministic controller ownership,
+- target reacquisition behavior,
+- handoff success rate,
+- end-to-end single-key success rate.
+
+------------------------------------------------------------------------
+
+## Phase 9 — Multi-Key Typing
+
+Goal:
+
+> Repeatedly execute the single-key primitive for short strings.
+
+Initial examples:
+
+``` text
 CAT
 DOG
 HELLO
@@ -537,597 +1581,192 @@ ROBOT
 VISION
 ```
 
----
+Verify after every character.
 
-# Keyboard Setup
+------------------------------------------------------------------------
 
-The first version should use a fixed MacBook keyboard.
-
-Recommended constraints:
-
-* fixed laptop position,
-* fixed screen angle,
-* fixed camera mounts,
-* fixed keyboard layout,
-* predictable lighting,
-* large screen font,
-* dedicated typing application.
-
-The purpose of V0 is not generalization.
-
-The purpose is to establish a reliable closed-loop system.
-
-Generalization should be introduced only after the basic pipeline works.
-
----
-
-# Screen Application
-
-A simple dedicated application or webpage should display:
-
-```text
-TARGET
-
-ROBOT
-
-
-TYPED
-
-ROBO
-```
-
-The text should initially use:
-
-* large font,
-* high contrast,
-* fixed position,
-* fixed background,
-* fixed screen ROI.
-
-The screen perception pipeline can therefore begin with a controlled OCR problem.
-
-Later versions may introduce:
-
-* different font sizes,
-* different themes,
-* changed window positions,
-* variable screen brightness.
-
----
-
-# End Effector
-
-The project should not depend on grasping.
-
-A simple fixed pressing tool should be attached to the SO-101 gripper.
-
-Possible tools include:
-
-* pen,
-* stylus,
-* plastic rod,
-* rubber-tipped pointer,
-* lightweight custom printed tip.
-
-The tool should remain mechanically fixed relative to the wrist camera.
-
-The end-effector reference point should therefore be stable and visually identifiable.
-
----
-
-# Development Roadmap
-
-## Phase 0 — Mechanical Feasibility
+## Phase 10 — Automatic Recovery
 
 Goal:
 
-> Verify that SO-101 can reliably press a MacBook key using a fixed tool.
+> Detect incorrect physical outcomes and repair them automatically.
 
-No perception.
+Evaluate:
 
-No ACT.
+- wrong-key detection,
+- uncertain OCR handling,
+- recovery success rate,
+- average corrective actions,
+- final corrected-string accuracy.
 
-No visual servo.
+------------------------------------------------------------------------
 
-Acceptance criteria:
+## Phase 11 — Controlled Generalization and Ablations
 
-```text
-manual / teleoperation key presses
-≥ 30 trials
-no unstable grasping
-no excessive force required
-repeatable key activation
-```
+Only after the fixed setup is reliable.
 
-If this phase fails, software development should stop until the physical setup is corrected.
+Candidate experiments:
 
----
+- robot initial configuration variation,
+- small camera perturbations,
+- lighting variation,
+- keyboard translation,
+- keyboard rotation,
+- unseen target strings,
+- TOP raw vs TOP screen-masked,
+- ACT only vs visual servo only vs ACT + visual servo,
+- template vs HOG/SVM vs tiny CNN,
+- different ACT handoff thresholds,
+- different servo gains and step bounds.
 
-## Phase 1 — Screen Perception
-
-Goal:
-
-> Reliably determine what text appears on the screen.
-
-Pipeline:
-
-```text
-screen camera
-     ↓
-fixed ROI
-     ↓
-image preprocessing
-     ↓
-OCR
-     ↓
-observed string
-```
-
-Acceptance criteria:
-
-```text
-known test strings
-≥ 99% character recognition
-under controlled lighting
-```
-
----
-
-## Phase 2 — Workspace Keyboard Detection
-
-Goal:
-
-> Determine the approximate position of a requested key.
-
-Input:
-
-```text
-workspace camera image
-target key
-```
-
-Output:
-
-```text
-approximate key location
-```
-
-Initial keyboard pose may remain fixed.
-
-Later tests should include:
-
-```text
-keyboard translation
-keyboard rotation
-camera variation
-```
-
----
-
-## Phase 3 — Wrist Visual Servo
-
-Goal:
-
-> Move the tool to the center of a target key using only closed-loop image feedback.
-
-No ACT yet.
-
-Pipeline:
-
-```text
-target key detected
-        ↓
-pixel error
-        ↓
-small robot motion
-        ↓
-new image
-        ↓
-repeat
-```
-
-Acceptance criteria should include:
-
-```text
-final pixel error
-alignment success rate
-number of servo iterations
-time to convergence
-```
-
----
-
-## Phase 4 — Single-Key Closed Loop
-
-Goal:
-
-> Press one requested key and visually verify the result from the screen.
-
-Example:
-
-```text
-target = G
-
-workspace detection
-      ↓
-coarse motion
-      ↓
-wrist visual servo
-      ↓
-press G
-      ↓
-screen OCR
-      ↓
-"G"
-      ↓
-SUCCESS
-```
-
-This is the first complete system milestone.
-
----
-
-## Phase 5 — Multi-Key Typing
-
-Goal:
-
-> Type a short string using repeated execution of the single-key primitive.
-
-Example:
-
-```text
-target = CAT
-```
-
-Execution:
-
-```text
-C
-verify
-A
-verify
-T
-verify
-```
-
-The system should verify every character rather than waiting until the entire word is complete.
-
----
-
-## Phase 6 — Automatic Error Recovery
-
-Goal:
-
-> Detect mistakes and automatically repair them.
-
-Examples:
-
-```text
-TARGET: CAT
-TYPED : CAR
-```
-
-Recovery:
-
-```text
-BACKSPACE
-T
-```
-
-And:
-
-```text
-TARGET: ROBOT
-TYPED : ROXX
-```
-
-Recovery:
-
-```text
-BACKSPACE
-BACKSPACE
-B
-O
-T
-```
-
-Metrics should include:
-
-```text
-error detection accuracy
-recovery success rate
-average recovery actions
-final task success rate
-```
-
----
-
-## Phase 7 — ACT Dataset Collection
-
-After the deterministic closed-loop system works, teleoperation demonstrations can be collected.
-
-Recommended observations:
-
-```text
-workspace RGB
-wrist RGB
-joint positions
-joint velocities
-target key
-```
-
-Recommended action:
-
-```text
-SO-101 joint command
-```
-
-The screen camera should not initially be included in the ACT observation.
-
-Screen perception belongs to the external supervisor.
-
----
-
-## Phase 8 — ACT Policy
-
-Train ACT to perform coarse key-approach motion.
-
-The expected behavior is:
-
-```text
-arbitrary start configuration
-        ↓
-ACT
-        ↓
-move near requested key
-```
-
-ACT does not need perfect final accuracy.
-
-Fine alignment remains the responsibility of visual servoing.
-
----
-
-## Phase 9 — ACT + Visual Servo
-
-Final primary architecture:
-
-```text
-ACT
- ↓
-coarse target neighborhood
- ↓
-switch controller
- ↓
-Visual Servo
- ↓
-fine alignment
- ↓
-PRESS
- ↓
-Screen Verification
-```
-
-The system should compare:
-
-```text
-ACT only
-Visual Servo only
-ACT + Visual Servo
-```
-
----
+------------------------------------------------------------------------
 
 # Evaluation
 
-The project should emphasize quantitative evaluation.
+## End-to-End Typing
 
-## Typing Metrics
+Measure:
 
-```text
-character success rate
+``` text
+single-key success rate
+character success rate before recovery
+character success rate after recovery
 word success rate
 final task success rate
 characters per minute
 average retries per character
 ```
 
----
+## Wrist Perception
 
-## Visual Servo Metrics
+Measure:
 
-```text
+``` text
+keycap detection precision / recall
+glyph classification accuracy
+target acquisition success rate
+false target acquisition rate
+confidence
+target pixel size at acquisition
+occlusion rate
+```
+
+## ACT
+
+Measure:
+
+``` text
+coarse approach success rate
+servo-ready handoff rate
+target visibility after ACT
+target pixel size after ACT
+approach time
+failure / timeout rate
+```
+
+## Visual Servo
+
+Measure:
+
+``` text
 initial pixel error
 final pixel error
 servo iterations
 convergence time
-failure rate
+convergence rate
+target-loss rate
 ```
 
----
+## Verification and Recovery
 
-## Learned Policy Metrics
+Measure:
 
-```text
-coarse approach success rate
-distance to target after ACT
-out-of-distribution success rate
-```
-
----
-
-## Recovery Metrics
-
-```text
-error detection accuracy
-successful recovery rate
-number of corrective actions
+``` text
+screen OCR accuracy
+false SUCCESS rate
+false WRONG rate
+UNCERTAIN rate
+recovery success rate
+corrective action count
 final corrected-string accuracy
 ```
 
----
-
-# Generalization Experiments
-
-After the base system becomes reliable, introduce controlled perturbations.
-
-## Keyboard Translation
-
-```text
-±1 cm
-±3 cm
-±5 cm
-```
-
-## Keyboard Rotation
-
-```text
-±2°
-±5°
-±10°
-```
-
-## Robot Initial Configuration
-
-Randomize initial joint positions within a safe region.
-
-## Camera Variation
-
-Introduce small changes in camera position.
-
-## Target Strings
-
-Evaluate strings not present during demonstration collection.
-
-For example:
-
-```text
-training demonstrations:
-CAT
-DOG
-HELLO
-
-evaluation:
-ROBOT
-VISION
-OPENAI
-```
-
-The important distinction is that evaluation should test composition of known key-press skills rather than memorization of complete word trajectories.
-
----
-
-# Controller Comparison
-
-One of the primary experiments is:
-
-| System    | Learned Motion | Visual Feedback | External Verification | Recovery |
-| --------- | -------------- | --------------- | --------------------- | -------- |
-| Classical | No             | Yes             | Yes                   | Yes      |
-| ACT       | Yes            | Limited         | Yes                   | Yes      |
-| ACT + VS  | Yes            | Yes             | Yes                   | Yes      |
-
-Possible future extension:
-
-| System       | Language Conditioned |
-| ------------ | -------------------- |
-| ACT          | No / symbolic target |
-| SmolVLA      | Yes                  |
-| SmolVLA + VS | Yes                  |
-
-This allows the project to investigate whether learned action policies and classical feedback controllers provide complementary capabilities.
-
----
-
-# Why ACT First?
-
-The initial project uses ACT rather than a VLA because the high-level language problem is simple and deterministic.
-
-For example:
-
-```text
-"ROBOT"
-```
-
-can be decomposed programmatically into:
-
-```text
-R
-O
-B
-O
-T
-```
-
-There is little benefit in asking a large vision-language-action model to discover this decomposition.
-
-The difficult part is physical execution.
-
-ACT therefore provides a simpler platform for studying:
-
-* demonstration collection,
-* action chunking,
-* learned motion priors,
-* visual generalization,
-* hybrid learned/classical control.
-
-A VLA such as SmolVLA can later be introduced as an additional experiment rather than a dependency of the core system.
-
----
-
-# Non-Goals
-
-The initial project does **not** attempt to solve:
-
-* high-speed robotic typing,
-* arbitrary keyboards,
-* arbitrary laptop models,
-* arbitrary camera placement,
-* unrestricted natural-language instruction following,
-* dexterous grasping,
-* force-controlled manipulation,
-* human-level typing speed,
-* end-to-end VLA control.
-
-These may become future experiments.
-
-The first objective is reliability and interpretability.
-
----
+------------------------------------------------------------------------
 
 # Safety
 
-The SO-101 should operate at conservative speed and acceleration limits.
+The robot operates directly above a laptop, so all motion near the
+keyboard must be bounded.
 
-The pressing tool must not contain sharp or conductive surfaces that could damage the laptop.
+Required safeguards:
 
-The system should define:
-
-```text
+``` text
 joint limits
 workspace limits
-maximum downward motion
+maximum Cartesian correction per servo iteration
+maximum downward press motion
 maximum press duration
+maximum servo iterations
+frame-age threshold
+target-confidence threshold
+controller-ownership lock
 timeout conditions
-emergency stop behavior
+emergency stop
 ```
 
-A failed visual detector must never result in uncontrolled downward motion.
+Safety invariants:
 
-All press operations should be bounded by predefined safe motion limits.
+1.  no valid target → no press,
+2.  target lost → no press,
+3.  stale image → no servo correction,
+4.  alignment not stable → no press,
+5.  ACT and visual servo never command simultaneously,
+6.  failed verification never causes an unbounded retry loop.
 
----
+------------------------------------------------------------------------
+
+# Current Software Environment
+
+The current validated development environment is approximately:
+
+``` text
+Python       3.12.14
+LeRobot      0.6.1
+PyTorch      2.11.0 + CUDA 13.0 build
+TorchVision  0.26.0 + CUDA 13.0 build
+TorchCodec   0.11.1
+Feetech SDK  1.0.0
+OpenCV       4.13.0 (headless)
+GPU          NVIDIA GeForce RTX 5070 Ti
+VRAM         ~15.4 GiB
+```
+
+For reproducibility, the project should pin the exact LeRobot
+version/commit and keep an exported environment file.
+
+------------------------------------------------------------------------
 
 # Proposed Repository Structure
 
-```text
-so101_closed_loop_typing/
+``` text
+so101_typing/
 │
 ├── configs/
 │   ├── cameras/
+│   │   ├── top.yaml
+│   │   ├── wrist.yaml
+│   │   └── screen.yaml
 │   ├── robot/
+│   ├── perception/
 │   ├── visual_servo/
+│   ├── press/
 │   └── act/
+│
+├── calibration/
+│   ├── screen_homography.json
+│   ├── tool_reference.json
+│   ├── image_jacobian.json
+│   └── top_screen_mask.json
 │
 ├── src/
 │   └── so101_typing/
@@ -1136,22 +1775,26 @@ so101_closed_loop_typing/
 │       │   └── cameras.py
 │       │
 │       ├── perception/
-│       │   ├── keyboard.py
-│       │   ├── key_detector.py
-│       │   ├── tool_detector.py
+│       │   ├── keycaps.py
+│       │   ├── glyphs.py
+│       │   ├── target_observation.py
+│       │   ├── screen_rectify.py
 │       │   └── screen_ocr.py
 │       │
 │       ├── control/
-│       │   ├── coarse_control.py
 │       │   ├── visual_servo.py
+│       │   ├── image_jacobian.py
 │       │   ├── press_controller.py
+│       │   ├── controller_owner.py
 │       │   └── safety.py
 │       │
 │       ├── policy/
 │       │   ├── act_policy.py
+│       │   ├── target_encoding.py
 │       │   └── dataset.py
 │       │
 │       ├── supervisor/
+│       │   ├── state_machine.py
 │       │   ├── typing.py
 │       │   ├── verification.py
 │       │   └── recovery.py
@@ -1159,156 +1802,192 @@ so101_closed_loop_typing/
 │       ├── runtime/
 │       │   ├── single_key.py
 │       │   ├── typing.py
+│       │   ├── event_log.py
 │       │   └── evaluate.py
 │       │
 │       └── utils/
-│
-├── tests/
+│           ├── timing.py
+│           └── visualization.py
 │
 ├── scripts/
-│   ├── calibrate_cameras.py
-│   ├── test_screen_ocr.py
+│   ├── camera_sanity.py
+│   ├── calibrate_screen.py
+│   ├── calibrate_tool_reference.py
+│   ├── calibrate_image_jacobian.py
+│   ├── collect_wrist_dataset.py
+│   ├── benchmark_glyph_models.py
 │   ├── test_visual_servo.py
+│   ├── test_screen_verification.py
 │   ├── collect_act_data.py
 │   ├── train_act.py
 │   └── run_typing_demo.py
 │
+├── tests/
+│   ├── test_state_machine.py
+│   ├── test_recovery.py
+│   ├── test_target_encoding.py
+│   └── test_controller_ownership.py
+│
 ├── docs/
 │   ├── architecture.md
 │   ├── calibration.md
+│   ├── perception.md
 │   ├── dataset.md
 │   └── experiments.md
 │
 └── README.md
 ```
 
----
+------------------------------------------------------------------------
 
 # First End-to-End Milestone
 
-The first complete milestone is intentionally small:
+The first complete milestone remains intentionally small:
 
-```text
+``` text
 Input:
 "G"
 ```
 
 Expected behavior:
 
-```text
-Workspace camera detects keyboard
-            ↓
-System determines approximate G location
-            ↓
-SO-101 moves near G
-            ↓
-Wrist camera detects G
-            ↓
-Visual servo centers the tool
-            ↓
-SO-101 presses G
-            ↓
-Screen camera observes the display
-            ↓
-OCR returns "G"
-            ↓
-SUCCESS
+``` text
+Supervisor requests G
+        ↓
+ACT uses TOP + WRIST + state + target=G
+        ↓
+ACT creates a servo-ready local viewpoint
+        ↓
+WRIST perception visually recognizes G
+        ↓
+ACT queue is stopped/reset
+        ↓
+Visual servo moves G toward p*
+        ↓
+alignment stable
+        ↓
+bounded deterministic press
+        ↓
+retract
+        ↓
+SIDE camera observes screen
+        ↓
+screen rectification + OCR
+        ↓
+"G"
+        ↓
+CONFIRMED_SUCCESS
 ```
 
-Nothing beyond this milestone should be considered necessary for proving the core architecture.
+Nothing beyond this is required to prove the primary architecture.
 
-Once this works reliably, multi-character typing becomes repeated execution of the same primitive.
+Once this primitive is reliable, multi-character typing is repeated
+execution plus deterministic recovery.
 
----
+------------------------------------------------------------------------
 
 # Final Demonstration
 
 A target such as:
 
-```text
+``` text
 TARGET: ROBOT
 ```
 
-is displayed or provided to the controller.
+is provided to the supervisor.
 
-The SO-101 physically types:
+The system repeatedly executes:
 
-```text
-R
-O
-B
-O
-T
+``` text
+target character
+      ↓
+ACT coarse approach
+      ↓
+appearance-based wrist recognition
+      ↓
+perception-triggered handoff
+      ↓
+visual servo alignment
+      ↓
+physical press
+      ↓
+screen verification
+      ↓
+next character / recovery
 ```
 
-while verifying the screen after every action.
+If the robot produces:
 
-If the robot accidentally produces:
-
-```text
+``` text
 ROBOR
 ```
 
-the system detects the mismatch and automatically performs:
+the external screen observer detects the mismatch and the supervisor
+generates:
 
-```text
+``` text
 BACKSPACE
 T
 ```
 
-until the screen shows:
+until the display contains:
 
-```text
+``` text
 ROBOT
 ```
 
 The final objective is therefore not simply:
 
-> make the robot press keys
+> make a robot press keyboard keys
 
 but:
 
-> build a robot that perceives, acts, observes the consequence of its action, detects mistakes, and autonomously corrects them.
+> **build a robot that perceives a target, uses learning to create a
+> useful local state, switches to explicit closed-loop control for
+> precision, physically acts on the world, independently observes the
+> consequence, and autonomously corrects errors.**
 
----
+------------------------------------------------------------------------
 
 # Long-Term Extensions
 
-Possible extensions include:
+After the V0 architecture is reliable:
 
-* SmolVLA as a language-conditioned policy,
-* natural-language commands such as `type robot`,
-* shifted keyboard layouts,
-* multiple keyboard models,
-* punctuation and modifier keys,
-* continuous ACT + visual-servo residual control,
-* learned recovery policies,
-* uncertainty-aware OCR,
-* multi-camera policy fusion,
-* online replanning,
-* autonomous calibration,
-* transfer to other button-based interaction tasks.
+- SmolVLA or another language-conditioned policy,
+- arbitrary target phrases,
+- shifted keyboard poses,
+- multiple keyboard models,
+- punctuation and modifier keys,
+- learned key detectors,
+- uncertainty-aware perception,
+- continuous ACT + visual-servo residual control,
+- learned recovery,
+- multi-camera policy fusion,
+- online replanning,
+- autonomous calibration,
+- transfer to other button-based physical interaction tasks.
 
-The architecture should remain modular enough that these extensions do not require redesigning the core runtime.
-
----
+------------------------------------------------------------------------
 
 # Project Principle
 
-The project follows one central engineering rule:
-
-> Solve deterministic problems deterministically, and use learning where learning provides real value.
-
-Therefore:
-
-```text
-string comparison      → deterministic code
-typing progress        → task supervisor
-screen recognition     → vision / OCR
-coarse robot motion    → ACT
-fine alignment         → visual servo
-physical execution     → SO-101
-result verification    → external visual feedback
+``` text
+string decomposition      → deterministic supervisor
+target selection          → deterministic supervisor
+coarse robot motion       → ACT
+local key identity        → visual appearance
+fine alignment            → classical visual servo
+physical press            → bounded deterministic control
+result observation        → independent screen vision
+recovery planning         → deterministic supervisor
 ```
 
-This separation is the foundation of the project.
+The project is intentionally hybrid.
+
+Learning is used where variation and motion priors are valuable.
+
+Classical algorithms are used where geometry, feedback, safety, and task
+semantics can be made explicit.
+
+The boundary between them is not hidden: it is part of the system being
+studied.
