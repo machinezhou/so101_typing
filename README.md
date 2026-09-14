@@ -1230,7 +1230,7 @@ to solve the entire contact task itself.
 
 This section tracks the actual implementation and integration status of
 the project. The detailed technical definition and acceptance criteria
-for each phase remain in the Development Roadmap below.
+for each phase remain unchanged in the Development Roadmap below.
 
 ## Overall Progress
 
@@ -1249,27 +1249,10 @@ for each phase remain in the Development Roadmap below.
 | Phase 10 | Automatic Recovery | Not Started |
 | Phase 11 | Controlled Generalization and Ablations | Not Started |
 
-The project is developed incrementally:
-
-``` text
-implement one phase
-        ↓
-software tests
-        ↓
-real-hardware integration
-        ↓
-calibration / configuration
-        ↓
-acceptance tests
-        ↓
-freeze validated assumptions
-        ↓
-start the next phase
-```
-
-A phase is not complete merely because placeholder modules or interfaces
-exist. It is complete only after its acceptance criteria have been
-validated.
+A phase is complete only after its acceptance criteria have been
+validated on the intended system. Placeholder modules, diagnostic
+components, or partial hardware tests do not by themselves complete a
+phase.
 
 ## Current Phase
 
@@ -1280,60 +1263,52 @@ Phase 1 — Freeze Camera Geometry and Build Camera Sanity Tool
 Current checkpoint:
 
 ``` text
-Phase 1 software implementation
+Phase 1 software foundation
         ↓
-software validation
+three-camera hardware integration
         ↓
-CONNECT PHYSICAL CAMERAS        <-- CURRENT HARDWARE CHECKPOINT
+FPS / exposure / buffering diagnosis
         ↓
-real-hardware camera sanity
+reproducible camera controls
         ↓
-fixed-geometry calibration
+camera framing sanity
         ↓
-rerun camera sanity
+PROVISIONAL CAMERA GEOMETRY FREEZE     <-- CURRENT
+        ↓
+TOP screen-mask calibration
+        ↓
+SIDE homography + text-ROI calibration
+        ↓
+final Phase 1 camera sanity
         ↓
 Phase 1 acceptance
         ↓
-freeze camera mounts and calibration
+freeze validated calibration
         ↓
 Phase 2
 ```
 
-### Completed in Phase 1
+## Validated Phase 1 Hardware Baseline
 
-The Phase 1 software foundation currently includes:
+All three cameras have been tested simultaneously with the intended
+resolution, frame rate, and pixel format.
 
-- project/package structure,
-- fixed TOP / WRIST / SIDE camera configuration files,
-- threaded OpenCV camera acquisition,
-- frame IDs and frame timing metadata,
-- measured FPS and camera read-error reporting,
-- TOP raw-image sanity path,
-- optional TOP screen-mask infrastructure,
-- WRIST raw-image sanity path,
-- preliminary keycap-candidate detection and overlay,
-- SIDE raw-image sanity path,
-- SIDE perspective-rectification infrastructure,
-- SIDE fixed text-ROI infrastructure,
-- camera sanity artifacts and machine-readable report,
-- Phase 1 software unit tests.
+| Camera | OpenCV ID | Resolution | Target FPS | FOURCC | Measured FPS |
+|---|---:|---:|---:|---|---:|
+| TOP | 2 | 640x480 | 30 | MJPG | ~29.8 |
+| WRIST | 0 | 640x480 | 30 | YUYV | ~30.0 |
+| SIDE | 4 | 640x480 | 30 | YUYV | ~30.0 |
 
-The current WRIST keycap detector is a **Phase 1 diagnostic component**.
-It is not the completed Phase 2 perception system. Final key identity
-must still come from visible glyph appearance rather than a
-pre-programmed keyboard row/column identity.
+The simultaneous sanity run currently passes the Phase 1 FPS check with
+zero camera read errors.
 
-### Pre-Hardware Software Gate
+The camera adapter uses a continuously draining threaded reader and
+retains only the latest application-level frame. Do not set
+`cv2.CAP_PROP_BUFFERSIZE=1` for these cameras. Hardware testing showed
+that this setting reduced TOP MJPG capture from approximately 30 FPS to
+approximately 15 FPS even though the requested camera FPS remained 30.
 
-Before the first hardware sanity run, the software baseline must pass:
-
-``` bash
-python -m compileall -q -f src scripts tests
-python -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-The camera adapter test suite should explicitly exercise the latest-frame
-path and verify the runtime frame contract:
+The runtime frame contract is active:
 
 ``` text
 camera_name
@@ -1343,52 +1318,97 @@ processing_timestamp
 frame_age_ms
 ```
 
-Do not proceed to hardware calibration if the software tests fail.
+`capture_timestamp` is currently a local monotonic timestamp recorded
+immediately after a successful OpenCV `read()` returns. It is not a
+hardware sensor exposure timestamp.
 
-## Resume Point After Cameras Are Connected
+## Reproducible Camera Controls
 
-The intended fixed camera configuration remains:
+Camera controls that were required for stable Phase 1 operation are now
+stored in the camera configuration and applied automatically before
+OpenCV opens the device.
 
-| Camera | OpenCV ID | Resolution | FPS | FOURCC |
-|---|---:|---:|---:|---|
-| TOP | 2 | 640x480 | 30 | MJPG |
-| WRIST | 0 | 640x480 | 30 | YUYV |
-| SIDE | 4 | 640x480 | 30 | YUYV |
+Current validated control strategy:
 
-Once all three physical cameras are connected, resume from the Phase 1
-hardware sanity run:
+``` text
+TOP
+  auto_exposure = 1
+  exposure_time_absolute = 200
+  gain = 32
 
-``` bash
-python scripts/camera_sanity.py --duration 15
+WRIST
+  auto_exposure = 3
+  exposure_dynamic_framerate = 0
+
+SIDE
+  no additional V4L2 control override currently required
 ```
 
-Inspect the report and generated images:
+A hardware persistence test was performed by intentionally changing the
+TOP and WRIST device controls to incorrect values before starting the
+project. `camera_sanity.py` restored the configured values automatically,
+and the resulting simultaneous capture rates were approximately:
 
-``` bash
-cat artifacts/camera_sanity/report.json
-ls -lh artifacts/camera_sanity/
-code artifacts/camera_sanity/latest_mosaic.jpg
+``` text
+TOP    29.79 FPS
+WRIST  30.01 FPS
+SIDE   29.99 FPS
 ```
 
-The first hardware run should verify:
+The requested V4L2 controls are also recorded in
+`artifacts/camera_sanity/report.json` so that hardware sanity artifacts
+remain associated with the camera-control configuration used for the
+run.
 
-- TOP, WRIST, and SIDE all produce valid frames,
-- actual camera properties match the intended configuration closely,
-- all three streams operate close to the intended 30 FPS,
-- frame IDs and timestamps advance correctly,
-- frame age remains reasonable for the sanity run,
-- TOP covers the useful robot/keyboard workspace,
-- WRIST resolves local keycaps and visible glyph detail,
-- SIDE provides a usable view of the MacBook display,
-- image orientations and logical camera roles are correct.
+## Camera Geometry Status
 
-No ACT inference, autonomous robot motion, visual-servo motion, or
-physical key press is required at this checkpoint.
+The current TOP view covers the robot, keyboard, and useful workspace.
+The MacBook display is visible in TOP but is not intended to provide the
+independent typing-success verification signal. The fixed TOP display
+region can be masked for the screen-leakage control/ablation path.
+
+The current WRIST geometry has been accepted as a Phase 1 handoff
+candidate. At a representative pre-contact pose:
+
+``` text
+ACT coarse approach
+        ↓
+WRIST sees the tool and a local neighborhood of keycaps
+        ↓
+target acquisition
+        ↓
+visual-servo XY correction
+        ↓
+alignment
+        ↓
+deterministic Z press
+```
+
+The representative WRIST view contains multiple visible keycaps and
+readable glyph detail while leaving room for additional motion toward
+the keyboard. The current camera mount should therefore remain fixed
+unless later calibration demonstrates a concrete geometric failure.
+
+This is a provisional geometry freeze. Physical press validation is not
+required to complete the current framing checkpoint; tool-reference,
+visual-servo, and press validation belong to later phases.
+
+The SIDE view contains the full display region with usable screen
+boundaries and is ready for fixed-screen homography calibration.
+
+## Phase 1 Diagnostic Perception Status
+
+The preliminary WRIST keycap-candidate detector is functioning as a
+camera-sanity diagnostic when the keyboard is presented in the intended
+local view. This does **not** complete Phase 2.
+
+Phase 2 must still implement and evaluate appearance-based key
+recognition. Final key identity must come from visible keycap/glyph
+appearance rather than pre-encoded keyboard row/column identity.
 
 ## Remaining Phase 1 Work
 
-After the raw camera views are accepted, complete fixed-geometry
-calibration using real camera images rather than guessed pixel values.
+The remaining work is fixed-geometry calibration and final acceptance.
 
 SIDE calibration:
 
@@ -1406,7 +1426,7 @@ select fixed typing text ROI
 save calibration/screen_homography.json
 ```
 
-TOP screen-mask calibration, if used for the leakage/ablation path:
+TOP screen-mask calibration, if retained for the leakage/ablation path:
 
 ``` text
 TOP raw frame
@@ -1418,20 +1438,34 @@ save calibration/top_screen_mask.json
 measure leakage statistics / compare masked and raw views
 ```
 
-After calibration, rerun:
-
-``` bash
-python scripts/camera_sanity.py --duration 30
-```
+After calibration, rerun the full camera sanity tool and inspect the raw
+and derived artifacts.
 
 Phase 1 is complete only when the Development Roadmap acceptance criteria
-are satisfied. At that point:
+are satisfied. In particular:
 
-- freeze the physical camera mounts,
-- freeze the validated calibration files,
-- change Phase 1 to **Completed** in the progress table,
-- change Phase 2 to **IN PROGRESS — CURRENT**,
-- begin Phase 2 wrist keycap detection and glyph recognition.
+``` text
+three stable camera streams
+        +
+accepted fixed camera geometry
+        +
+TOP useful workspace view
+        +
+WRIST usable local keycap/glyph view
+        +
+SIDE readable rectified screen
+        +
+fixed SIDE text ROI
+        +
+frame timing metadata
+        +
+validated calibration files
+        ↓
+Phase 1 Completed
+```
+
+Until those remaining calibration and acceptance checks pass, Phase 1
+must remain **IN PROGRESS — CURRENT**.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
