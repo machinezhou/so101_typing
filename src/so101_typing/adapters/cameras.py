@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock, Thread
+import subprocess
 import time
 
 import cv2
@@ -20,6 +21,8 @@ class CameraSpec:
     height: int
     fps: int
     fourcc: str
+
+    v4l2_controls: dict[str, int] | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "CameraSpec":
@@ -54,9 +57,68 @@ class ThreadedOpenCVCamera:
         self._capture_times: deque[float] = deque(maxlen=180)
         self._read_errors = 0
 
+    def _apply_v4l2_controls(self) -> None:
+        controls = self.spec.v4l2_controls
+
+        if not controls:
+            return
+
+        index_or_path = self.spec.index_or_path
+
+        if isinstance(index_or_path, int):
+            device = f"/dev/video{index_or_path}"
+        elif (
+            isinstance(index_or_path, str)
+            and index_or_path.startswith("/dev/video")
+        ):
+            device = index_or_path
+        else:
+            raise RuntimeError(
+                f"Camera {self.spec.name!r} has V4L2 controls "
+                f"configured, but index_or_path="
+                f"{index_or_path!r} is not a V4L2 device"
+            )
+
+        assignments = ",".join(
+            f"{name}={value}"
+            for name, value in controls.items()
+        )
+
+        try:
+            subprocess.run(
+                [
+                    "v4l2-ctl",
+                    "-d",
+                    device,
+                    "--set-ctrl",
+                    assignments,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "v4l2-ctl is required for configured "
+                "camera controls"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            detail = (
+                exc.stderr.strip()
+                or exc.stdout.strip()
+                or f"exit code {exc.returncode}"
+            )
+
+            raise RuntimeError(
+                f"Failed to apply V4L2 controls for "
+                f"{self.spec.name!r} on {device}: {detail}"
+            ) from exc
+
     def start(self) -> None:
         if self._thread is not None:
             return
+
+        self._apply_v4l2_controls()
 
         capture = cv2.VideoCapture(self.spec.index_or_path)
 
@@ -76,11 +138,6 @@ class ThreadedOpenCVCamera:
                 cv2.CAP_PROP_FOURCC,
                 cv2.VideoWriter_fourcc(*self.spec.fourcc),
             )
-
-        try:
-            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
 
         self._capture = capture
         self._stop.clear()

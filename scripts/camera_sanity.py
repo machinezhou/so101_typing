@@ -321,6 +321,7 @@ def main() -> None:
                             "height": camera.spec.height,
                             "fps": camera.spec.fps,
                             "fourcc": camera.spec.fourcc,
+                            "v4l2_controls": camera.spec.v4l2_controls,
                         },
                         "actual": camera.actual_properties(),
                         "measured_fps": camera.measured_fps,

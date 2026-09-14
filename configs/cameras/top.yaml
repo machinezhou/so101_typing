@@ -4,3 +4,9 @@ width: 640
 height: 480
 fps: 30
 fourcc: MJPG
+
+# Phase 1 fixed-environment camera controls.
+v4l2_controls:
+  auto_exposure: 1
+  exposure_time_absolute: 200
+  gain: 32

@@ -4,3 +4,9 @@ width: 640
 height: 480
 fps: 30
 fourcc: YUYV
+
+# Keep automatic exposure while preventing exposure control
+# from reducing the delivered frame rate.
+v4l2_controls:
+  auto_exposure: 3
+  exposure_dynamic_framerate: 0
