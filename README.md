@@ -1233,12 +1233,11 @@ the project. The detailed technical definition and acceptance criteria
 for each phase remain unchanged in the Development Roadmap below.
 
 ## Overall Progress
-
 | Phase | Description | Status |
 |---|---|---|
 | Phase 0 | Mechanical Feasibility | **Completed** |
-| Phase 1 | Freeze Camera Geometry and Build Camera Sanity Tool | **IN PROGRESS — CURRENT** |
-| Phase 2 | Wrist Keycap Detection and Glyph Recognition | Not Started |
+| Phase 1 | Freeze Camera Geometry and Build Camera Sanity Tool | **Completed** |
+| Phase 2 | Wrist Keycap Detection and Glyph Recognition | **IN PROGRESS — CURRENT** |
 | Phase 3 | Tool Reference and Visual Servo | Not Started |
 | Phase 4 | Screen Rectification and Verification | Not Started |
 | Phase 5 | Deterministic Local Single-Key Closed Loop | Not Started |
@@ -1257,38 +1256,42 @@ phase.
 ## Current Phase
 
 ``` text
-Phase 1 — Freeze Camera Geometry and Build Camera Sanity Tool
+Phase 2 — Wrist Keycap Detection and Glyph Recognition
 ```
 
 Current checkpoint:
-
 ``` text
-Phase 1 software foundation
+Phase 1 camera/software foundation
         ↓
-three-camera hardware integration
+validated camera geometry + calibration
         ↓
-FPS / exposure / buffering diagnosis
+PHASE 1 ACCEPTED / FROZEN
         ↓
-reproducible camera controls
+PHASE 2 WRIST PERCEPTION FOUNDATION     <-- CURRENT
         ↓
-camera framing sanity
+representative wrist-frame dataset
         ↓
-PROVISIONAL CAMERA GEOMETRY FREEZE     <-- CURRENT
+keycap segmentation + candidate extraction
         ↓
-TOP screen-mask calibration
+per-key perspective normalization
         ↓
-SIDE homography + text-ROI calibration
+appearance-based glyph recognition
         ↓
-final Phase 1 camera sanity
+TargetObservation
         ↓
-Phase 1 acceptance
+Phase 2 quantitative evaluation
         ↓
-freeze validated calibration
-        ↓
-Phase 2
+Phase 2 acceptance
 ```
 
-## Validated Phase 1 Hardware Baseline
+## Phase 1 Completion Record
+
+Phase 1 acceptance criteria have now been validated on the intended
+three-camera system. Camera positions and the fixed MacBook geometry
+should remain unchanged unless a later phase demonstrates a concrete
+failure that requires recalibration.
+
+### Stable three-camera baseline
 
 All three cameras have been tested simultaneously with the intended
 resolution, frame rate, and pixel format.
@@ -1299,8 +1302,15 @@ resolution, frame rate, and pixel format.
 | WRIST | 0 | 640x480 | 30 | YUYV | ~30.0 |
 | SIDE | 4 | 640x480 | 30 | YUYV | ~30.0 |
 
-The simultaneous sanity run currently passes the Phase 1 FPS check with
-zero camera read errors.
+The validated 30-second simultaneous sanity run completed with zero
+camera read errors and passed the FPS check:
+
+``` text
+TOP     29.80 FPS  errors=0
+WRIST   29.99 FPS  errors=0
+SIDE    29.99 FPS  errors=0
+FPS CHECK: PASS
+```
 
 The camera adapter uses a continuously draining threaded reader and
 retains only the latest application-level frame. Do not set
@@ -1308,7 +1318,7 @@ retains only the latest application-level frame. Do not set
 that this setting reduced TOP MJPG capture from approximately 30 FPS to
 approximately 15 FPS even though the requested camera FPS remained 30.
 
-The runtime frame contract is active:
+The runtime frame contract remains active:
 
 ``` text
 camera_name
@@ -1322,11 +1332,10 @@ frame_age_ms
 immediately after a successful OpenCV `read()` returns. It is not a
 hardware sensor exposure timestamp.
 
-## Reproducible Camera Controls
+### Reproducible camera controls
 
-Camera controls that were required for stable Phase 1 operation are now
-stored in the camera configuration and applied automatically before
-OpenCV opens the device.
+Camera controls required for stable operation are stored in the camera
+configuration and applied automatically before OpenCV opens the device.
 
 Current validated control strategy:
 
@@ -1344,112 +1353,132 @@ SIDE
   no additional V4L2 control override currently required
 ```
 
-A hardware persistence test was performed by intentionally changing the
-TOP and WRIST device controls to incorrect values before starting the
-project. `camera_sanity.py` restored the configured values automatically,
-and the resulting simultaneous capture rates were approximately:
+A hardware persistence test intentionally changed TOP and WRIST device
+controls to incorrect values before project startup. `camera_sanity.py`
+restored the configured values automatically while maintaining the
+validated simultaneous capture rates. Requested V4L2 controls are also
+recorded in `artifacts/camera_sanity/report.json`.
 
-``` text
-TOP    29.79 FPS
-WRIST  30.01 FPS
-SIDE   29.99 FPS
+### Final camera geometry
+
+The final TOP view covers the keyboard, SO-101, and useful approach
+workspace. The TOP mount was adjusted before final acceptance so that an
+unwanted dynamic region at the upper-right of the previous framing is no
+longer part of the intended observation. The accepted TOP geometry is
+now frozen.
+
+The WRIST view remains accepted as the Phase 1 handoff geometry. At a
+representative pre-contact pose it contains multiple local keycaps with
+readable glyph detail, while preserving room for additional motion
+toward the keyboard. Tool-reference, visual-servo, and press validation
+remain later-phase responsibilities.
+
+The SIDE camera position and MacBook screen angle are frozen. The full
+relevant display region remains available for the fixed homography, and
+the rectified output contains readable screen text.
+
+### SIDE screen calibration
+
+The SIDE calibration is now configured in
+`calibration/screen_homography.json`:
+
+``` json
+{
+  "source_points": [
+    [40.0, 84.0],
+    [463.0, 60.0],
+    [431.0, 435.0],
+    [25.0, 340.0]
+  ],
+  "output_size": [1280, 800],
+  "text_roi": [304, 67, 960, 694]
+}
 ```
 
-The requested V4L2 controls are also recorded in
-`artifacts/camera_sanity/report.json` so that hardware sanity artifacts
-remain associated with the camera-control configuration used for the
-run.
-
-## Camera Geometry Status
-
-The current TOP view covers the robot, keyboard, and useful workspace.
-The MacBook display is visible in TOP but is not intended to provide the
-independent typing-success verification signal. The fixed TOP display
-region can be masked for the screen-leakage control/ablation path.
-
-The current WRIST geometry has been accepted as a Phase 1 handoff
-candidate. At a representative pre-contact pose:
+The calibration path has been validated both offline and through the
+live camera pipeline:
 
 ``` text
-ACT coarse approach
-        ↓
-WRIST sees the tool and a local neighborhood of keycaps
-        ↓
-target acquisition
-        ↓
-visual-servo XY correction
-        ↓
-alignment
-        ↓
-deterministic Z press
+SIDE raw
+    ↓
+fixed screen quadrilateral
+    ↓
+homography
+    ↓
+1280x800 canonical screen
+    ↓
+fixed 960x694 text ROI
+    ↓
+readable screen content
 ```
 
-The representative WRIST view contains multiple visible keycaps and
-readable glyph detail while leaving room for additional motion toward
-the keyboard. The current camera mount should therefore remain fixed
-unless later calibration demonstrates a concrete geometric failure.
+`ScreenCalibration` now validates source geometry and ROI bounds and
+supports calibration save/load. `scripts/calibrate_screen.py` provides a
+browser-based calibration workflow compatible with the project's
+headless OpenCV environment.
 
-This is a provisional geometry freeze. Physical press validation is not
-required to complete the current framing checkpoint; tool-reference,
-visual-servo, and press validation belong to later phases.
+### Optional TOP screen-mask calibration
 
-The SIDE view contains the full display region with usable screen
-boundaries and is ready for fixed-screen homography calibration.
+The TOP display mask is retained as an optional screen-leakage / ablation
+capability, not as mandatory preprocessing for the default ACT path.
+Default ACT experiments should therefore begin with raw TOP unless a
+leakage experiment provides evidence that masking is required.
 
-## Phase 1 Diagnostic Perception Status
+The accepted optional mask is stored in
+`calibration/top_screen_mask.json`:
 
-The preliminary WRIST keycap-candidate detector is functioning as a
-camera-sanity diagnostic when the keyboard is presented in the intended
-local view. This does **not** complete Phase 2.
-
-Phase 2 must still implement and evaluate appearance-based key
-recognition. Final key identity must come from visible keycap/glyph
-appearance rather than pre-encoded keyboard row/column identity.
-
-## Remaining Phase 1 Work
-
-The remaining work is fixed-geometry calibration and final acceptance.
-
-SIDE calibration:
-
-``` text
-SIDE raw frame
-      ↓
-select fixed screen quadrilateral
-      ↓
-compute screen homography
-      ↓
-canonical rectified screen
-      ↓
-select fixed typing text ROI
-      ↓
-save calibration/screen_homography.json
+``` json
+{
+  "polygon": [
+    [47, 351],
+    [144, 94],
+    [258, 165],
+    [204, 369]
+  ],
+  "brightness_threshold": 245
+}
 ```
 
-TOP screen-mask calibration, if retained for the leakage/ablation path:
+The calibration preview confirms that the visible MacBook display is
+removed while the keyboard, robot, and useful workspace remain visible.
+The calibration artifact reported approximately:
 
 ``` text
-TOP raw frame
-      ↓
-identify fixed display polygon
-      ↓
-save calibration/top_screen_mask.json
-      ↓
-measure leakage statistics / compare masked and raw views
+masked_fraction               0.11379
+screen_pixel_count            34957
+bright_fraction_inside_screen 0.03456
+mean_inside_screen            242.35
+std_inside_screen             6.87
 ```
 
-After calibration, rerun the full camera sanity tool and inspect the raw
-and derived artifacts.
+`TopMaskConfig` now validates and persists the fixed polygon, and
+`scripts/calibrate_top_mask.py` provides the corresponding browser-based
+calibration workflow. The saved mask remains available for the later
+`TOP raw` vs `TOP screen-masked` ablation.
 
-Phase 1 is complete only when the Development Roadmap acceptance criteria
-are satisfied. In particular:
+### Phase 1 software validation
+
+The SIDE calibration changes add unit coverage for uncalibrated loading,
+valid rectification/cropping, invalid quadrilaterals, ROI bounds, and
+save/load round trips. The TOP mask changes add coverage for masking and
+statistics, passthrough behavior, polygon validation, frame bounds,
+save/load round trips, and brightness-threshold validation.
+
+The 11 calibration-focused unit tests supplied with the Phase 1
+calibration checkpoints pass together.
+
+## Phase 1 Acceptance
+
+The Development Roadmap Phase 1 acceptance criteria are satisfied:
 
 ``` text
-three stable camera streams
+three stable ~30 FPS camera streams
         +
-accepted fixed camera geometry
+zero read errors in the validated simultaneous run
         +
-TOP useful workspace view
+accepted and frozen camera geometry
+        +
+TOP useful robot/keyboard workspace
         +
 WRIST usable local keycap/glyph view
         +
@@ -1459,13 +1488,42 @@ fixed SIDE text ROI
         +
 frame timing metadata
         +
-validated calibration files
+reproducible camera controls
+        +
+validated calibration files and calibration tools
         ↓
-Phase 1 Completed
+PHASE 1 COMPLETED
+        ↓
+PHASE 2 IN PROGRESS — CURRENT
 ```
 
-Until those remaining calibration and acceptance checks pass, Phase 1
-must remain **IN PROGRESS — CURRENT**.
+## Phase 2 Entry Condition
+
+Phase 2 starts from the frozen WRIST geometry and must solve key identity
+from visible appearance rather than from a pre-programmed keyboard
+layout. The preliminary keycap-candidate logic used by
+`camera_sanity.py` remains diagnostic only and must not be treated as a
+completed Phase 2 detector.
+
+The next implementation sequence is:
+
+``` text
+representative WRIST frames
+        ↓
+keycap segmentation
+        ↓
+candidate extraction / geometric filtering
+        ↓
+per-key perspective normalization
+        ↓
+glyph dataset + OTHER examples
+        ↓
+Template Matching vs HOG + SVM vs Tiny CNN
+        ↓
+TargetObservation
+        ↓
+precision / recall / classification / acquisition evaluation
+```
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
