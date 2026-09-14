@@ -8,12 +8,10 @@ screen-based verification**.
 The project is designed as a compact embodied-AI system in which learned
 policies and deterministic algorithms have explicit responsibilities,
 explicit interfaces, and observable handoff points.
-
 > **Core principle:** solve deterministic problems deterministically,
 > and use learning where learning provides real value.
 
 ------------------------------------------------------------------------
-
 ## Project Goal
 
 The goal is **not** to build the fastest robotic typist and **not** to
@@ -21,7 +19,6 @@ hide the task behind a pre-programmed keyboard map.
 
 The goal is to build a reliable and interpretable physical closed loop
 that can:
-
 1.  receive a target string such as `ROBOT`,
 2.  choose the next requested key,
 3.  use ACT to move the SO-101 into a useful local neighborhood,
@@ -33,7 +30,6 @@ that can:
 9.  verify whether the intended character actually appeared,
 10. recover automatically from wrong key presses,
 11. repeat until the requested string is correct.
-
 A typical final task is:
 
 ``` text
@@ -49,7 +45,6 @@ ROBOT
 on the MacBook using only physical keyboard interaction.
 
 ------------------------------------------------------------------------
-
 ## Current Project Status
 
 The project is no longer at the mechanical-feasibility stage.
@@ -63,7 +58,6 @@ The current physical setup has already demonstrated:
 - successful physical MacBook key presses using that tool,
 - three simultaneous camera streams,
 - a fixed MacBook and robot workspace.
-
 Therefore, the main engineering risk has shifted away from *“can the
 SO-101 physically press a key?”* toward:
 
@@ -75,7 +69,6 @@ SO-101 physically press a key?”* toward:
 - reproducible data collection and evaluation.
 
 ------------------------------------------------------------------------
-
 ## Research Questions
 
 The central research question is:
@@ -86,7 +79,6 @@ The central research question is:
 > and drives recovery?**
 
 The project also studies several more specific questions:
-
 - Can ACT learn a **perception-aware approach pose** rather than needing
   millimeter-level final accuracy?
 - Can classical vision recognize the requested key locally after ACT has
@@ -100,22 +92,17 @@ The project also studies several more specific questions:
 - How do learned visual representations and explicit classical visual
   features complement each other?
 - How much does visual servoing improve over ACT-only execution?
-
 Primary controller comparison:
-
 | System             | Learned coarse motion | Appearance-based local vision | Closed-loop fine correction | External screen verification | Recovery |
 |--------------------|----------------------:|------------------------------:|----------------------------:|-----------------------------:|---------:|
 | Classical baseline |                    No |                           Yes |                         Yes |                          Yes |      Yes |
 | ACT only           |                   Yes |            Limited/diagnostic |                          No |                          Yes |      Yes |
 | ACT + Visual Servo |                   Yes |                           Yes |                         Yes |                          Yes |      Yes |
-
 Possible future comparisons include SmolVLA and other learned policies,
 but they are not dependencies of V0.
 
 ------------------------------------------------------------------------
-
 # Design Constraints
-
 ## 1. Key identity must come from visual appearance
 
 A deliberate project constraint is:
@@ -127,7 +114,6 @@ For example, the system should not conclude that a key is `F` only
 because it is the fourth key in a known row.
 
 Keyboard geometry may still be used for:
-
 - finding keycap candidates,
 - rejecting implausible contours,
 - grouping nearby keycaps,
@@ -139,7 +125,6 @@ glyph/appearance of the key itself.
 
 This keeps the perception problem real and makes the interaction between
 learned and classical vision meaningful.
-
 ## 2. V0 is a fixed-environment system
 
 The first reliable version intentionally assumes:
@@ -154,7 +139,6 @@ The first reliable version intentionally assumes:
 
 V0 is intended to establish a reliable closed loop before introducing
 generalization.
-
 ## 3. Screen verification is external to the motor policy
 
 The screen camera is not part of the initial ACT observation.
@@ -167,7 +151,6 @@ The screen is observed by the supervisor after physical execution.
 ------------------------------------------------------------------------
 
 # Hardware Setup
-
 ## Robot
 
 - SO-101 arm
@@ -183,7 +166,6 @@ pressing has already been demonstrated.
 A rigid/custom printed mount can be introduced later to improve
 repeatability of the camera-to-tool transform, but it is not a
 prerequisite for starting the software pipeline.
-
 ## Cameras
 
 The current three-camera configuration is:
@@ -216,13 +198,10 @@ The current three-camera configuration is:
   }
 }'
 ```
-
 The logical name `side` is retained for compatibility with the existing
 setup, but in this project its primary role becomes **screen
 verification**.
-
 ### Physical camera layout
-
 ``` text
                          TOP CAMERA
                              │
@@ -240,15 +219,12 @@ verification**.
        local keyboard                  SIDE CAMERA
        / tool region                  (~45° allowed)
 ```
-
 The current physical layout is considered suitable for V0.
 
 ------------------------------------------------------------------------
-
 # Camera Responsibilities
 
 The cameras intentionally have asymmetric roles.
-
 ## TOP — global learned-motion context
 
 The TOP camera should prioritize visibility of:
@@ -263,7 +239,6 @@ It answers:
 > **Where should the robot move globally?**
 
 The TOP camera does **not** need to resolve individual glyphs.
-
 The MacBook display may remain visible in the TOP image. In the current
 geometry it is strongly overexposed, and physically hiding it is not
 worth sacrificing robot-workspace coverage.
@@ -281,7 +256,6 @@ TOP raw
 
 This enables a later leakage/ablation experiment without changing the
 physical setup.
-
 ## WRIST — local perception and precision control
 
 The WRIST camera is the primary precision sensor.
@@ -297,7 +271,6 @@ It is responsible for:
 - measuring image-space alignment error during visual servoing.
 
 It answers:
-
 > **Which key am I looking at, and how far is the tool from the desired
 > alignment?**
 
@@ -316,7 +289,6 @@ WRIST RGB
           explicit glyph labels
           explicit pixel coordinates
 ```
-
 ## SIDE / SCREEN — independent outcome verification
 
 The SIDE camera is positioned as close to the MacBook screen as the
@@ -328,7 +300,6 @@ It answers:
 
 Because the MacBook and camera are fixed, perspective distortion can be
 removed with a one-time screen homography:
-
 ``` text
 SIDE raw frame
       ↓
@@ -349,11 +320,9 @@ The SIDE/SCREEN stream should remain outside the initial ACT
 observation.
 
 ------------------------------------------------------------------------
-
 # System Architecture
 
 The primary architecture is:
-
 ``` text
                          TARGET TEXT
                            "ROBOT"
@@ -414,7 +383,6 @@ The primary architecture is:
                               └───────────────►│
                                       Task Supervisor
 ```
-
 The important architectural property is **controller ownership**:
 
 - ACT owns coarse motion.
@@ -424,12 +392,10 @@ The important architectural property is **controller ownership**:
 - The supervisor is the only module that changes high-level task state.
 
 ------------------------------------------------------------------------
-
 # Runtime State Machine
 
 The runtime should be implemented as an explicit state machine rather
 than a loose sequence of function calls.
-
 ``` text
 IDLE
   │
@@ -486,7 +452,6 @@ VERIFY
   ▼
 DONE
 ```
-
 `TARGET_ACQUIRED` and `ALIGNED` are intentionally different states:
 
 - `TARGET_ACQUIRED`: the system knows where the requested key is in the
@@ -495,7 +460,6 @@ DONE
   reference.
 
 ------------------------------------------------------------------------
-
 # Module Responsibilities and Interfaces
 
 ## Task Supervisor
@@ -521,7 +485,6 @@ R → O → B → O → T
 
 The learned policy does not need to understand the word `ROBOT`. It
 receives one requested primitive at a time.
-
 ## Target Encoding
 
 Initial supported actions:
@@ -548,7 +511,6 @@ The implementation may use one-hot or another low-dimensional encoding.
 The important requirement is that the target condition is explicitly
 recorded in the dataset and explicitly supplied to the policy at
 inference time.
-
 ## ACT Coarse Controller
 
 ACT is responsible for:
@@ -575,10 +537,8 @@ Recommended action:
 ``` text
 SO-101 joint-position command / action chunk
 ```
-
 The existing joint-space ACT path should be retained initially because
 the platform has already been demonstrated with ACT.
-
 ### Perception-aware approach
 
 A successful ACT terminal state should make the next deterministic stage
@@ -592,7 +552,6 @@ easy:
 - end effector remains at a safe pre-press height.
 
 This is a **perception-aware approach pose**.
-
 ## ACT → Visual Servo Handoff
 
 The handoff must be triggered by perception, not by a fixed time or a
@@ -615,7 +574,6 @@ TargetObservation(
 ```
 
 A first `servo_ready` rule can require:
-
 ``` text
 correct target label
 AND confidence >= threshold
@@ -632,12 +590,10 @@ When `servo_ready` becomes true:
 4.  read the latest robot state,
 5.  wait for/obtain a fresh wrist frame,
 6.  transfer exclusive control ownership to visual servo.
-
 This boundary is critical. ACT and visual servo must never command the
 robot concurrently in V0.
 
 ------------------------------------------------------------------------
-
 # Wrist Key Perception
 
 The wrist perception problem is intentionally local.
@@ -657,7 +613,6 @@ inspect a small local neighborhood and identify R
 This is an important interaction between learning and classical
 perception: the learned policy actively creates an easier perception
 problem.
-
 ## Proposed pipeline
 
 ``` text
@@ -683,7 +638,6 @@ glyph recognition
        ↓
 label + confidence + center
 ```
-
 ### Keycap detection
 
 V0 should first attempt classical methods:
@@ -698,7 +652,6 @@ V0 should first attempt classical methods:
 
 A large object detector is not the default starting point because the
 current fixed MacBook scene has strong keycap/background contrast.
-
 ### Glyph recognition
 
 The project should compare at least:
@@ -718,7 +671,6 @@ classified as letters.
 
 For `SPACE` and `BACKSPACE`, dedicated visual handling may be required
 because they are not ordinary single-letter glyphs.
-
 ### Important constraint
 
 Perspective rectification of an individual key is allowed.
@@ -744,7 +696,6 @@ Z PRESS
 ```
 
 Do not simultaneously perform lateral correction and downward pressing.
-
 ## Tool reference point
 
 The desired image location should not be assumed to be the center of the
@@ -779,7 +730,6 @@ or:
 The controller drives:
 
 \[ e \]
-
 ## Local image Jacobian
 
 For V0, the local mapping from small Cartesian robot motion to image
@@ -807,7 +757,6 @@ Then a local controller can use:
 \[ X = -J^{+} e \]
 
 with:
-
 - bounded Cartesian step size,
 - damping if necessary,
 - maximum iteration count,
@@ -817,7 +766,6 @@ with:
 
 The Cartesian correction can then be converted to safe robot commands
 through the chosen kinematic/IK path.
-
 ## Alignment acceptance
 
 Do not declare alignment from one frame.
@@ -832,7 +780,6 @@ for N consecutive fresh frames
 before entering `PRESS`.
 
 ------------------------------------------------------------------------
-
 # Deterministic Press Controller
 
 The press stage should not be learned in V0.
@@ -860,9 +807,7 @@ The controller must define:
 
 The pencil/tool should never move downward if target confidence or
 alignment state is invalid.
-
 ------------------------------------------------------------------------
-
 # Screen Perception and Verification
 
 The screen camera is an independent observer.
@@ -885,7 +830,6 @@ canonical screen
 ```
 
 Then use a fixed typing ROI.
-
 ## Verification states
 
 Screen verification should not be binary.
@@ -917,9 +861,7 @@ wait / reacquire / OCR again
 ```
 
 rather than modifying the typed string immediately.
-
 ------------------------------------------------------------------------
-
 # Automatic Recovery
 
 Recovery semantics belong to the supervisor.
@@ -975,7 +917,6 @@ Screen Perception
 
 Supervisor
 "What should happen next?"
-
 ACT
 "How do I move into a useful neighborhood?"
 
@@ -990,7 +931,6 @@ Press Controller
 ```
 
 ------------------------------------------------------------------------
-
 # Camera Calibration and Sanity Checks
 
 Before collecting the typing dataset, freeze the camera positions and
@@ -1008,7 +948,6 @@ Pass if:
 - the camera mount is mechanically stable.
 
 The screen does not need to be physically removed from view.
-
 ### WRIST
 
 Pass if:
@@ -1017,7 +956,6 @@ Pass if:
 - glyphs contain enough pixels for classification,
 - the pencil/arm does not consistently hide the requested key,
 - the camera-to-tool relationship remains stable during a run.
-
 ### SIDE / SCREEN
 
 Pass if:
@@ -1026,7 +964,6 @@ Pass if:
 - the relevant screen region remains visible,
 - text remains recoverable after perspective rectification,
 - exposure can be configured for readable screen text.
-
 ## Exposure and focus
 
 Where supported, prefer stable settings for:
@@ -1042,7 +979,6 @@ share identical settings.
 - TOP: robot + keyboard context
 - WRIST: black keycaps + white glyph detail
 - SIDE: display text
-
 ## TOP screen-leakage test
 
 Physical masking is not required.
@@ -1068,14 +1004,12 @@ Measure within the TOP screen ROI:
 - mean/std,
 - frame-to-frame noise,
 - inter-state pixel differences.
-
 If the states are indistinguishable from noise, raw TOP can be used with
 evidence that the screen carries no practical task signal.
 
 If they remain distinguishable, enable the fixed software mask for ACT.
 
 ------------------------------------------------------------------------
-
 # Timing, Freshness, and Controller Ownership
 
 Visual servoing is more sensitive to latency than coarse ACT motion.
@@ -1101,7 +1035,6 @@ sequence_id
 The servo controller should reject frames that are too old.
 
 This prevents a failure mode such as:
-
 ``` text
 robot moves
    ↓
@@ -1115,7 +1048,6 @@ oscillation / wrong correction
 At any instant, exactly one motion controller should own robot commands.
 
 ------------------------------------------------------------------------
-
 # Recommended Runtime Data Contracts
 
 These are conceptual contracts; exact implementation may use
@@ -1138,7 +1070,6 @@ class TargetObservation:
     frame_id: int
     timestamp: float
 ```
-
 ## `AlignmentResult`
 
 ``` python
@@ -1164,7 +1095,6 @@ class PressResult:
     retracted: bool
     timeout: bool
 ```
-
 ## `VerificationResult`
 
 ``` python
@@ -1183,7 +1113,6 @@ class VerificationResult:
 ```
 
 ------------------------------------------------------------------------
-
 # Event Logging and Replay
 
 Every key attempt should produce a trace that can be inspected after
@@ -1193,7 +1122,6 @@ Example:
 
 ``` text
 target=R
-
 0.000  state=ACT_APPROACH
 0.033  act_action=[...]
 1.820  target=R confidence=0.91 center=(411,231)
@@ -1211,7 +1139,6 @@ target=R
 ```
 
 Recommended logged signals:
-
 - state transitions,
 - target key,
 - ACT actions,
@@ -1230,9 +1157,7 @@ A replay/debug viewer is highly valuable for both engineering and the
 final demonstration.
 
 ------------------------------------------------------------------------
-
 # Dataset Design
-
 ## Wrist perception dataset
 
 Before training a new ACT typing policy, collect a small dedicated wrist
@@ -1246,7 +1171,6 @@ For each target region:
 - include moderate viewpoint variation,
 - include partial occlusion,
 - collect non-letter keys for `OTHER`.
-
 The first goal is not large-scale learning. It is to measure whether
 keycap detection and glyph recognition are reliable under the actual
 wrist-camera distribution.
@@ -1263,7 +1187,6 @@ Tiny CNN
 
 using held-out frames/episodes rather than adjacent frames from the same
 recording whenever possible.
-
 ## ACT typing dataset
 
 After the local deterministic loop is reliable, collect
@@ -1285,7 +1208,6 @@ SO-101 joint command
 ```
 
 Do not include the SIDE/SCREEN camera in the initial policy input.
-
 ### Demonstration endpoint
 
 Teleoperation demonstrations should end at a **servo-ready viewpoint**,
@@ -1303,7 +1225,217 @@ This teaches ACT to hand the problem to classical perception rather than
 to solve the entire contact task itself.
 
 ------------------------------------------------------------------------
+<!-- IMPLEMENTATION_PROGRESS:START -->
+# Implementation Progress and Current Checkpoint
 
+This section tracks the actual implementation and integration status of
+the project. The detailed technical definition and acceptance criteria
+for each phase remain in the Development Roadmap below.
+
+## Overall Progress
+
+| Phase | Description | Status |
+|---|---|---|
+| Phase 0 | Mechanical Feasibility | **Completed** |
+| Phase 1 | Freeze Camera Geometry and Build Camera Sanity Tool | **IN PROGRESS — CURRENT** |
+| Phase 2 | Wrist Keycap Detection and Glyph Recognition | Not Started |
+| Phase 3 | Tool Reference and Visual Servo | Not Started |
+| Phase 4 | Screen Rectification and Verification | Not Started |
+| Phase 5 | Deterministic Local Single-Key Closed Loop | Not Started |
+| Phase 6 | Target-Conditioned ACT Dataset | Not Started |
+| Phase 7 | ACT Coarse Policy | Not Started |
+| Phase 8 | ACT + Visual Servo Handoff | Not Started |
+| Phase 9 | Multi-Key Typing | Not Started |
+| Phase 10 | Automatic Recovery | Not Started |
+| Phase 11 | Controlled Generalization and Ablations | Not Started |
+
+The project is developed incrementally:
+
+``` text
+implement one phase
+        ↓
+software tests
+        ↓
+real-hardware integration
+        ↓
+calibration / configuration
+        ↓
+acceptance tests
+        ↓
+freeze validated assumptions
+        ↓
+start the next phase
+```
+
+A phase is not complete merely because placeholder modules or interfaces
+exist. It is complete only after its acceptance criteria have been
+validated.
+
+## Current Phase
+
+``` text
+Phase 1 — Freeze Camera Geometry and Build Camera Sanity Tool
+```
+
+Current checkpoint:
+
+``` text
+Phase 1 software implementation
+        ↓
+software validation
+        ↓
+CONNECT PHYSICAL CAMERAS        <-- CURRENT HARDWARE CHECKPOINT
+        ↓
+real-hardware camera sanity
+        ↓
+fixed-geometry calibration
+        ↓
+rerun camera sanity
+        ↓
+Phase 1 acceptance
+        ↓
+freeze camera mounts and calibration
+        ↓
+Phase 2
+```
+
+### Completed in Phase 1
+
+The Phase 1 software foundation currently includes:
+
+- project/package structure,
+- fixed TOP / WRIST / SIDE camera configuration files,
+- threaded OpenCV camera acquisition,
+- frame IDs and frame timing metadata,
+- measured FPS and camera read-error reporting,
+- TOP raw-image sanity path,
+- optional TOP screen-mask infrastructure,
+- WRIST raw-image sanity path,
+- preliminary keycap-candidate detection and overlay,
+- SIDE raw-image sanity path,
+- SIDE perspective-rectification infrastructure,
+- SIDE fixed text-ROI infrastructure,
+- camera sanity artifacts and machine-readable report,
+- Phase 1 software unit tests.
+
+The current WRIST keycap detector is a **Phase 1 diagnostic component**.
+It is not the completed Phase 2 perception system. Final key identity
+must still come from visible glyph appearance rather than a
+pre-programmed keyboard row/column identity.
+
+### Pre-Hardware Software Gate
+
+Before the first hardware sanity run, the software baseline must pass:
+
+``` bash
+python -m compileall -q -f src scripts tests
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+The camera adapter test suite should explicitly exercise the latest-frame
+path and verify the runtime frame contract:
+
+``` text
+camera_name
+frame_id
+capture_timestamp
+processing_timestamp
+frame_age_ms
+```
+
+Do not proceed to hardware calibration if the software tests fail.
+
+## Resume Point After Cameras Are Connected
+
+The intended fixed camera configuration remains:
+
+| Camera | OpenCV ID | Resolution | FPS | FOURCC |
+|---|---:|---:|---:|---|
+| TOP | 2 | 640x480 | 30 | MJPG |
+| WRIST | 0 | 640x480 | 30 | YUYV |
+| SIDE | 4 | 640x480 | 30 | YUYV |
+
+Once all three physical cameras are connected, resume from the Phase 1
+hardware sanity run:
+
+``` bash
+python scripts/camera_sanity.py --duration 15
+```
+
+Inspect the report and generated images:
+
+``` bash
+cat artifacts/camera_sanity/report.json
+ls -lh artifacts/camera_sanity/
+code artifacts/camera_sanity/latest_mosaic.jpg
+```
+
+The first hardware run should verify:
+
+- TOP, WRIST, and SIDE all produce valid frames,
+- actual camera properties match the intended configuration closely,
+- all three streams operate close to the intended 30 FPS,
+- frame IDs and timestamps advance correctly,
+- frame age remains reasonable for the sanity run,
+- TOP covers the useful robot/keyboard workspace,
+- WRIST resolves local keycaps and visible glyph detail,
+- SIDE provides a usable view of the MacBook display,
+- image orientations and logical camera roles are correct.
+
+No ACT inference, autonomous robot motion, visual-servo motion, or
+physical key press is required at this checkpoint.
+
+## Remaining Phase 1 Work
+
+After the raw camera views are accepted, complete fixed-geometry
+calibration using real camera images rather than guessed pixel values.
+
+SIDE calibration:
+
+``` text
+SIDE raw frame
+      ↓
+select fixed screen quadrilateral
+      ↓
+compute screen homography
+      ↓
+canonical rectified screen
+      ↓
+select fixed typing text ROI
+      ↓
+save calibration/screen_homography.json
+```
+
+TOP screen-mask calibration, if used for the leakage/ablation path:
+
+``` text
+TOP raw frame
+      ↓
+identify fixed display polygon
+      ↓
+save calibration/top_screen_mask.json
+      ↓
+measure leakage statistics / compare masked and raw views
+```
+
+After calibration, rerun:
+
+``` bash
+python scripts/camera_sanity.py --duration 30
+```
+
+Phase 1 is complete only when the Development Roadmap acceptance criteria
+are satisfied. At that point:
+
+- freeze the physical camera mounts,
+- freeze the validated calibration files,
+- change Phase 1 to **Completed** in the progress table,
+- change Phase 2 to **IN PROGRESS — CURRENT**,
+- begin Phase 2 wrist keycap detection and glyph recognition.
+
+<!-- IMPLEMENTATION_PROGRESS:END -->
+
+------------------------------------------------------------------------
 # Development Roadmap
 
 The roadmap is updated to reflect the current physical progress.
@@ -1320,7 +1452,6 @@ Already demonstrated through teleoperation.
 No redesign of the end effector is required before software work begins.
 
 ------------------------------------------------------------------------
-
 ## Phase 1 — Freeze Camera Geometry and Build Camera Sanity Tool
 
 Goal:
@@ -1343,7 +1474,6 @@ SIDE text ROI
 ```
 
 Acceptance:
-
 - all three cameras stable at 30 FPS under the intended configuration,
 - TOP covers useful robot/keyboard workspace,
 - WRIST resolves local keycaps/glyphs,
@@ -1352,7 +1482,6 @@ Acceptance:
 - camera mounts are frozen after acceptance.
 
 ------------------------------------------------------------------------
-
 ## Phase 2 — Wrist Keycap Detection and Glyph Recognition
 
 Goal:
@@ -1383,7 +1512,6 @@ Tiny CNN
 ```
 
 Acceptance should measure:
-
 - keycap detection precision/recall,
 - character classification accuracy,
 - target acquisition success rate,
@@ -1392,7 +1520,6 @@ Acceptance should measure:
 - performance under small pose/exposure variations.
 
 ------------------------------------------------------------------------
-
 ## Phase 3 — Tool Reference and Visual Servo
 
 Goal:
@@ -1410,7 +1537,6 @@ Tasks:
 6.  require stable multi-frame convergence.
 
 Acceptance should include:
-
 - convergence rate,
 - final pixel error,
 - convergence time,
@@ -1421,7 +1547,6 @@ Acceptance should include:
 No ACT is required for this phase.
 
 ------------------------------------------------------------------------
-
 ## Phase 4 — Screen Rectification and Verification
 
 Goal:
@@ -1452,9 +1577,7 @@ Acceptance:
 - high character recognition accuracy,
 - low false-WRONG rate,
 - explicit uncertainty behavior.
-
 ------------------------------------------------------------------------
-
 ## Phase 5 — Deterministic Local Single-Key Closed Loop
 
 Goal:
@@ -1486,7 +1609,6 @@ This proves the local perception-action-verification loop before learned
 coarse motion is introduced.
 
 ------------------------------------------------------------------------
-
 ## Phase 6 — Target-Conditioned ACT Dataset
 
 Goal:
@@ -1508,7 +1630,6 @@ The target condition must be part of every episode’s data schema.
 Do not include screen-camera pixels in the ACT observation.
 
 ------------------------------------------------------------------------
-
 ## Phase 7 — ACT Coarse Policy
 
 Goal:
@@ -1529,7 +1650,6 @@ Evaluate:
 ACT does not need to press the key.
 
 ------------------------------------------------------------------------
-
 ## Phase 8 — ACT + Visual Servo Handoff
 
 Goal:
@@ -1562,9 +1682,7 @@ Acceptance must explicitly test:
 - target reacquisition behavior,
 - handoff success rate,
 - end-to-end single-key success rate.
-
 ------------------------------------------------------------------------
-
 ## Phase 9 — Multi-Key Typing
 
 Goal:
@@ -1584,7 +1702,6 @@ VISION
 Verify after every character.
 
 ------------------------------------------------------------------------
-
 ## Phase 10 — Automatic Recovery
 
 Goal:
@@ -1600,7 +1717,6 @@ Evaluate:
 - final corrected-string accuracy.
 
 ------------------------------------------------------------------------
-
 ## Phase 11 — Controlled Generalization and Ablations
 
 Only after the fixed setup is reliable.
@@ -1618,9 +1734,7 @@ Candidate experiments:
 - template vs HOG/SVM vs tiny CNN,
 - different ACT handoff thresholds,
 - different servo gains and step bounds.
-
 ------------------------------------------------------------------------
-
 # Evaluation
 
 ## End-to-End Typing
@@ -1650,7 +1764,6 @@ confidence
 target pixel size at acquisition
 occlusion rate
 ```
-
 ## ACT
 
 Measure:
@@ -1676,7 +1789,6 @@ convergence time
 convergence rate
 target-loss rate
 ```
-
 ## Verification and Recovery
 
 Measure:
@@ -1692,7 +1804,6 @@ final corrected-string accuracy
 ```
 
 ------------------------------------------------------------------------
-
 # Safety
 
 The robot operates directly above a laptop, so all motion near the
@@ -1715,7 +1826,6 @@ emergency stop
 ```
 
 Safety invariants:
-
 1.  no valid target → no press,
 2.  target lost → no press,
 3.  stale image → no servo correction,
@@ -1724,7 +1834,6 @@ Safety invariants:
 6.  failed verification never causes an unbounded retry loop.
 
 ------------------------------------------------------------------------
-
 # Current Software Environment
 
 The current validated development environment is approximately:
@@ -1743,11 +1852,8 @@ VRAM         ~15.4 GiB
 
 For reproducibility, the project should pin the exact LeRobot
 version/commit and keep an exported environment file.
-
 ------------------------------------------------------------------------
-
 # Proposed Repository Structure
-
 ``` text
 so101_typing/
 │
@@ -1837,9 +1943,7 @@ so101_typing/
 │
 └── README.md
 ```
-
 ------------------------------------------------------------------------
-
 # First End-to-End Milestone
 
 The first complete milestone remains intentionally small:
@@ -1850,7 +1954,6 @@ Input:
 ```
 
 Expected behavior:
-
 ``` text
 Supervisor requests G
         ↓
@@ -1878,14 +1981,12 @@ screen rectification + OCR
         ↓
 CONFIRMED_SUCCESS
 ```
-
 Nothing beyond this is required to prove the primary architecture.
 
 Once this primitive is reliable, multi-character typing is repeated
 execution plus deterministic recovery.
 
 ------------------------------------------------------------------------
-
 # Final Demonstration
 
 A target such as:
@@ -1921,7 +2022,6 @@ If the robot produces:
 ``` text
 ROBOR
 ```
-
 the external screen observer detects the mismatch and the supervisor
 generates:
 
@@ -1946,9 +2046,7 @@ but:
 > useful local state, switches to explicit closed-loop control for
 > precision, physically acts on the world, independently observes the
 > consequence, and autonomously corrects errors.**
-
 ------------------------------------------------------------------------
-
 # Long-Term Extensions
 
 After the V0 architecture is reliable:
@@ -1966,9 +2064,7 @@ After the V0 architecture is reliable:
 - online replanning,
 - autonomous calibration,
 - transfer to other button-based physical interaction tasks.
-
 ------------------------------------------------------------------------
-
 # Project Principle
 
 ``` text
@@ -1983,7 +2079,6 @@ recovery planning         → deterministic supervisor
 ```
 
 The project is intentionally hybrid.
-
 Learning is used where variation and motion priors are valuable.
 
 Classical algorithms are used where geometry, feedback, safety, and task

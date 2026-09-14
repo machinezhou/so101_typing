@@ -121,14 +121,23 @@ class ThreadedOpenCVCamera:
 
             self._frame_id += 1
 
-    def latest(self, copy_image: bool = False) -> CameraFrame | None:
+    def latest(
+        self,
+        copy_image: bool = False,
+    ) -> CameraFrame | None:
         with self._lock:
             frame = self._latest
 
             if frame is None:
                 return None
 
-            image = frame.image.copy() if copy_image else frame.image
+            image = (
+                frame.image.copy()
+                if copy_image
+                else frame.image
+            )
+
+            processing_timestamp = time.monotonic()
 
             return CameraFrame(
                 camera_name=frame.camera_name,
