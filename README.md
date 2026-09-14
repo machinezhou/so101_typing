@@ -1237,8 +1237,8 @@ for each phase remain unchanged in the Development Roadmap below.
 |---|---|---|
 | Phase 0 | Mechanical Feasibility | **Completed** |
 | Phase 1 | Freeze Camera Geometry and Build Camera Sanity Tool | **Completed** |
-| Phase 2 | Wrist Keycap Detection and Glyph Recognition | **IN PROGRESS — CURRENT** |
-| Phase 3 | Tool Reference and Visual Servo | Not Started |
+| Phase 2 | Wrist Keycap Detection and Glyph Recognition | **Completed** |
+| Phase 3 | Tool Reference and Visual Servo | **IN PROGRESS — CURRENT** |
 | Phase 4 | Screen Rectification and Verification | Not Started |
 | Phase 5 | Deterministic Local Single-Key Closed Loop | Not Started |
 | Phase 6 | Target-Conditioned ACT Dataset | Not Started |
@@ -1256,7 +1256,7 @@ phase.
 ## Current Phase
 
 ``` text
-Phase 2 — Wrist Keycap Detection and Glyph Recognition
+Phase 3 — Tool Reference and Visual Servo
 ```
 
 Current checkpoint:
@@ -1267,21 +1267,29 @@ validated camera geometry + calibration
         ↓
 PHASE 1 ACCEPTED / FROZEN
         ↓
-PHASE 2 WRIST PERCEPTION FOUNDATION     <-- CURRENT
+Phase 2 wrist perception
         ↓
-representative wrist-frame dataset
+24 independent WRIST frames / 333 labeled real A-Z glyphs
         ↓
-keycap segmentation + candidate extraction
+HOG + Linear SVM grouped held-out validation
         ↓
-per-key perspective normalization
+persisted runtime classifier + rejection + TargetObservation
         ↓
-appearance-based glyph recognition
+PHASE 2 ACCEPTED / FROZEN
         ↓
-TargetObservation
+PHASE 3 TOOL REFERENCE + VISUAL SERVO     <-- CURRENT
         ↓
-Phase 2 quantitative evaluation
+calibrate tool reference p*
         ↓
-Phase 2 acceptance
+estimate local image Jacobian
+        ↓
+implement bounded XY visual servo
+        ↓
+stale-frame rejection + target-loss handling
+        ↓
+stable multi-frame convergence
+        ↓
+Phase 3 acceptance
 ```
 
 ## Phase 1 Completion Record
@@ -1494,36 +1502,162 @@ validated calibration files and calibration tools
         ↓
 PHASE 1 COMPLETED
         ↓
-PHASE 2 IN PROGRESS — CURRENT
+PHASE 2 COMPLETED
+        ↓
+PHASE 3 IN PROGRESS — CURRENT
 ```
 
-## Phase 2 Entry Condition
+## Phase 2 Completion Record
 
-Phase 2 starts from the frozen WRIST geometry and must solve key identity
-from visible appearance rather than from a pre-programmed keyboard
-layout. The preliminary keycap-candidate logic used by
-`camera_sanity.py` remains diagnostic only and must not be treated as a
-completed Phase 2 detector.
+Phase 2 has now been validated as the V0 wrist-perception checkpoint.
+Key identity is inferred from visible glyph appearance rather than from a
+pre-programmed keyboard row/column identity.
+
+### Wrist perception dataset
+
+The completed dataset contains:
+
+``` text
+24 independent WRIST source frames
+333 labeled real glyph crops
+26 / 26 A-Z classes covered
+```
+
+The first seed round contained 93 glyphs from 8 source frames. A second
+round added 240 high-confidence glyph crops from 16 additional WRIST
+poses, including stronger viewpoint variation, bottom-region views, and
+tool-occlusion cases.
+
+The second-round manifest uses normalized image-coordinate anchors and
+nearest-candidate matching rather than relying on raw contour candidate
+indices. This avoids brittle label association when small OpenCV contour
+count differences occur across environments.
+
+### Classifier selection
+
+The initial strict whole-source-frame held-out comparison established the
+baseline:
+
+``` text
+Template Matching      58 / 92 = 63.0%   (1 skipped class fold)
+HOG + Linear SVM       78 / 92 = 84.8%   (1 skipped class fold)
+```
+
+After adding the second-round viewpoints, the combined dataset was
+re-evaluated with leave-one-source-frame-out grouping:
+
+``` text
+HOG + Linear SVM      322 / 333 = 96.7%
+skipped = 0
+```
+
+This exceeded the approximately 95% decision threshold used for the V0
+classifier choice. HOG + Linear SVM is therefore the accepted Phase 2
+classifier path; Tiny CNN is not required for the current fixed-environment
+V0 checkpoint.
+
+The remaining grouped-held-out errors were concentrated mainly among
+visually similar classes such as T/Y, P/F, L/I, and M/H rather than a
+broad failure of the pipeline.
+
+### Runtime perception wiring
+
+The offline classifier has been integrated into the runtime perception
+path:
+
+``` text
+WRIST frame
+    ↓
+keycap candidates
+    ↓
+per-key rectification
+    ↓
+glyph preprocessing
+    ↓
+persisted HOG + Linear SVM
+    ↓
+confidence / conservative rejection
+    ↓
+target-letter filtering
+    ↓
+TargetObservation
+```
+
+The completed runtime wiring includes:
+
+- persisted classifier loading,
+- conservative unknown/reject handling,
+- A-Z target selection,
+- integration with `TargetObservation`,
+- validation across the collected multi-view WRIST data.
+
+The validated runtime wiring result is:
+
+``` text
+329 / 333 = 98.8% runtime wiring recall
+```
+
+This number is intentionally reported as runtime wiring recall, not as
+held-out classification accuracy. The grouped held-out classifier result
+remains 322 / 333 = 96.7%.
+
+## Phase 2 Acceptance
+
+The Phase 2 checkpoint is accepted for V0 because the system now has:
+
+``` text
+appearance-based key identity
+        +
+real multi-view WRIST data
+        +
+A-Z coverage
+        +
+96.7% grouped held-out HOG + SVM accuracy
+        +
+persisted runtime classifier
+        +
+conservative rejection
+        +
+A-Z target filtering
+        +
+TargetObservation runtime integration
+        +
+98.8% runtime wiring recall
+        ↓
+PHASE 2 COMPLETED
+        ↓
+PHASE 3 IN PROGRESS — CURRENT
+```
+
+## Phase 3 Entry Condition
+
+Phase 3 starts from the accepted wrist-perception runtime and does not
+require ACT. The next task is local closed-loop geometric alignment from a
+safe teleoperated pose.
 
 The next implementation sequence is:
 
 ``` text
-representative WRIST frames
+calibrate tool reference p* = (u*, v*)
         ↓
-keycap segmentation
+estimate local image Jacobian
         ↓
-candidate extraction / geometric filtering
+implement bounded XY correction
         ↓
-per-key perspective normalization
+reject stale frames
         ↓
-glyph dataset + OTHER examples
+detect / handle target loss
         ↓
-Template Matching vs HOG + SVM vs Tiny CNN
+require stable multi-frame convergence
         ↓
-TargetObservation
+measure final pixel error / iterations / convergence time
         ↓
-precision / recall / classification / acquisition evaluation
+Phase 3 acceptance
 ```
+
+The immediate next checkpoint is tool-reference calibration `p*`. ACT,
+press execution, and screen verification remain outside this Phase 3
+checkpoint.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 

@@ -1,0 +1,475 @@
+{
+  "schema_version": 1,
+  "notes": [
+    "Labels were assigned from visible glyph appearance only.",
+    "Candidate indices refer to the Phase-2 geometry-first detector checkpoint.",
+    "This is a seed set for preprocessing/baseline work, not the final training corpus."
+  ],
+  "samples": [
+    {
+      "label": "A",
+      "sample": "01_left_top",
+      "candidate_index": 7
+    },
+    {
+      "label": "A",
+      "sample": "04_left_middle",
+      "candidate_index": 1
+    },
+    {
+      "label": "B",
+      "sample": "02_mid_top",
+      "candidate_index": 13
+    },
+    {
+      "label": "B",
+      "sample": "05_center",
+      "candidate_index": 12
+    },
+    {
+      "label": "B",
+      "sample": "07_bottom",
+      "candidate_index": 9
+    },
+    {
+      "label": "B",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 16
+    },
+    {
+      "label": "C",
+      "sample": "02_mid_top",
+      "candidate_index": 4
+    },
+    {
+      "label": "C",
+      "sample": "04_left_middle",
+      "candidate_index": 14
+    },
+    {
+      "label": "C",
+      "sample": "05_center",
+      "candidate_index": 4
+    },
+    {
+      "label": "C",
+      "sample": "07_bottom",
+      "candidate_index": 0
+    },
+    {
+      "label": "C",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 7
+    },
+    {
+      "label": "D",
+      "sample": "02_mid_top",
+      "candidate_index": 2
+    },
+    {
+      "label": "D",
+      "sample": "04_left_middle",
+      "candidate_index": 12
+    },
+    {
+      "label": "D",
+      "sample": "05_center",
+      "candidate_index": 2
+    },
+    {
+      "label": "D",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 5
+    },
+    {
+      "label": "E",
+      "sample": "02_mid_top",
+      "candidate_index": 1
+    },
+    {
+      "label": "E",
+      "sample": "04_left_middle",
+      "candidate_index": 10
+    },
+    {
+      "label": "E",
+      "sample": "05_center",
+      "candidate_index": 1
+    },
+    {
+      "label": "F",
+      "sample": "02_mid_top",
+      "candidate_index": 7
+    },
+    {
+      "label": "F",
+      "sample": "05_center",
+      "candidate_index": 6
+    },
+    {
+      "label": "F",
+      "sample": "07_bottom",
+      "candidate_index": 3
+    },
+    {
+      "label": "F",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 9
+    },
+    {
+      "label": "G",
+      "sample": "02_mid_top",
+      "candidate_index": 11
+    },
+    {
+      "label": "G",
+      "sample": "05_center",
+      "candidate_index": 11
+    },
+    {
+      "label": "G",
+      "sample": "07_bottom",
+      "candidate_index": 7
+    },
+    {
+      "label": "G",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 14
+    },
+    {
+      "label": "H",
+      "sample": "01_left_top",
+      "candidate_index": 23
+    },
+    {
+      "label": "H",
+      "sample": "07_bottom",
+      "candidate_index": 11
+    },
+    {
+      "label": "H",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 18
+    },
+    {
+      "label": "I",
+      "sample": "03_right_top",
+      "candidate_index": 0
+    },
+    {
+      "label": "I",
+      "sample": "06_right_middle",
+      "candidate_index": 4
+    },
+    {
+      "label": "I",
+      "sample": "07_bottom",
+      "candidate_index": 18
+    },
+    {
+      "label": "I",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 22
+    },
+    {
+      "label": "J",
+      "sample": "01_left_top",
+      "candidate_index": 24
+    },
+    {
+      "label": "J",
+      "sample": "06_right_middle",
+      "candidate_index": 3
+    },
+    {
+      "label": "J",
+      "sample": "07_bottom",
+      "candidate_index": 15
+    },
+    {
+      "label": "K",
+      "sample": "01_left_top",
+      "candidate_index": 25
+    },
+    {
+      "label": "K",
+      "sample": "03_right_top",
+      "candidate_index": 3
+    },
+    {
+      "label": "K",
+      "sample": "06_right_middle",
+      "candidate_index": 7
+    },
+    {
+      "label": "K",
+      "sample": "07_bottom",
+      "candidate_index": 19
+    },
+    {
+      "label": "L",
+      "sample": "03_right_top",
+      "candidate_index": 7
+    },
+    {
+      "label": "L",
+      "sample": "06_right_middle",
+      "candidate_index": 11
+    },
+    {
+      "label": "L",
+      "sample": "07_bottom",
+      "candidate_index": 24
+    },
+    {
+      "label": "M",
+      "sample": "01_left_top",
+      "candidate_index": 26
+    },
+    {
+      "label": "M",
+      "sample": "03_right_top",
+      "candidate_index": 2
+    },
+    {
+      "label": "M",
+      "sample": "06_right_middle",
+      "candidate_index": 6
+    },
+    {
+      "label": "M",
+      "sample": "07_bottom",
+      "candidate_index": 17
+    },
+    {
+      "label": "N",
+      "sample": "05_center",
+      "candidate_index": 15
+    },
+    {
+      "label": "N",
+      "sample": "06_right_middle",
+      "candidate_index": 2
+    },
+    {
+      "label": "N",
+      "sample": "07_bottom",
+      "candidate_index": 13
+    },
+    {
+      "label": "O",
+      "sample": "03_right_top",
+      "candidate_index": 4
+    },
+    {
+      "label": "O",
+      "sample": "04_left_middle",
+      "candidate_index": 22
+    },
+    {
+      "label": "O",
+      "sample": "06_right_middle",
+      "candidate_index": 8
+    },
+    {
+      "label": "O",
+      "sample": "07_bottom",
+      "candidate_index": 23
+    },
+    {
+      "label": "P",
+      "sample": "03_right_top",
+      "candidate_index": 9
+    },
+    {
+      "label": "P",
+      "sample": "06_right_middle",
+      "candidate_index": 12
+    },
+    {
+      "label": "Q",
+      "sample": "01_left_top",
+      "candidate_index": 4
+    },
+    {
+      "label": "R",
+      "sample": "02_mid_top",
+      "candidate_index": 5
+    },
+    {
+      "label": "R",
+      "sample": "04_left_middle",
+      "candidate_index": 15
+    },
+    {
+      "label": "R",
+      "sample": "05_center",
+      "candidate_index": 5
+    },
+    {
+      "label": "R",
+      "sample": "07_bottom",
+      "candidate_index": 2
+    },
+    {
+      "label": "R",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 8
+    },
+    {
+      "label": "S",
+      "sample": "01_left_top",
+      "candidate_index": 12
+    },
+    {
+      "label": "S",
+      "sample": "04_left_middle",
+      "candidate_index": 6
+    },
+    {
+      "label": "S",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 1
+    },
+    {
+      "label": "T",
+      "sample": "01_left_top",
+      "candidate_index": 20
+    },
+    {
+      "label": "T",
+      "sample": "02_mid_top",
+      "candidate_index": 8
+    },
+    {
+      "label": "T",
+      "sample": "04_left_middle",
+      "candidate_index": 17
+    },
+    {
+      "label": "T",
+      "sample": "05_center",
+      "candidate_index": 8
+    },
+    {
+      "label": "T",
+      "sample": "07_bottom",
+      "candidate_index": 6
+    },
+    {
+      "label": "T",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 12
+    },
+    {
+      "label": "U",
+      "sample": "02_mid_top",
+      "candidate_index": 15
+    },
+    {
+      "label": "U",
+      "sample": "06_right_middle",
+      "candidate_index": 0
+    },
+    {
+      "label": "U",
+      "sample": "07_bottom",
+      "candidate_index": 14
+    },
+    {
+      "label": "U",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 20
+    },
+    {
+      "label": "V",
+      "sample": "02_mid_top",
+      "candidate_index": 9
+    },
+    {
+      "label": "V",
+      "sample": "05_center",
+      "candidate_index": 9
+    },
+    {
+      "label": "V",
+      "sample": "07_bottom",
+      "candidate_index": 5
+    },
+    {
+      "label": "V",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 11
+    },
+    {
+      "label": "W",
+      "sample": "01_left_top",
+      "candidate_index": 8
+    },
+    {
+      "label": "W",
+      "sample": "04_left_middle",
+      "candidate_index": 5
+    },
+    {
+      "label": "W",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 0
+    },
+    {
+      "label": "X",
+      "sample": "01_left_top",
+      "candidate_index": 14
+    },
+    {
+      "label": "X",
+      "sample": "02_mid_top",
+      "candidate_index": 0
+    },
+    {
+      "label": "X",
+      "sample": "04_left_middle",
+      "candidate_index": 9
+    },
+    {
+      "label": "X",
+      "sample": "05_center",
+      "candidate_index": 0
+    },
+    {
+      "label": "X",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 4
+    },
+    {
+      "label": "Y",
+      "sample": "02_mid_top",
+      "candidate_index": 12
+    },
+    {
+      "label": "Y",
+      "sample": "04_left_middle",
+      "candidate_index": 19
+    },
+    {
+      "label": "Y",
+      "sample": "07_bottom",
+      "candidate_index": 10
+    },
+    {
+      "label": "Y",
+      "sample": "08_center_offset_occlusion",
+      "candidate_index": 17
+    },
+    {
+      "label": "Z",
+      "sample": "01_left_top",
+      "candidate_index": 10
+    },
+    {
+      "label": "Z",
+      "sample": "04_left_middle",
+      "candidate_index": 4
+    }
+  ]
+}
