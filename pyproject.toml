@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "so101-typing"
+version = "0.1.0"
+description = "Closed-loop SO-101 robotic typing system"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "numpy>=2.2",
+    "PyYAML>=6.0",
+    "opencv-python-headless>=4.13",
+    "lerobot==0.6.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.9",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
