@@ -1,4 +1,10 @@
 {
+  "motion_frame": "keyboard_plane_xy",
+  "motion_unit": "mm",
   "matrix": null,
+  "sample_count": 0,
+  "residual_rms_px": null,
+  "singular_values": null,
+  "condition_number": null,
   "damping": 1e-06
 }
