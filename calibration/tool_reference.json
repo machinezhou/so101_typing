@@ -4,9 +4,9 @@
     640,
     480
   ],
-  "u": null,
-  "v": null,
-  "sample_count": 0,
-  "std_u_px": null,
-  "std_v_px": null
+  "u": 303.0,
+  "v": 227.5,
+  "sample_count": 7,
+  "std_u_px": 1.522173357452174,
+  "std_v_px": 1.284286904919121
 }
