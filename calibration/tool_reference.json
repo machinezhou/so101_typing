@@ -1,4 +1,12 @@
 {
+  "camera_name": "wrist",
+  "image_size": [
+    640,
+    480
+  ],
   "u": null,
-  "v": null
+  "v": null,
+  "sample_count": 0,
+  "std_u_px": null,
+  "std_v_px": null
 }
