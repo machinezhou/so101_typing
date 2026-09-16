@@ -1,11 +1,23 @@
 {
   "motion_frame": "base_link_xy",
   "motion_unit": "mm",
-  "matrix": null,
-  "sample_count": 0,
-  "residual_rms_px": null,
-  "singular_values": null,
-  "condition_number": null,
+  "matrix": [
+    [
+      -2.386845397949219,
+      -0.41411895751953126
+    ],
+    [
+      0.29467163085937503,
+      2.875
+    ]
+  ],
+  "sample_count": 8,
+  "residual_rms_px": 3.2555333751561077,
+  "singular_values": [
+    3.06191404719176,
+    2.2012869422979664
+  ],
+  "condition_number": 1.3909654340634794,
   "damping": 1e-06,
   "input_semantics": "requested_cartesian_delta"
 }

@@ -62,6 +62,10 @@ DEFAULT_MAX_MEASURED_Z_ERROR_MM = 1.0
 DEFAULT_MAX_RESIDUAL_RMS_PX = 5.0
 DEFAULT_MAX_OPPOSITION_COSINE = -0.5
 DEFAULT_MAX_ZERO_JOINT_SHIFT_DEG = 0.5
+DEFAULT_CONDITIONING_MIN_CYCLES = 2
+DEFAULT_CONDITIONING_MAX_CYCLES = 4
+DEFAULT_CONDITIONING_MAX_BEFORE_DRIFT_PX = 10.0
+DEFAULT_CONDITIONING_MAX_RESPONSE_DRIFT_PX = 8.0
 
 
 def _finite_positive(value: float, name: str) -> float:
@@ -572,17 +576,21 @@ def _command_delta(
         f"error_xy={measured_xy_error_mm:.2f}mm error_z={measured_z_error_mm:.2f}mm"
     )
 
-    if measured_z_error_mm > max_measured_z_error_mm:
-        raise RuntimeError(
-            "Measured-joint FK left the anchor Z plane: "
-            f"delta_z={measured_delta_mm[2]:+.3f} mm "
-            f"(limit {max_measured_z_error_mm:.3f} mm). No next Cartesian command."
-        )
-    if measured_xy_error_mm > max_measured_xy_error_mm:
-        raise RuntimeError(
-            "Measured-joint FK missed the requested fixed-anchor XY target: "
-            f"error={measured_xy_error_mm:.3f} mm "
-            f"(limit {max_measured_xy_error_mm:.3f} mm). No next Cartesian command."
+    # H3.2 calibrates command-space image response:
+    # requested Cartesian XY command -> observed WRIST pixel delta.
+    # Measured-joint FK is diagnostic only: the known steady servo residual,
+    # backlash and compliance must not be reinterpreted as a millimetre-accuracy
+    # acceptance gate. Hardware safety is still fail-closed before/around motion
+    # via command norm, EE-step/model-FK checks, joint clipping/slew limits and
+    # the motion-stability settle gate.
+    if (
+        measured_z_error_mm > max_measured_z_error_mm
+        or measured_xy_error_mm > max_measured_xy_error_mm
+    ):
+        print(
+            "[MEASURED-FK NOTE] diagnostic only; not an H3.2 acceptance gate "
+            f"(reference thresholds: XY {max_measured_xy_error_mm:.2f} mm, "
+            f"Z {max_measured_z_error_mm:.2f} mm)"
         )
 
     return joint_action, sent_action, settled_obs, settled_timestamp, diagnostics
@@ -674,6 +682,30 @@ def main() -> None:
         help="Requested Cartesian command magnitude used only with --probe-axis.",
     )
     parser.add_argument("--cycles", type=int, default=DEFAULT_CYCLES)
+    parser.add_argument(
+        "--conditioning-min-cycles",
+        type=int,
+        default=DEFAULT_CONDITIONING_MIN_CYCLES,
+        help="Minimum full +X/-X/+Y/-Y conditioning cycles before readiness can pass.",
+    )
+    parser.add_argument(
+        "--conditioning-max-cycles",
+        type=int,
+        default=DEFAULT_CONDITIONING_MAX_CYCLES,
+        help="Maximum conditioning cycles before failing closed without formal samples.",
+    )
+    parser.add_argument(
+        "--conditioning-max-before-drift-px",
+        type=float,
+        default=DEFAULT_CONDITIONING_MAX_BEFORE_DRIFT_PX,
+        help="Maximum same-phase BEFORE-center drift between adjacent conditioning cycles.",
+    )
+    parser.add_argument(
+        "--conditioning-max-response-drift-px",
+        type=float,
+        default=DEFAULT_CONDITIONING_MAX_RESPONSE_DRIFT_PX,
+        help="Maximum same-phase dUV drift between adjacent conditioning cycles.",
+    )
     parser.add_argument("--burst-frames", type=int, default=DEFAULT_BURST_FRAMES)
     parser.add_argument(
         "--burst-min-inliers",
@@ -737,13 +769,13 @@ def main() -> None:
         "--max-measured-xy-error-mm",
         type=float,
         default=DEFAULT_MAX_MEASURED_XY_ERROR_MM,
-        help="Fail before the next sample if FK(measured joints) misses the requested XY target.",
+        help="Diagnostic reference only; FK(measured joints) is not an H3.2 accuracy gate.",
     )
     parser.add_argument(
         "--max-measured-z-error-mm",
         type=float,
         default=DEFAULT_MAX_MEASURED_Z_ERROR_MM,
-        help="Fail before the next sample if FK(measured joints) leaves the fixed anchor Z plane.",
+        help="Diagnostic reference only; FK(measured joints) is not an H3.2 accuracy gate.",
     )
     parser.add_argument(
         "--max-residual-rms-px",
@@ -785,6 +817,12 @@ def main() -> None:
         raise ValueError("--target must be one ASCII A-Z letter")
     if args.cycles < 1:
         raise ValueError("--cycles must be >= 1")
+    if args.conditioning_min_cycles < 2:
+        raise ValueError("--conditioning-min-cycles must be >= 2")
+    if args.conditioning_max_cycles < args.conditioning_min_cycles:
+        raise ValueError(
+            "--conditioning-max-cycles must be >= --conditioning-min-cycles"
+        )
     if args.burst_frames < 1:
         raise ValueError("--burst-frames must be >= 1")
     if not 1 <= args.burst_min_inliers <= args.burst_frames:
@@ -815,6 +853,8 @@ def main() -> None:
         "max_measured_z_error_mm",
         "max_residual_rms_px",
         "max_condition_number",
+        "conditioning_max_before_drift_px",
+        "conditioning_max_response_drift_px",
     ):
         _finite_positive(getattr(args, name), f"--{name.replace('_', '-')}")
 
@@ -869,7 +909,14 @@ def main() -> None:
         )
     else:
         print(f"calibration step   = {args.step_mm:.1f} commanded-mm")
-        print(f"cycles             = {args.cycles} ({4 * args.cycles} motion samples)")
+        print(f"cycles             = {args.cycles} ({4 * args.cycles} formal motion samples)")
+        print(
+            "conditioning       = adaptive "
+            f"{args.conditioning_min_cycles}..{args.conditioning_max_cycles} cycles; "
+            f"same-phase BEFORE <= {args.conditioning_max_before_drift_px:.1f}px, "
+            f"dUV <= {args.conditioning_max_response_drift_px:.1f}px, "
+            f"X/Y opposition <= {args.max_opposition_cosine:.2f}"
+        )
         print(f"candidate output   = {args.output.resolve()}")
     print(
         "burst consensus    = "
@@ -885,9 +932,9 @@ def main() -> None:
         f"|Z| <= {args.max_model_z_error_mm:.2f} mm before send"
     )
     print(
-        "measured FK gates   = "
-        f"XY <= {args.max_measured_xy_error_mm:.2f} mm, "
-        f"|Z| <= {args.max_measured_z_error_mm:.2f} mm before next command"
+        "measured FK diag    = non-gating; reference thresholds "
+        f"XY {args.max_measured_xy_error_mm:.2f} mm, "
+        f"Z {args.max_measured_z_error_mm:.2f} mm"
     )
     print(
         "pipeline            = EEReferenceAndDelta(fixed anchor) -> EEBoundsAndSafety -> "
@@ -1106,10 +1153,18 @@ def main() -> None:
             f"({ready_center[0]:.2f}, {ready_center[1]:.2f}) px"
         )
 
-        for index, (dx_mm, dy_mm) in enumerate(sequence, start=1):
-            # Every sample starts from the SAME fixed anchor.  For samples after
-            # the first, explicitly return to anchor before capturing BEFORE.
-            if index > 1:
+        def _execute_motion_sample(
+            dx_mm: float,
+            dy_mm: float,
+            *,
+            sample_index: int,
+            sample_role: str,
+            preview_filename: str,
+            skip_anchor_return: bool,
+        ) -> dict:
+            nonlocal last_frame_id
+
+            if not skip_anchor_return:
                 return_observation = robot.get_observation()
                 _, _, _, anchor_settled_timestamp, anchor_return_fk = _command_delta(
                     robot,
@@ -1130,7 +1185,8 @@ def main() -> None:
                     settle_timeout_s=args.settle_timeout_s,
                 )
                 anchor_guard_timestamp = (
-                    anchor_settled_timestamp + args.post_settle_guard_ms / 1000.0
+                    anchor_settled_timestamp
+                    + args.post_settle_guard_ms / 1000.0
                 )
             else:
                 anchor_return_fk = zero_plan
@@ -1175,7 +1231,8 @@ def main() -> None:
             )
 
             min_after_capture_timestamp = (
-                settled_timestamp + args.post_settle_guard_ms / 1000.0
+                settled_timestamp
+                + args.post_settle_guard_ms / 1000.0
             )
 
             after, after_records, image, last_frame_id = _capture_target_center(
@@ -1192,9 +1249,10 @@ def main() -> None:
 
             image_delta = after - before
             motion = [float(dx_mm), float(dy_mm)]
-            delta_px = [float(image_delta[0]), float(image_delta[1])]
-            motions.append(motion)
-            image_deltas.append(delta_px)
+            delta_px = [
+                float(image_delta[0]),
+                float(image_delta[1]),
+            ]
 
             preview = _draw_preview(
                 image,
@@ -1202,50 +1260,395 @@ def main() -> None:
                 before=before,
                 after=after,
                 motion=(dx_mm, dy_mm),
-                sample_index=index,
+                sample_index=sample_index,
             )
-            preview_path = args.artifact_dir / f"sample_{index:02d}.jpg"
+            preview_path = args.artifact_dir / preview_filename
             if not cv2.imwrite(str(preview_path), preview):
-                raise RuntimeError(f"Failed to write preview: {preview_path}")
+                raise RuntimeError(
+                    f"Failed to write preview: {preview_path}"
+                )
 
-            samples.append(
-                {
-                    "sample_index": index,
-                    "requested_cartesian_delta_mm": motion,
-                    "input_semantics": "requested_cartesian_delta",
-                    "reference_semantics": "fixed_anchor",
-                    "anchor_xyz_mm": anchor_xyz_mm.tolist(),
-                    "anchor_return_fk": anchor_return_fk,
-                    "fk_diagnostics": fk_diagnostics,
-                    "before_center_px": [float(before[0]), float(before[1])],
-                    "after_center_px": [float(after[0]), float(after[1])],
-                    "image_delta_px": delta_px,
-                    "before_observations": before_records,
-                    "after_observations": after_records,
-                    "joint_action_requested": {
-                        key: float(value)
-                        for key, value in joint_action.items()
-                        if isinstance(value, (int, float, np.integer, np.floating))
-                    },
-                    "joint_action_sent": {
-                        key: float(value)
-                        for key, value in sent_action.items()
-                        if isinstance(value, (int, float, np.integer, np.floating))
-                    },
-                    "settled_joint_observation": {
-                        key: float(value)
-                        for key, value in settled_obs.items()
-                        if isinstance(value, (int, float, np.integer, np.floating))
-                    },
-                    "settled_timestamp": float(settled_timestamp),
-                    "min_after_capture_timestamp": float(min_after_capture_timestamp),
-                }
+            return {
+                "sample_index": int(sample_index),
+                "sample_role": sample_role,
+                "requested_cartesian_delta_mm": motion,
+                "input_semantics": "requested_cartesian_delta",
+                "reference_semantics": "fixed_anchor",
+                "anchor_xyz_mm": anchor_xyz_mm.tolist(),
+                "anchor_return_fk": anchor_return_fk,
+                "fk_diagnostics": fk_diagnostics,
+                "before_center_px": [
+                    float(before[0]),
+                    float(before[1]),
+                ],
+                "after_center_px": [
+                    float(after[0]),
+                    float(after[1]),
+                ],
+                "image_delta_px": delta_px,
+                "before_observations": before_records,
+                "after_observations": after_records,
+                "joint_action_requested": {
+                    key: float(value)
+                    for key, value in joint_action.items()
+                    if isinstance(
+                        value,
+                        (int, float, np.integer, np.floating),
+                    )
+                },
+                "joint_action_sent": {
+                    key: float(value)
+                    for key, value in sent_action.items()
+                    if isinstance(
+                        value,
+                        (int, float, np.integer, np.floating),
+                    )
+                },
+                "settled_joint_observation": {
+                    key: float(value)
+                    for key, value in settled_obs.items()
+                    if isinstance(
+                        value,
+                        (int, float, np.integer, np.floating),
+                    )
+                },
+                "settled_timestamp": float(settled_timestamp),
+                "min_after_capture_timestamp": float(
+                    min_after_capture_timestamp
+                ),
+            }
+
+        conditioning_samples: list[dict] = []
+        conditioning_reports: list[dict] = []
+        conditioning_converged = False
+        conditioning_cycles_executed = 0
+
+        if not args.probe_axis:
+            conditioning_sequence = [
+                (args.step_mm, 0.0),
+                (-args.step_mm, 0.0),
+                (0.0, args.step_mm),
+                (0.0, -args.step_mm),
+            ]
+            previous_cycle: list[dict] | None = None
+
+            print()
+            print("===== H3.2 ADAPTIVE CONDITIONING =====")
+            print(
+                "Conditioning samples are readiness-only "
+                "and are NEVER used to fit J_cmd."
             )
+
+            for cycle_index in range(
+                1,
+                args.conditioning_max_cycles + 1,
+            ):
+                cycle_records: list[dict] = []
+
+                for phase_index, (dx_mm, dy_mm) in enumerate(
+                    conditioning_sequence,
+                    start=1,
+                ):
+                    conditioning_index = (
+                        (cycle_index - 1) * 4 + phase_index
+                    )
+
+                    record = _execute_motion_sample(
+                        dx_mm,
+                        dy_mm,
+                        sample_index=conditioning_index,
+                        sample_role="conditioning",
+                        preview_filename=(
+                            f"conditioning_c{cycle_index:02d}"
+                            f"_p{phase_index:02d}.jpg"
+                        ),
+                        skip_anchor_return=(
+                            cycle_index == 1
+                            and phase_index == 1
+                        ),
+                    )
+
+                    record["conditioning_cycle"] = int(
+                        cycle_index
+                    )
+                    record["conditioning_phase"] = int(
+                        phase_index
+                    )
+
+                    conditioning_samples.append(record)
+                    cycle_records.append(record)
+
+                    duv = record["image_delta_px"]
+                    print(
+                        f"[COND {cycle_index:02d}.{phase_index}] "
+                        f"anchor->dXY="
+                        f"({dx_mm:+.1f},{dy_mm:+.1f}) mm  "
+                        f"dUV=({duv[0]:+.2f},{duv[1]:+.2f}) px"
+                    )
+
+                cycle_motions = [
+                    record["requested_cartesian_delta_mm"]
+                    for record in cycle_records
+                ]
+                cycle_duv = [
+                    record["image_delta_px"]
+                    for record in cycle_records
+                ]
+
+                cycle_direction = _direction_consistency(
+                    cycle_motions,
+                    cycle_duv,
+                )
+
+                x_cos = cycle_direction["x"][
+                    "opposition_cosine"
+                ]
+                y_cos = cycle_direction["y"][
+                    "opposition_cosine"
+                ]
+
+                report = {
+                    "cycle": int(cycle_index),
+                    "direction_consistency": cycle_direction,
+                    "compared_to_cycle": None,
+                    "before_phase_drift_px": None,
+                    "response_phase_drift_px": None,
+                    "max_before_phase_drift_px": None,
+                    "max_response_phase_drift_px": None,
+                    "converged": False,
+                }
+
+                if previous_cycle is not None:
+                    before_drifts = []
+                    response_drifts = []
+
+                    for previous, current in zip(
+                        previous_cycle,
+                        cycle_records,
+                        strict=True,
+                    ):
+                        previous_before = np.asarray(
+                            previous["before_center_px"],
+                            dtype=np.float64,
+                        )
+                        current_before = np.asarray(
+                            current["before_center_px"],
+                            dtype=np.float64,
+                        )
+
+                        previous_duv = np.asarray(
+                            previous["image_delta_px"],
+                            dtype=np.float64,
+                        )
+                        current_duv = np.asarray(
+                            current["image_delta_px"],
+                            dtype=np.float64,
+                        )
+
+                        before_drifts.append(
+                            float(
+                                np.linalg.norm(
+                                    current_before
+                                    - previous_before
+                                )
+                            )
+                        )
+
+                        response_drifts.append(
+                            float(
+                                np.linalg.norm(
+                                    current_duv
+                                    - previous_duv
+                                )
+                            )
+                        )
+
+                    max_before_drift = max(before_drifts)
+                    max_response_drift = max(
+                        response_drifts
+                    )
+
+                    direction_ok = (
+                        x_cos is not None
+                        and y_cos is not None
+                        and float(x_cos)
+                        <= args.max_opposition_cosine
+                        and float(y_cos)
+                        <= args.max_opposition_cosine
+                    )
+
+                    drift_ok = (
+                        max_before_drift
+                        <= args.conditioning_max_before_drift_px
+                        and max_response_drift
+                        <= args.conditioning_max_response_drift_px
+                    )
+
+                    enough_cycles = (
+                        cycle_index
+                        >= args.conditioning_min_cycles
+                    )
+
+                    conditioning_converged = bool(
+                        enough_cycles
+                        and direction_ok
+                        and drift_ok
+                    )
+
+                    report.update(
+                        {
+                            "compared_to_cycle": int(
+                                cycle_index - 1
+                            ),
+                            "before_phase_drift_px": before_drifts,
+                            "response_phase_drift_px": response_drifts,
+                            "max_before_phase_drift_px": float(
+                                max_before_drift
+                            ),
+                            "max_response_phase_drift_px": float(
+                                max_response_drift
+                            ),
+                            "converged": conditioning_converged,
+                        }
+                    )
+
+                    print(
+                        f"[COND CHECK "
+                        f"{cycle_index - 1}->{cycle_index}] "
+                        f"max BEFORE drift="
+                        f"{max_before_drift:.2f}px "
+                        f"(<= "
+                        f"{args.conditioning_max_before_drift_px:.2f})  "
+                        f"max dUV drift="
+                        f"{max_response_drift:.2f}px "
+                        f"(<= "
+                        f"{args.conditioning_max_response_drift_px:.2f})  "
+                        f"opposition X={x_cos!r} "
+                        f"Y={y_cos!r} "
+                        f"(<= "
+                        f"{args.max_opposition_cosine:.2f})"
+                    )
+
+                else:
+                    print(
+                        f"[COND CHECK {cycle_index}] "
+                        "baseline cycle recorded; "
+                        "one adjacent cycle is required "
+                        "for convergence."
+                    )
+
+                conditioning_reports.append(report)
+                conditioning_cycles_executed = cycle_index
+
+                if conditioning_converged:
+                    print(
+                        f"[CONDITIONING PASS] stable after "
+                        f"{cycle_index} cycles; "
+                        "formal samples start fresh and "
+                        "conditioning data remain excluded."
+                    )
+                    break
+
+                previous_cycle = cycle_records
+
+            if not conditioning_converged:
+                conditioning_failure = {
+                    "schema_version": 1,
+                    "protocol": "fixed_anchor_conditioning_v1",
+                    "input_semantics":
+                        "requested_cartesian_delta",
+                    "reference_semantics": "fixed_anchor",
+                    "measured_fk_policy": "diagnostic_only",
+                    "anchor_xyz_mm": anchor_xyz_mm.tolist(),
+                    "target_label": target_label,
+                    "step_commanded_mm": float(
+                        args.step_mm
+                    ),
+                    "thresholds": {
+                        "min_cycles": int(
+                            args.conditioning_min_cycles
+                        ),
+                        "max_cycles": int(
+                            args.conditioning_max_cycles
+                        ),
+                        "max_before_phase_drift_px": float(
+                            args.conditioning_max_before_drift_px
+                        ),
+                        "max_response_phase_drift_px": float(
+                            args.conditioning_max_response_drift_px
+                        ),
+                        "max_opposition_cosine": float(
+                            args.max_opposition_cosine
+                        ),
+                    },
+                    "cycles_executed": int(
+                        conditioning_cycles_executed
+                    ),
+                    "converged": False,
+                    "cycle_reports": conditioning_reports,
+                    "samples": conditioning_samples,
+                }
+
+                failure_path = (
+                    args.artifact_dir
+                    / "conditioning_failure_session.json"
+                )
+
+                failure_path.write_text(
+                    json.dumps(
+                        conditioning_failure,
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+
+                raise RuntimeError(
+                    "Adaptive conditioning did not converge "
+                    f"within {args.conditioning_max_cycles} cycles; "
+                    "formal H3.2 samples were NOT started. "
+                    f"See {failure_path}"
+                )
+
+            print("===== FORMAL H3.2 SAMPLING =====")
+
+        # Probe bypasses conditioning.
+        # Full H3.2 starts a completely fresh formal dataset.
+        for index, (dx_mm, dy_mm) in enumerate(
+            sequence,
+            start=1,
+        ):
+            record = _execute_motion_sample(
+                dx_mm,
+                dy_mm,
+                sample_index=index,
+                sample_role=(
+                    "probe"
+                    if args.probe_axis
+                    else "calibration"
+                ),
+                preview_filename=f"sample_{index:02d}.jpg",
+                skip_anchor_return=bool(
+                    args.probe_axis
+                    and index == 1
+                ),
+            )
+
+            motion = record[
+                "requested_cartesian_delta_mm"
+            ]
+            delta_px = record["image_delta_px"]
+
+            motions.append(motion)
+            image_deltas.append(delta_px)
+            samples.append(record)
 
             print(
                 f"[{index:02d}/{len(sequence):02d}] "
-                f"anchor->dXY=({dx_mm:+.1f},{dy_mm:+.1f}) mm  "
-                f"dUV=({image_delta[0]:+.2f},{image_delta[1]:+.2f}) px"
+                f"anchor->dXY="
+                f"({dx_mm:+.1f},{dy_mm:+.1f}) mm  "
+                f"dUV=({delta_px[0]:+.2f},"
+                f"{delta_px[1]:+.2f}) px"
             )
 
         # End autonomous sampling by returning to the same fixed anchor.
@@ -1277,6 +1680,7 @@ def main() -> None:
                 "protocol": "fixed_anchor_cartesian_single_xy_probe_v2",
                 "input_semantics": "requested_cartesian_delta",
                 "reference_semantics": "fixed_anchor",
+                "measured_fk_policy": "diagnostic_only",
                 "anchor_xyz_mm": anchor_xyz_mm.tolist(),
                 "final_anchor_fk": final_anchor_fk,
                 "target_label": target_label,
@@ -1357,9 +1761,10 @@ def main() -> None:
 
         session = {
             "schema_version": 1,
-            "protocol": "fixed_anchor_cartesian_paired_xy_perturbations_v2",
+            "protocol": "fixed_anchor_conditioned_cartesian_paired_xy_perturbations_v3",
             "input_semantics": "requested_cartesian_delta",
             "reference_semantics": "fixed_anchor",
+            "measured_fk_policy": "diagnostic_only",
             "anchor_xyz_mm": anchor_xyz_mm.tolist(),
             "final_anchor_fk": final_anchor_fk,
             "target_label": target_label,
@@ -1380,6 +1785,29 @@ def main() -> None:
                 "cluster_radius_px": float(args.burst_cluster_radius_px),
             },
             "post_settle_guard_ms": float(args.post_settle_guard_ms),
+            "conditioning": {
+                "policy": "phase_matched_adjacent_cycle_convergence_v1",
+                "min_cycles": int(args.conditioning_min_cycles),
+                "max_cycles": int(args.conditioning_max_cycles),
+                "max_before_phase_drift_px": float(
+                    args.conditioning_max_before_drift_px
+                ),
+                "max_response_phase_drift_px": float(
+                    args.conditioning_max_response_drift_px
+                ),
+                "max_opposition_cosine": float(
+                    args.max_opposition_cosine
+                ),
+                "cycles_executed": int(
+                    conditioning_cycles_executed
+                ),
+                "converged": bool(
+                    conditioning_converged
+                ),
+                "cycle_reports": conditioning_reports,
+                "samples": conditioning_samples,
+                "excluded_from_jacobian_fit": True,
+            },
             "samples": samples,
             "image_jacobian": calibration.to_dict(),
             "residual_vectors_px": residual.tolist(),

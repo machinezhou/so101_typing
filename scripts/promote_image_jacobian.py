@@ -50,12 +50,51 @@ def main() -> None:
         raise RuntimeError("Candidate does not use requested Cartesian command semantics")
 
     session_data = json.loads(args.session.read_text(encoding="utf-8"))
-    if session_data.get("protocol") != "fixed_anchor_cartesian_paired_xy_perturbations_v2":
-        raise RuntimeError("Session is not a fixed-anchor H3.2 calibration session")
+    if (
+        session_data.get("protocol")
+        != "fixed_anchor_conditioned_cartesian_paired_xy_perturbations_v3"
+    ):
+        raise RuntimeError(
+            "Session is not a conditioned fixed-anchor H3.2 v3 calibration session"
+        )
+
+    conditioning = session_data.get("conditioning")
+    if (
+        not isinstance(conditioning, dict)
+        or conditioning.get("converged") is not True
+    ):
+        raise RuntimeError(
+            "Session did not pass adaptive conditioning"
+        )
+
+    if (
+        conditioning.get("excluded_from_jacobian_fit")
+        is not True
+    ):
+        raise RuntimeError(
+            "Conditioning samples were not explicitly excluded from J fit"
+        )
     if session_data.get("input_semantics") != REQUESTED_CARTESIAN_DELTA:
         raise RuntimeError("Session input semantics do not match the command-space contract")
     if session_data.get("image_jacobian") != candidate.to_dict():
         raise RuntimeError("Session Jacobian does not exactly match the candidate artifact")
+
+    formal_samples = session_data.get("samples")
+    if (
+        not isinstance(formal_samples, list)
+        or len(formal_samples) != candidate.sample_count
+    ):
+        raise RuntimeError(
+            "Formal sample count does not match the candidate"
+        )
+
+    if any(
+        sample.get("sample_role") != "calibration"
+        for sample in formal_samples
+    ):
+        raise RuntimeError(
+            "Session formal sample set contains non-calibration samples"
+        )
     acceptance = session_data.get("acceptance")
     if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
         raise RuntimeError("Session did not pass automatic H3.2 acceptance gates")
