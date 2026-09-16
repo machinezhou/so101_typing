@@ -1359,25 +1359,25 @@ tool reference p* calibrated              ✓
         ↓
 LeRobot official Cartesian backend        ✓
         ↓
-H3.2 image-Jacobian calibration tooling   ✓ 141/141 + dry-run preflight
+fixed-anchor Cartesian planning            ✓
         ↓
-project-side Cartesian regression isolated/fixed
+H3.2 conditioned physical calibration      ✓ ACCEPTED
         ↓
-same-target joint hold                    ✓ stable at 30 Hz
+conditioning convergence                   ✓ 3 cycles
         ↓
-fixed-anchor zero-delta plan               ✓ 0.000 deg joint shift
+formal paired samples                      ✓ 8 samples
         ↓
-+X 5 mm fixed-anchor plan check            ✓ FK=(+4.95,-0.01,-0.09) mm
+J_cmd [px/commanded-mm]                    ✓
+[[-2.386845, -0.414119],
+ [ 0.294672,  2.875000]]
         ↓
-CARTESIAN PLANNING DEBUG CHECKPOINT      ✓ ACCEPTED
+residual RMS / condition number            ✓ 3.256 px / 1.391
         ↓
-controlled +X physical probe              <-- NEXT H3.2 CALIBRATION STEP
+direction opposition X / Y                 ✓ -0.981 / -0.931
         ↓
-candidate command-space J_cmd
+canonical image_jacobian.json              ✓ PROMOTED
         ↓
-review + promote accepted J_cmd
-        ↓
-integrate existing bounded XY servo runtime with hardware
+closed-loop XY visual-servo hardware       <-- NEXT
         ↓
 stale-frame rejection + target-loss handling
         ↓
@@ -1729,88 +1729,98 @@ Phase 3 starts from the accepted wrist-perception runtime and does not
 require ACT. The current task remains local closed-loop geometric alignment
 from a safe teleoperated pose.
 
-Completed or software-validated at this checkpoint:
+Completed or hardware-validated at this checkpoint:
 
 - H3.1 tool-reference calibration is complete; the WRIST tool reference
   `p*` is available. The WRIST mount, pencil/tool mounting, SO-101 base, and
   fixed MacBook geometry have remained unchanged since that calibration, so
   H3.1 remains valid and does not need to be repeated.
-- Cartesian motion now delegates FK, end-effector bounds/safety processing,
-  IK, and joint-target generation to LeRobot's SO-101 Cartesian processor
-  path instead of maintaining a project-local IK contract.
+- Cartesian motion delegates FK, end-effector bounds/safety processing, IK,
+  and joint-target generation to LeRobot's SO-101 Cartesian processor path
+  instead of maintaining a project-local IK contract.
 - Project-facing visual-servo corrections use `base_link_xy` and
   **commanded millimetres**. These are requested Cartesian command units,
   not independently measured TCP displacement or positioning-accuracy
   claims. LeRobot owns conversion through the robot kinematics path.
-- The H3.2 image-Jacobian calibration tool is implemented. On the intended
-  development machine, the current hardware-gate version passed the pinned
-  LeRobot dry-run preflight with the SO-101 URDF resolved from
-  `HF_LEROBOT_HOME/robot-urdfs/so101`.
-- The current repository contains 141 unit tests; **141/141 passed** on the
-  intended development machine before the physical probe.
-- The project-side Cartesian regression investigated before the H3.2 physical
-  probe has now been isolated and corrected. A dedicated same-target hardware
-  hold test repeatedly sent one unchanged joint target at 30 Hz and passed with
-  **0.000 deg observed span on every joint**. This rules out repeated identical
-  joint-target transmission as the source of the previously observed drift.
-- The corrected fixed-anchor planning path was then checked at the real
-  perception-safe working hover. The zero Cartesian request reproduced the
-  anchor with **0.000 deg maximum planned joint shift**.
-- A final `--plan-only` fixed-anchor check requested **+X 5.00 commanded-mm**
-  from anchor XYZ `(+289.24,+53.89,+49.18) mm`. The planned target returned by
-  project FK was `(+4.95,-0.01,-0.09) mm` relative to the anchor, with
-  **0.05 mm XY model error** and **0.09 mm Z model error**. Planned arm-joint
-  deltas were `shoulder_pan=+0.224 deg`, `shoulder_lift=+2.388 deg`,
-  `elbow_flex=-3.088 deg`, `wrist_flex=+0.699 deg`, and
-  `wrist_roll=+0.208 deg`. The plan passed all configured gates and **no
-  Cartesian action was sent to the robot**.
-- `--plan-only` is now a true kinematic planning check: after anchor latching
-  and the zero-delta gate it does not depend on glyph acquisition and does not
-  send Cartesian motion. This removes the earlier plan-only visual dependency
-  and the subsequent unbound `ready_center` failure.
-- This closes the current **code-debugging checkpoint**. The corrected code is
-  suitable to save/commit/upload as the new Phase 3 development baseline. The
-  result establishes project-side planning/reference consistency; it does not
-  claim physical TCP millimetre accuracy.
-- The SO-101 follower hardware/calibration remains unchanged from the last
-  normal leader/follower teleoperation checkpoint, so no follower
-  recalibration is required before H3.2.
-- Physical H3.2 image-Jacobian calibration has **not** yet been accepted. The
-  next item is the controlled +X physical probe as the first measurement step
-  of H3.2 itself, not an additional verification round for the fixed code. It
-  is followed by the full local Jacobian measurement and review of residual
-  error and conditioning.
+- The project-side Cartesian regression investigated before physical H3.2 was
+  isolated and corrected. A same-target hardware hold repeatedly sent one
+  unchanged joint target at 30 Hz and passed with **0.000 deg observed span
+  on every joint**. The corrected fixed-anchor zero request also reproduced
+  the anchor with **0.000 deg maximum planned joint shift**.
+- A fixed-anchor `+X 5.00` commanded-mm plan check returned approximately
+  `(+4.95,-0.01,-0.09) mm` relative to the model anchor, with **0.05 mm XY
+  model error** and **0.09 mm Z model error**. This remains a model-consistency
+  and safety check, not a physical TCP-accuracy claim.
+- H3.2 now uses an **adaptive conditioned fixed-anchor protocol**. Conditioning
+  runs repeated `+X/-X/+Y/-Y` cycles as readiness-only data and never includes
+  those samples in the Jacobian fit. Readiness requires adjacent same-phase
+  cycles to satisfy the configured image-position drift, image-response drift,
+  and X/Y opposition gates.
+- On the accepted physical run, conditioning correctly rejected the first
+  adjacent-cycle comparison and converged on the next one. The protocol passed
+  after **3 conditioning cycles**. Only then did the script start a fresh
+  formal H3.2 dataset.
+- The formal dataset contains **8** paired `+X/-X/+Y/-Y` motion samples. The
+  accepted command-space image Jacobian is:
 
-The code-debugging checkpoint is complete. The remaining Phase 3 sequence is:
+  ``` text
+  J_cmd [px/commanded-mm] =
+  [[-2.386845397949219,   -0.41411895751953126],
+   [ 0.29467163085937503,  2.87500000000000000]]
+  ```
+
+- Formal H3.2 acceptance metrics were **residual RMS = 3.256 px**,
+  **condition number = 1.391**, **X opposition = -0.981**, and
+  **Y opposition = -0.931**. The candidate was accepted with no reported
+  acceptance errors.
+- The accepted candidate was explicitly promoted with
+  `scripts/promote_image_jacobian.py --confirm-reviewed`. The canonical
+  calibration is now `calibration/image_jacobian.json` with
+  `sample_count = 8` and `input_semantics = requested_cartesian_delta`.
+- Measured-joint FK remains **diagnostic-only** for H3.2. The calibrated
+  mapping is `requested Cartesian XY delta -> observed WRIST pixel delta`;
+  measured FK must not be reintroduced as an open-loop millimetre-accuracy
+  acceptance gate.
+- The pre-H3.2 software baseline had **141/141 unit tests passing**. The final
+  promotion checkpoint also passed Python compilation and `git diff --check`.
+- **H3.2 is complete and should now be treated as a saved calibration
+  checkpoint.** Do not repeat it unless the fixed camera/tool/keyboard geometry
+  changes or later closed-loop evidence contradicts the local calibration.
+
+The remaining Phase 3 sequence is:
 
 ``` text
-controlled physical probe (first H3.2 measurement step)
+canonical J_cmd available                    ✓
         ↓
-measure local command-space image Jacobian J_cmd [px/commanded-mm]
+run bounded XY visual servo on hardware      <-- NEXT
         ↓
-review residual / conditioning / repeatability
+compute pixel error relative to p*
         ↓
-promote accepted candidate calibration
+solve bounded Cartesian XY correction
         ↓
-integrate and tune the existing bounded XY correction runtime
+command from the current measured robot state
         ↓
-reject stale frames
+reacquire a fresh WRIST observation
         ↓
-detect / handle target loss
+reject stale frames / handle target loss
         ↓
 require stable multi-frame convergence
         ↓
-measure final pixel error / iterations / convergence time
+repeat G convergence from several image offsets
+        ↓
+perform two cross-keyboard transfer sanity checks
+        ↓
+measure final error / iterations / time / failures
         ↓
 Phase 3 acceptance
 ```
 
 ### Phase 3 implementation notes / pitfalls
 
-These notes capture lessons from the current integration work so the next
-iteration does not repeat the same debugging path:
+These notes capture lessons from the current integration work so later
+iterations do not reopen already-resolved branches:
 
-- Do **not** treat FK → IK → FK consistency inside one URDF model as proof of
+- Do **not** treat FK -> IK -> FK consistency inside one URDF model as proof of
   real-world millimetre accuracy. It validates model consistency, not the
   physical SO-101.
 - Do **not** make sub-millimetre open-loop Cartesian accuracy a prerequisite
@@ -1820,42 +1830,40 @@ iteration does not repeat the same debugging path:
 - Prefer LeRobot's existing SO-101 kinematics, calibration, and Cartesian
   processors over duplicating servo calibration or building another IK
   wrapper. The follower calibration remains owned by LeRobot.
-- Each visual-servo correction should be referenced from the current measured
-  robot state rather than accumulating an idealized Cartesian pose.
+- Each visual-servo correction should be referenced from the **current measured
+  robot state** rather than accumulating an idealized Cartesian pose.
 - The calibrated Jacobian is explicitly a **command-space** mapping:
-  `requested Cartesian XY delta -> observed WRIST pixel delta`. Do not turn
-  H3.2 into a physical TCP-displacement metrology experiment. FK-derived
-  displacement may be logged for debugging, but it is not a Phase 3
-  prerequisite or acceptance metric.
+  `requested Cartesian XY delta -> observed WRIST pixel delta`. FK-derived
+  displacement may be logged for diagnostics, but it is not a Phase 3
+  positioning-accuracy metric.
 - Keep safety limits distinct from accuracy requirements. A maximum Cartesian
   step is a motion bound, not a claim that the arm can position to that
   tolerance.
-- Calibrate the local image Jacobian experimentally in the real WRIST view
-  before tuning servo gains or total-correction budgets. Avoid choosing those
-  values from an assumed millimetre-level robot model.
+- Keep the adaptive H3.2 conditioning protocol. The accepted run demonstrated
+  a real first-cycle transient; conditioning prevented that transient from
+  contaminating the formal Jacobian fit. Conditioning samples are readiness
+  data only and must remain excluded from `J_cmd` fitting.
+- Do not relatch the fixed Cartesian command anchor during conditioning. The
+  accepted protocol keeps one fixed command anchor, detects convergence from
+  adjacent complete cycles, and starts a fresh formal dataset only after
+  readiness passes.
 - Use the SO-101 URDF from LeRobot's configured cache (`HF_LEROBOT_HOME`);
   do not introduce a second project-specific URDF location without a concrete
   reason.
 - **Observed WRIST occlusion constraint:** when the pencil tip is less than
   roughly **1 cm above the keyboard**, the pencil/tool can occlude the target
-  key/glyph. Do not assume reliable target recognition in this near-contact
-  zone. Keep XY visual alignment at a perception-safe pre-press height where
-  possible, treat degraded visibility as target loss, and keep lateral
+  key/glyph. Keep XY visual alignment at a perception-safe pre-press height
+  where possible, treat degraded visibility as target loss, and keep lateral
   alignment separate from the later Z press.
-- The large outliers seen in H3.1 samples 5 and 7 occurred during this
-  near-contact/hand-motion occlusion condition; they are not evidence that
-  normal-hover glyph recognition randomly changes identity. Robust burst
-  consensus remains as a defensive guard against transient occlusion or a
-  wrong candidate entering one measurement burst.
-- The pre-probe Cartesian regression has been resolved with two complementary
-  checks: unchanged joint targets remain stable in hardware, and the corrected
-  fixed-anchor `IK -> planned joints -> FK` path preserves zero delta and plans
-  +X 5 commanded-mm within the model gates. Do not reopen that debugging branch
-  unless a later physical measurement produces contradictory evidence.
-- Hardware calibration should start with a controlled single-step probe and
-  explicit abort behavior before running the full multi-sample sequence. This
-  probe is the next H3.2 measurement step, not a prerequisite for saving the
-  corrected code checkpoint.
+- Robust burst consensus remains a defensive guard against transient occlusion
+  or a wrong glyph candidate entering one measurement burst.
+- Do not reopen the old same-target drift / fixed-anchor planning investigation
+  unless a later physical measurement produces contradictory evidence. The
+  dedicated hold test and corrected fixed-anchor planning checks already closed
+  that branch.
+- The next hardware gate is **closed-loop XY visual-servo validation**. It is
+  not another Jacobian probe or calibration round, and it still must not perform
+  a Z press.
 
 ### Phase 3 hardware ownership and abort contract
 
@@ -1865,23 +1873,23 @@ configuration with a torque-disabled section, so reconnecting while the arm is
 already hovering above the keyboard would reintroduce an avoidable sag/handoff
 risk.
 
-Instead, `scripts/calibrate_image_jacobian.py` owns the follower and leader for
-the whole hardware session:
+The Phase 3 hardware process should own the follower and leader for the whole
+session:
 
 ``` text
 start with leader + follower at normal zero/home
         ↓
-script connects follower once (safe rest pose)
+process connects follower once (safe rest pose)
         ↓
-script connects leader
+process connects leader
         ↓
-in-process leader → follower teleoperation
+in-process leader -> follower teleoperation
         ↓
 operator moves to perception-safe hover
         ↓
 press ENTER to freeze the manual pose
         ↓
-probe / H3.2 autonomous XY commands
+autonomous bounded XY visual-servo corrections
         ↓
 in-process operator recovery teleoperation resumes
         ↓
@@ -1896,7 +1904,7 @@ This keeps the follower connected across manual positioning and autonomous
 motion, so the transition does not call `SO101Follower.connect()` again at the
 hover pose.
 
-Exit semantics are deliberately separated:
+Exit semantics remain deliberately separated:
 
 - **normal Phase 3 completion:** stop autonomous corrections and resume
   operator-controlled leader/follower teleoperation; the operator returns to
@@ -1915,30 +1923,40 @@ Exit semantics are deliberately separated:
 Do not interpret "abort" as "blindly drive home". Returning home is an
 operator-controlled recovery step after autonomous motion has stopped.
 
-The first hardware action is intentionally one Cartesian command only:
+### H3.2 recalibration policy
 
-``` bash
-python scripts/calibrate_image_jacobian.py \
-  --robot-port /dev/ttyACM0 \
-  --leader-port /dev/ttyACM1 \
-  --probe-axis +x \
-  --probe-step-mm 5
+The accepted H3.2 result is now canonical. A future H3.2 recalibration should
+only be run after a relevant camera/tool/keyboard geometry change or if later
+closed-loop evidence shows that the local mapping is no longer valid.
+
+When recalibration is actually required, preserve the accepted protocol:
+
+``` text
+teleoperate to perception-safe hover
+        ↓
+latch one fixed Cartesian command anchor
+        ↓
+adaptive +X/-X/+Y/-Y conditioning
+        ↓
+conditioning convergence gate
+        ↓
+start a fresh formal paired sample set
+        ↓
+fit and review candidate J_cmd
+        ↓
+explicit promotion only after acceptance
 ```
 
-Probe mode records `artifacts/image_jacobian_calibration/probe_session.json`,
-does not fit a Jacobian, and does not modify
-`calibration/image_jacobian.json`. Only after that probe is reviewed should
-the paired `+X/-X/+Y/-Y` calibration be run. The full calibration writes a
-**candidate** artifact under `artifacts/image_jacobian_calibration/`; the
-canonical calibration remains unchanged until the candidate is reviewed and
-explicitly promoted with:
+Conditioning samples remain excluded from the Jacobian fit. The full
+calibration writes a **candidate** under `artifacts/image_jacobian_calibration/`;
+the canonical file is changed only by explicit review/promotion:
 
 ``` bash
 python scripts/promote_image_jacobian.py --confirm-reviewed
 ```
 
 ACT, key-press execution, and screen verification remain outside the current
-Phase 3 checkpoint.
+Phase 3 checkpoint. The next hardware work is XY-only visual-servo convergence.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
