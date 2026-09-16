@@ -1,424 +1,141 @@
+import math
 import unittest
-
-import numpy as np
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from so101_typing.control.cartesian_kinematics import (
-    CartesianIKSafetyConfig,
+    DEFAULT_MAX_DELTA_NORM_MM,
+    MM_TO_M,
     MOTION_FRAME,
-    SafeCartesianIK,
+    MOTION_UNIT,
+    SO101_MOTOR_NAMES,
+    build_official_cartesian_pipeline,
+    make_cartesian_delta_action,
 )
 
 
-JOINTS = (
-    "j1",
-    "j2",
-    "j3",
-    "j4",
-    "j5",
-)
-
-LIMITS = {
-    name: (-100.0, 100.0)
-    for name in JOINTS
-}
-
-
-class FakeKinematics:
-    def __init__(
-        self,
-        *,
-        achieved_xyz_mm=(1.0, 0.0, 0.0),
-        dq_deg=(0.5, 0.0, 0.0, 0.0, 0.0),
-        orientation_change_deg=0.0,
-    ):
-        self.achieved_xyz_mm = np.asarray(
-            achieved_xyz_mm,
-            dtype=np.float64,
+class TestCartesianDeltaAction(unittest.TestCase):
+    def test_contract_is_mm_in_base_frame(self):
+        action = make_cartesian_delta_action(
+            10.0,
+            -7.5,
+            delta_z_mm=2.0,
         )
 
-        self.dq_deg = np.asarray(
-            dq_deg,
-            dtype=np.float64,
+        self.assertEqual(MOTION_FRAME, "base_link_xy")
+        self.assertEqual(MOTION_UNIT, "mm")
+        self.assertEqual(MM_TO_M, 0.001)
+
+        self.assertTrue(action["enabled"])
+
+        self.assertEqual(action["target_x"], 10.0)
+        self.assertEqual(action["target_y"], -7.5)
+        self.assertEqual(action["target_z"], 2.0)
+
+        self.assertEqual(action["target_wx"], 0.0)
+        self.assertEqual(action["target_wy"], 0.0)
+        self.assertEqual(action["target_wz"], 0.0)
+
+        self.assertEqual(action["gripper_vel"], 0.0)
+
+    def test_centimetre_scale_request_is_allowed_by_adapter(self):
+        action = make_cartesian_delta_action(
+            10.0,
+            0.0,
         )
 
-        self.orientation_change_deg = float(
-            orientation_change_deg
-        )
+        self.assertEqual(action["target_x"], 10.0)
 
-        self.q0 = None
-        self.q1 = None
-
-        self.warmed = False
-        self.inverse_saw_warm_state = False
-
-    def forward_kinematics(
-        self,
-        joint_pos_deg,
-    ):
-        q = np.asarray(
-            joint_pos_deg,
-            dtype=np.float64,
-        )
-
-        if self.q0 is None:
-            self.q0 = q.copy()
-            self.warmed = True
-
-            return np.eye(
-                4,
-                dtype=np.float64,
-            )
-
-        if (
-            self.q1 is not None
-            and np.allclose(
-                q,
-                self.q1,
-            )
-        ):
-            T = np.eye(
-                4,
-                dtype=np.float64,
-            )
-
-            T[:3, 3] = (
-                self.achieved_xyz_mm
-                / 1000.0
-            )
-
-            angle = np.deg2rad(
-                self.orientation_change_deg
-            )
-
-            c = np.cos(angle)
-            s = np.sin(angle)
-
-            T[:3, :3] = np.array(
-                [
-                    [c, -s, 0.0],
-                    [s, c, 0.0],
-                    [0.0, 0.0, 1.0],
-                ],
-                dtype=np.float64,
-            )
-
-            return T
-
-        return np.eye(
-            4,
-            dtype=np.float64,
-        )
-
-    def inverse_kinematics(
-        self,
-        current_joint_pos,
-        desired_ee_pose,
-        position_weight=1.0,
-        orientation_weight=0.01,
-    ):
-        self.inverse_saw_warm_state = (
-            self.warmed
-        )
-
-        self.q1 = (
-            np.asarray(
-                current_joint_pos,
-                dtype=np.float64,
-            )
-            + self.dq_deg
-        )
-
-        return self.q1.copy()
-
-
-def planner(
-    fake,
-    *,
-    config=None,
-    limits=None,
-):
-    return SafeCartesianIK(
-        fake,
-        joint_names=JOINTS,
-        joint_limits_deg=(
-            limits
-            or LIMITS
-        ),
-        config=config,
-    )
-
-
-class TestSafeCartesianIK(unittest.TestCase):
-    def test_accepts_small_backprojected_candidate(self):
-        fake = FakeKinematics(
-            achieved_xyz_mm=(
-                0.99,
-                0.0,
-                0.004,
-            )
-        )
-
-        result = planner(
-            fake
-        ).candidate_xy(
-            np.zeros(5),
-            (1.0, 0.0),
-        )
-
-        self.assertTrue(
-            result.accepted
+    def test_two_centimetre_request_is_allowed(self):
+        action = make_cartesian_delta_action(
+            20.0,
+            0.0,
         )
 
         self.assertEqual(
-            result.rejection_reasons,
-            (),
+            DEFAULT_MAX_DELTA_NORM_MM,
+            20.0,
         )
+        self.assertEqual(action["target_x"], 20.0)
 
-        self.assertEqual(
-            result.motion_frame,
-            MOTION_FRAME,
-        )
-
-        self.assertEqual(
-            result.motion_frame,
-            "base_link_xy",
-        )
-
-        self.assertEqual(
-            result.motion_unit,
-            "mm",
-        )
-
-        self.assertTrue(
-            fake.inverse_saw_warm_state
-        )
-
-        self.assertLess(
-            result.position_error_norm_mm,
-            0.05,
-        )
-
-    def test_rejects_request_over_one_mm(self):
-        fake = FakeKinematics()
-
+    def test_first_command_over_two_centimetres_is_rejected(self):
         with self.assertRaisesRegex(
             ValueError,
-            "max_request_norm_mm",
+            "max_delta_norm_mm",
         ):
-            planner(
-                fake
-            ).candidate_xy(
-                np.zeros(5),
-                (1.01, 0.0),
-            )
-
-    def test_rejects_large_joint_step(self):
-        fake = FakeKinematics(
-            dq_deg=(
-                2.1,
-                0.0,
-                0.0,
-                0.0,
+            make_cartesian_delta_action(
+                20.01,
                 0.0,
             )
-        )
 
-        result = planner(
-            fake
-        ).candidate_xy(
-            np.zeros(5),
-            (1.0, 0.0),
-        )
-
-        self.assertFalse(
-            result.accepted
-        )
-
-        self.assertIn(
-            "joint_step",
-            result.rejection_reasons,
-        )
-
-    def test_rejects_unintended_z(self):
-        fake = FakeKinematics(
-            achieved_xyz_mm=(
-                1.0,
+    def test_custom_delta_limit_is_supported(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "max_delta_norm_mm",
+        ):
+            make_cartesian_delta_action(
+                10.01,
                 0.0,
-                0.06,
+                max_delta_norm_mm=10.0,
             )
-        )
 
-        result = planner(
-            fake
-        ).candidate_xy(
-            np.zeros(5),
-            (1.0, 0.0),
-        )
+    def test_nonfinite_delta_is_rejected(self):
+        for bad in (
+            math.nan,
+            math.inf,
+            -math.inf,
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    make_cartesian_delta_action(
+                        bad,
+                        0.0,
+                    )
 
-        self.assertFalse(
-            result.accepted
-        )
 
-        self.assertIn(
-            "unintended_z",
-            result.rejection_reasons,
-        )
-
-    def test_rejects_backprojection_error(self):
-        fake = FakeKinematics(
-            achieved_xyz_mm=(
-                0.90,
-                0.0,
-                0.0,
+class TestOfficialPipeline(unittest.TestCase):
+    def test_pipeline_uses_lerobot_processors(self):
+        with TemporaryDirectory() as tmp:
+            urdf = Path(tmp) / "robot.urdf"
+            urdf.write_text(
+                "<robot name='dummy'/>",
+                encoding="utf-8",
             )
-        )
 
-        result = planner(
-            fake
-        ).candidate_xy(
-            np.zeros(5),
-            (1.0, 0.0),
-        )
+            fake_kinematics = object()
 
-        self.assertFalse(
-            result.accepted
-        )
+            with patch(
+                "so101_typing.control.cartesian_kinematics."
+                "RobotKinematics",
+                return_value=fake_kinematics,
+            ):
+                pipeline = build_official_cartesian_pipeline(
+                    urdf,
+                    motor_names=SO101_MOTOR_NAMES,
+                    end_effector_bounds={
+                        "min": [-1.0, -1.0, -1.0],
+                        "max": [1.0, 1.0, 1.0],
+                    },
+                    max_ee_step_m=0.02,
+                )
 
-        self.assertIn(
-            "position_error",
-            result.rejection_reasons,
-        )
+        self.assertIsNotNone(pipeline)
 
-    def test_rejects_orientation_change(self):
-        fake = FakeKinematics(
-            orientation_change_deg=0.11
-        )
+        step_names = [
+            type(step).__name__
+            for step in pipeline.steps
+        ]
 
-        result = planner(
-            fake
-        ).candidate_xy(
-            np.zeros(5),
-            (1.0, 0.0),
-        )
-
-        self.assertFalse(
-            result.accepted
-        )
-
-        self.assertIn(
-            "orientation_change",
-            result.rejection_reasons,
-        )
-
-    def test_fails_before_kinematics_on_current_joint_margin(self):
-        fake = FakeKinematics()
-
-        q0 = np.array(
+        self.assertEqual(
+            step_names,
             [
-                91.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ]
+                "EEReferenceAndDelta",
+                "EEBoundsAndSafety",
+                "GripperVelocityToJoint",
+                "InverseKinematicsEEToJoints",
+            ],
         )
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "current joint margin",
-        ):
-            planner(
-                fake
-            ).candidate_xy(
-                q0,
-                (1.0, 0.0),
-            )
-
-        self.assertFalse(
-            fake.warmed
-        )
-
-        self.assertFalse(
-            fake.inverse_saw_warm_state
-        )
-
-    def test_fails_before_kinematics_on_current_joint_outside_urdf(self):
-        fake = FakeKinematics()
-
-        q0 = np.array(
-            [
-                101.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ]
-        )
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "outside URDF",
-        ):
-            planner(
-                fake
-            ).candidate_xy(
-                q0,
-                (1.0, 0.0),
-            )
-
-        self.assertFalse(
-            fake.warmed
-        )
-
-        self.assertFalse(
-            fake.inverse_saw_warm_state
-        )
-
-    def test_rejects_candidate_joint_margin(self):
-        fake = FakeKinematics(
-            dq_deg=(
-                2.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            )
-        )
-
-        q0 = np.array(
-            [
-                89.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ]
-        )
-
-        result = planner(
-            fake
-        ).candidate_xy(
-            q0,
-            (1.0, 0.0),
-        )
-
-        self.assertFalse(
-            result.accepted
-        )
-
-        self.assertIn(
-            "candidate_joint_margin",
-            result.rejection_reasons,
-        )
-
-    def test_config_rejects_invalid_threshold(self):
-        with self.assertRaisesRegex(
-            ValueError,
-            "max_joint_step_deg",
-        ):
-            CartesianIKSafetyConfig(
-                max_joint_step_deg=0.0
-            )
 
 
 if __name__ == "__main__":
