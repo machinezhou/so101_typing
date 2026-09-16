@@ -50,12 +50,18 @@ def main() -> None:
         raise RuntimeError("Candidate does not use requested Cartesian command semantics")
 
     session_data = json.loads(args.session.read_text(encoding="utf-8"))
-    if session_data.get("protocol") != "official_lerobot_cartesian_paired_xy_perturbations":
-        raise RuntimeError("Session is not a paired XY H3.2 calibration session")
+    if session_data.get("protocol") != "fixed_anchor_cartesian_paired_xy_perturbations_v2":
+        raise RuntimeError("Session is not a fixed-anchor H3.2 calibration session")
     if session_data.get("input_semantics") != REQUESTED_CARTESIAN_DELTA:
         raise RuntimeError("Session input semantics do not match the command-space contract")
     if session_data.get("image_jacobian") != candidate.to_dict():
         raise RuntimeError("Session Jacobian does not exactly match the candidate artifact")
+    acceptance = session_data.get("acceptance")
+    if not isinstance(acceptance, dict) or acceptance.get("accepted") is not True:
+        raise RuntimeError("Session did not pass automatic H3.2 acceptance gates")
+    if acceptance.get("errors"):
+        raise RuntimeError("Session acceptance record contains errors")
+
     direction = session_data.get("direction_consistency")
     if not isinstance(direction, dict) or not all(axis in direction for axis in ("x", "y")):
         raise RuntimeError("Session is missing X/Y direction-consistency diagnostics")

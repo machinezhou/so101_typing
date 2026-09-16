@@ -1361,7 +1361,17 @@ LeRobot official Cartesian backend        ✓
         ↓
 H3.2 image-Jacobian calibration tooling   ✓ 141/141 + dry-run preflight
         ↓
-controlled +X physical probe              <-- NEXT
+project-side Cartesian regression isolated/fixed
+        ↓
+same-target joint hold                    ✓ stable at 30 Hz
+        ↓
+fixed-anchor zero-delta plan               ✓ 0.000 deg joint shift
+        ↓
++X 5 mm fixed-anchor plan check            ✓ FK=(+4.95,-0.01,-0.09) mm
+        ↓
+CARTESIAN PLANNING DEBUG CHECKPOINT      ✓ ACCEPTED
+        ↓
+controlled +X physical probe              <-- NEXT H3.2 CALIBRATION STEP
         ↓
 candidate command-space J_cmd
         ↓
@@ -1738,18 +1748,43 @@ Completed or software-validated at this checkpoint:
   `HF_LEROBOT_HOME/robot-urdfs/so101`.
 - The current repository contains 141 unit tests; **141/141 passed** on the
   intended development machine before the physical probe.
+- The project-side Cartesian regression investigated before the H3.2 physical
+  probe has now been isolated and corrected. A dedicated same-target hardware
+  hold test repeatedly sent one unchanged joint target at 30 Hz and passed with
+  **0.000 deg observed span on every joint**. This rules out repeated identical
+  joint-target transmission as the source of the previously observed drift.
+- The corrected fixed-anchor planning path was then checked at the real
+  perception-safe working hover. The zero Cartesian request reproduced the
+  anchor with **0.000 deg maximum planned joint shift**.
+- A final `--plan-only` fixed-anchor check requested **+X 5.00 commanded-mm**
+  from anchor XYZ `(+289.24,+53.89,+49.18) mm`. The planned target returned by
+  project FK was `(+4.95,-0.01,-0.09) mm` relative to the anchor, with
+  **0.05 mm XY model error** and **0.09 mm Z model error**. Planned arm-joint
+  deltas were `shoulder_pan=+0.224 deg`, `shoulder_lift=+2.388 deg`,
+  `elbow_flex=-3.088 deg`, `wrist_flex=+0.699 deg`, and
+  `wrist_roll=+0.208 deg`. The plan passed all configured gates and **no
+  Cartesian action was sent to the robot**.
+- `--plan-only` is now a true kinematic planning check: after anchor latching
+  and the zero-delta gate it does not depend on glyph acquisition and does not
+  send Cartesian motion. This removes the earlier plan-only visual dependency
+  and the subsequent unbound `ready_center` failure.
+- This closes the current **code-debugging checkpoint**. The corrected code is
+  suitable to save/commit/upload as the new Phase 3 development baseline. The
+  result establishes project-side planning/reference consistency; it does not
+  claim physical TCP millimetre accuracy.
 - The SO-101 follower hardware/calibration remains unchanged from the last
   normal leader/follower teleoperation checkpoint, so no follower
   recalibration is required before H3.2.
-- Physical H3.2 image-Jacobian calibration has **not** yet been accepted.
-  The immediate next checkpoint is a controlled hardware probe, followed by
-  the full local Jacobian measurement and review of residual error and
-  conditioning.
+- Physical H3.2 image-Jacobian calibration has **not** yet been accepted. The
+  next item is the controlled +X physical probe as the first measurement step
+  of H3.2 itself, not an additional verification round for the fixed code. It
+  is followed by the full local Jacobian measurement and review of residual
+  error and conditioning.
 
-The remaining Phase 3 sequence is:
+The code-debugging checkpoint is complete. The remaining Phase 3 sequence is:
 
 ``` text
-controlled physical probe
+controlled physical probe (first H3.2 measurement step)
         ↓
 measure local command-space image Jacobian J_cmd [px/commanded-mm]
         ↓
@@ -1812,8 +1847,15 @@ iteration does not repeat the same debugging path:
   normal-hover glyph recognition randomly changes identity. Robust burst
   consensus remains as a defensive guard against transient occlusion or a
   wrong candidate entering one measurement burst.
+- The pre-probe Cartesian regression has been resolved with two complementary
+  checks: unchanged joint targets remain stable in hardware, and the corrected
+  fixed-anchor `IK -> planned joints -> FK` path preserves zero delta and plans
+  +X 5 commanded-mm within the model gates. Do not reopen that debugging branch
+  unless a later physical measurement produces contradictory evidence.
 - Hardware calibration should start with a controlled single-step probe and
-  explicit abort behavior before running the full multi-sample sequence.
+  explicit abort behavior before running the full multi-sample sequence. This
+  probe is the next H3.2 measurement step, not a prerequisite for saving the
+  corrected code checkpoint.
 
 ### Phase 3 hardware ownership and abort contract
 
