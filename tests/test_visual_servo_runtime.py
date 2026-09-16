@@ -53,7 +53,7 @@ def _tool_reference() -> ToolReferenceCalibration:
 
 def _jacobian() -> ImageJacobianCalibration:
     return ImageJacobianCalibration(
-        motion_frame="keyboard_plane_xy",
+        motion_frame="base_link_xy",
         motion_unit="mm",
         matrix=((2.0, 0.0), (0.0, 3.0)),
         sample_count=4,

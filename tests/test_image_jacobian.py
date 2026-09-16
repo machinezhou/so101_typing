@@ -11,7 +11,7 @@ from so101_typing.control.image_jacobian import ImageJacobianCalibration
 class TestImageJacobianCalibration(unittest.TestCase):
     def test_uncalibrated_placeholder_returns_none(self):
         payload = {
-            "motion_frame": "keyboard_plane_xy",
+            "motion_frame": "base_link_xy",
             "motion_unit": "mm",
             "matrix": None,
             "sample_count": 0,
@@ -85,7 +85,7 @@ class TestImageJacobianCalibration(unittest.TestCase):
 
     def test_predict_image_delta_uses_column_vector_convention(self):
         calibration = ImageJacobianCalibration(
-            motion_frame="keyboard_plane_xy",
+            motion_frame="base_link_xy",
             motion_unit="mm",
             matrix=((2.0, -1.0), (0.5, 3.0)),
             sample_count=4,
@@ -97,7 +97,7 @@ class TestImageJacobianCalibration(unittest.TestCase):
 
     def test_save_load_round_trip(self):
         calibration = ImageJacobianCalibration(
-            motion_frame="keyboard_plane_xy",
+            motion_frame="base_link_xy",
             motion_unit="mm",
             matrix=((2.0, -0.5), (0.25, 1.5)),
             sample_count=6,
@@ -180,7 +180,7 @@ class TestImageJacobianCalibration(unittest.TestCase):
 
     def test_calibrated_json_requires_diagnostics(self):
         payload = {
-            "motion_frame": "keyboard_plane_xy",
+            "motion_frame": "base_link_xy",
             "motion_unit": "mm",
             "matrix": [[2.0, 0.0], [0.0, 2.0]],
             "damping": 1e-6,
@@ -194,7 +194,7 @@ class TestImageJacobianCalibration(unittest.TestCase):
     def test_rejects_invalid_damping(self):
         with self.assertRaisesRegex(ValueError, "damping"):
             ImageJacobianCalibration(
-                motion_frame="keyboard_plane_xy",
+                motion_frame="base_link_xy",
                 motion_unit="mm",
                 matrix=((2.0, 0.0), (0.0, 2.0)),
                 sample_count=4,

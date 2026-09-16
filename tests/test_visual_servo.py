@@ -18,7 +18,7 @@ def _calibration(
 ):
     singular_values = np.linalg.svd(np.asarray(matrix, dtype=np.float64), compute_uv=False)
     return ImageJacobianCalibration(
-        motion_frame="keyboard_plane_xy",
+        motion_frame="base_link_xy",
         motion_unit="mm",
         matrix=matrix,
         sample_count=4,

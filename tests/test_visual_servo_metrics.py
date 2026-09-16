@@ -55,7 +55,7 @@ def _tool_reference() -> ToolReferenceCalibration:
 
 def _jacobian() -> ImageJacobianCalibration:
     return ImageJacobianCalibration(
-        motion_frame="keyboard_plane_xy",
+        motion_frame="base_link_xy",
         motion_unit="mm",
         matrix=((2.0, 0.0), (0.0, 3.0)),
         sample_count=8,
@@ -136,7 +136,7 @@ def _aligned_metrics(
         max_frame_age_ms=20.0,
         cumulative_correction=(-4.0, 0.0),
         cumulative_correction_norm=4.0,
-        motion_frame="keyboard_plane_xy",
+        motion_frame="base_link_xy",
         motion_unit="mm",
         servo_gain=1.0,
         convergence_threshold_px=3.0,

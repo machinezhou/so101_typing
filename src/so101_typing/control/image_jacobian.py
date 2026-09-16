@@ -141,7 +141,7 @@ class ImageJacobianCalibration:
         motion_deltas: Iterable[Sequence[float]],
         image_deltas_px: Iterable[Sequence[float]],
         *,
-        motion_frame: str = "keyboard_plane_xy",
+        motion_frame: str = "base_link_xy",
         motion_unit: str = "mm",
         damping: float = 1e-6,
         max_condition_number: float | None = None,
