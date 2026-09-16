@@ -44,7 +44,7 @@ def _frame(
 
 
 class TestTargetBurstAccumulator(unittest.TestCase):
-    def test_h31_identity_jump_becomes_robust_ready_measurement(self):
+    def test_h31_near_contact_occlusion_outlier_becomes_robust_ready_measurement(self):
         accumulator = TargetBurstAccumulator(
             target_label="G"
         )

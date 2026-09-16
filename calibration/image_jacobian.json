@@ -6,5 +6,6 @@
   "residual_rms_px": null,
   "singular_values": null,
   "condition_number": null,
-  "damping": 1e-06
+  "damping": 1e-06,
+  "input_semantics": "requested_cartesian_delta"
 }

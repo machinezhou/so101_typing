@@ -9,7 +9,7 @@ from so101_typing.control.target_measurement import (
 
 
 class TestTargetBurstMeasurement(unittest.TestCase):
-    def test_h31_sample_5_rejects_single_identity_jump(self):
+    def test_h31_sample_5_rejects_single_near_contact_occlusion_outlier(self):
         centers = np.array(
             [
                 [440.362, 286.155],
@@ -39,7 +39,7 @@ class TestTargetBurstMeasurement(unittest.TestCase):
             atol=1e-12,
         )
 
-    def test_h31_sample_7_rejects_single_identity_jump(self):
+    def test_h31_sample_7_rejects_single_near_contact_occlusion_outlier(self):
         centers = np.array(
             [
                 [301.000, 224.500],

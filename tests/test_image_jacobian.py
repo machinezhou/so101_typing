@@ -13,6 +13,7 @@ class TestImageJacobianCalibration(unittest.TestCase):
         payload = {
             "motion_frame": "base_link_xy",
             "motion_unit": "mm",
+            "input_semantics": "requested_cartesian_delta",
             "matrix": None,
             "sample_count": 0,
             "residual_rms_px": None,
@@ -112,6 +113,24 @@ class TestImageJacobianCalibration(unittest.TestCase):
             loaded = ImageJacobianCalibration.load(path)
             self.assertEqual(loaded, calibration)
             self.assertTrue(path.read_text(encoding="utf-8").endswith("\n"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["input_semantics"],
+                "requested_cartesian_delta",
+            )
+
+    def test_rejects_non_command_space_semantics(self):
+        with self.assertRaisesRegex(ValueError, "input_semantics"):
+            ImageJacobianCalibration(
+                motion_frame="base_link_xy",
+                motion_unit="mm",
+                matrix=((2.0, 0.0), (0.0, 2.0)),
+                sample_count=4,
+                residual_rms_px=0.0,
+                singular_values=(2.0, 2.0),
+                condition_number=1.0,
+                input_semantics="measured_tcp_delta",
+            )
 
     def test_rejects_too_few_samples(self):
         with self.assertRaisesRegex(ValueError, "at least 4"):

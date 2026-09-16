@@ -9,6 +9,9 @@ from pathlib import Path
 import numpy as np
 
 
+REQUESTED_CARTESIAN_DELTA = "requested_cartesian_delta"
+
+
 def _as_finite_array(
     values: Iterable[Sequence[float]],
     *,
@@ -60,15 +63,17 @@ def _normalize_singular_values(values: Sequence[float]) -> tuple[float, float]:
 
 @dataclass(frozen=True, slots=True)
 class ImageJacobianCalibration:
-    """Local mapping from small Cartesian XY motion to wrist-image motion.
+    """Local mapping from requested Cartesian XY command to wrist-image motion.
 
     The matrix follows the column-vector convention::
 
         delta_p_px = J @ delta_x
 
-    where ``delta_p_px = (delta_u_px, delta_v_px)`` and ``delta_x`` is a
-    two-dimensional Cartesian perturbation expressed in ``motion_unit`` and
-    ``motion_frame``.
+    where ``delta_p_px = (delta_u_px, delta_v_px)`` and ``delta_x`` is the
+    requested two-dimensional Cartesian command expressed in ``motion_unit``
+    and ``motion_frame``.  The denominator is command space; it is not an
+    independently measured physical TCP displacement or positioning-accuracy
+    claim for the SO-101.
     """
 
     motion_frame: str
@@ -79,6 +84,7 @@ class ImageJacobianCalibration:
     singular_values: tuple[float, float]
     condition_number: float
     damping: float = 1e-6
+    input_semantics: str = REQUESTED_CARTESIAN_DELTA
 
     def __post_init__(self) -> None:
         if not isinstance(self.motion_frame, str):
@@ -116,6 +122,12 @@ class ImageJacobianCalibration:
         if not math.isfinite(damping) or damping < 0.0:
             raise ValueError("damping must be finite and non-negative")
         object.__setattr__(self, "damping", damping)
+
+        if self.input_semantics != REQUESTED_CARTESIAN_DELTA:
+            raise ValueError(
+                "input_semantics must be "
+                f"{REQUESTED_CARTESIAN_DELTA!r}"
+            )
 
     @property
     def array(self) -> np.ndarray:
@@ -193,6 +205,7 @@ class ImageJacobianCalibration:
             ),
             condition_number=condition_number,
             damping=damping,
+            input_semantics=REQUESTED_CARTESIAN_DELTA,
         )
 
     @classmethod
@@ -226,6 +239,10 @@ class ImageJacobianCalibration:
             singular_values=data["singular_values"],
             condition_number=data["condition_number"],
             damping=data["damping"],
+            input_semantics=data.get(
+                "input_semantics",
+                REQUESTED_CARTESIAN_DELTA,
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -238,6 +255,7 @@ class ImageJacobianCalibration:
             "singular_values": list(self.singular_values),
             "condition_number": self.condition_number,
             "damping": self.damping,
+            "input_semantics": self.input_semantics,
         }
 
     def save(self, path: str | Path) -> None:

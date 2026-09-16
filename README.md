@@ -109,14 +109,17 @@ The project also studies several more specific questions:
 - How do learned visual representations and explicit classical visual
   features complement each other?
 - How much does visual servoing improve over ACT-only execution?
-  Primary controller comparison:
-  \| System \| Learned coarse motion \| Appearance-based local vision \| Closed-loop fine correction \| External screen verification \| Recovery \|
-  \|--------------------\|----------------------:\|------------------------------:\|----------------------------:\|-----------------------------:\|---------:\|
-  \| Classical baseline \| No \| Yes \| Yes \| Yes \| Yes \|
-  \| ACT only \| Yes \| Limited/diagnostic \| No \| Yes \| Yes \|
-  \| ACT + Visual Servo \| Yes \| Yes \| Yes \| Yes \| Yes \|
-  Possible future comparisons include SmolVLA and other learned policies,
-  but they are not dependencies of V0.
+
+Primary controller comparison:
+
+| System | Learned coarse motion | Appearance-based local vision | Closed-loop fine correction | External screen verification | Recovery |
+|---|---:|---:|---:|---:|---:|
+| Classical baseline | No | Yes | Yes | Yes | Yes |
+| ACT only | Yes | Limited/diagnostic | No | Yes | Yes |
+| ACT + Visual Servo | Yes | Yes | Yes | Yes | Yes |
+
+Possible future comparisons include SmolVLA and other learned policies,
+but they are not dependencies of V0.
 
 ------------------------------------------------------------------------
 
@@ -775,19 +778,17 @@ the image error is:
 e = p - p*
 ```
 
-or:
+or simply `e = (u - u*, v - v*)`.
 
-\[ e =
-\]
-
-The controller drives:
-
-\[ e \]
+The controller drives `||e||` toward zero.
 
 ## Local image Jacobian
 
-For V0, the local mapping from small Cartesian robot motion to image
-motion can be estimated experimentally.
+For V0, the local mapping from a small **requested Cartesian XY command**
+to image motion can be estimated experimentally. The millimetre value is
+the command-space scaling used by the LeRobot Cartesian processor; it is
+not an independently measured TCP displacement or an SO-101 positioning-
+accuracy claim.
 
 Apply small safe perturbations around a representative pre-press pose:
 
@@ -801,14 +802,19 @@ Apply small safe perturbations around a representative pre-press pose:
 and measure the corresponding target-center displacement in the wrist
 image.
 
-Estimate:
+Estimate the local command-space image Jacobian:
 
-\[ J =
-\]
+``` text
+delta_p_image ~= J_cmd @ delta_c_requested
+```
 
-Then a local controller can use:
+where `J_cmd` has units `px / commanded-mm`.
 
-\[ X = -J^{+} e \]
+Then a local controller can use a damped/bounded form of:
+
+``` text
+delta_c_requested = -J_cmd^+ @ e
+```
 
 with:
 
@@ -862,7 +868,8 @@ The controller must define:
 - timeout behavior,
 - abort behavior.
 
-## The pencil/tool should never move downward if target confidence or alignment state is invalid.
+The pencil/tool should never move downward if target confidence or
+alignment state is invalid.
 
 # Screen Perception and Verification
 
@@ -917,7 +924,7 @@ If the screen result is uncertain:
 wait / reacquire / OCR again
 ```
 
-## rather than modifying the typed string immediately.
+rather than modifying the typed string immediately.
 
 # Automatic Recovery
 
@@ -1352,11 +1359,15 @@ tool reference p* calibrated              ✓
         ↓
 LeRobot official Cartesian backend        ✓
         ↓
-H3.2 image-Jacobian calibration tooling   ✓ software preflight
+H3.2 image-Jacobian calibration tooling   ✓ 141/141 + dry-run preflight
         ↓
-controlled physical probe + measured J    <-- NEXT
+controlled +X physical probe              <-- NEXT
         ↓
-bounded XY visual servo
+candidate command-space J_cmd
+        ↓
+review + promote accepted J_cmd
+        ↓
+integrate existing bounded XY servo runtime with hardware
         ↓
 stale-frame rejection + target-loss handling
         ↓
@@ -1711,16 +1722,25 @@ from a safe teleoperated pose.
 Completed or software-validated at this checkpoint:
 
 - H3.1 tool-reference calibration is complete; the WRIST tool reference
-  `p*` is available.
+  `p*` is available. The WRIST mount, pencil/tool mounting, SO-101 base, and
+  fixed MacBook geometry have remained unchanged since that calibration, so
+  H3.1 remains valid and does not need to be repeated.
 - Cartesian motion now delegates FK, end-effector bounds/safety processing,
   IK, and joint-target generation to LeRobot's SO-101 Cartesian processor
   path instead of maintaining a project-local IK contract.
-- Project-facing visual-servo corrections use `base_link_xy` and millimetres;
-  LeRobot owns the conversion through the robot kinematics path.
-- The H3.2 image-Jacobian calibration tool is implemented and passes
-  software preflight with the SO-101 URDF resolved from LeRobot's
-  `HF_LEROBOT_HOME/robot-urdfs/so101` cache.
-- The current software checkpoint passes 140 unit tests.
+- Project-facing visual-servo corrections use `base_link_xy` and
+  **commanded millimetres**. These are requested Cartesian command units,
+  not independently measured TCP displacement or positioning-accuracy
+  claims. LeRobot owns conversion through the robot kinematics path.
+- The H3.2 image-Jacobian calibration tool is implemented. On the intended
+  development machine, the current hardware-gate version passed the pinned
+  LeRobot dry-run preflight with the SO-101 URDF resolved from
+  `HF_LEROBOT_HOME/robot-urdfs/so101`.
+- The current repository contains 141 unit tests; **141/141 passed** on the
+  intended development machine before the physical probe.
+- The SO-101 follower hardware/calibration remains unchanged from the last
+  normal leader/follower teleoperation checkpoint, so no follower
+  recalibration is required before H3.2.
 - Physical H3.2 image-Jacobian calibration has **not** yet been accepted.
   The immediate next checkpoint is a controlled hardware probe, followed by
   the full local Jacobian measurement and review of residual error and
@@ -1731,11 +1751,13 @@ The remaining Phase 3 sequence is:
 ``` text
 controlled physical probe
         ↓
-measure local image Jacobian J [px/mm]
+measure local command-space image Jacobian J_cmd [px/commanded-mm]
         ↓
 review residual / conditioning / repeatability
         ↓
-implement and tune bounded XY correction
+promote accepted candidate calibration
+        ↓
+integrate and tune the existing bounded XY correction runtime
         ↓
 reject stale frames
         ↓
@@ -1765,6 +1787,11 @@ iteration does not repeat the same debugging path:
   wrapper. The follower calibration remains owned by LeRobot.
 - Each visual-servo correction should be referenced from the current measured
   robot state rather than accumulating an idealized Cartesian pose.
+- The calibrated Jacobian is explicitly a **command-space** mapping:
+  `requested Cartesian XY delta -> observed WRIST pixel delta`. Do not turn
+  H3.2 into a physical TCP-displacement metrology experiment. FK-derived
+  displacement may be logged for debugging, but it is not a Phase 3
+  prerequisite or acceptance metric.
 - Keep safety limits distinct from accuracy requirements. A maximum Cartesian
   step is a motion bound, not a claim that the arm can position to that
   tolerance.
@@ -1780,8 +1807,93 @@ iteration does not repeat the same debugging path:
   zone. Keep XY visual alignment at a perception-safe pre-press height where
   possible, treat degraded visibility as target loss, and keep lateral
   alignment separate from the later Z press.
+- The large outliers seen in H3.1 samples 5 and 7 occurred during this
+  near-contact/hand-motion occlusion condition; they are not evidence that
+  normal-hover glyph recognition randomly changes identity. Robust burst
+  consensus remains as a defensive guard against transient occlusion or a
+  wrong candidate entering one measurement burst.
 - Hardware calibration should start with a controlled single-step probe and
   explicit abort behavior before running the full multi-sample sequence.
+
+### Phase 3 hardware ownership and abort contract
+
+Do **not** hand Phase 3 from a separate `lerobot-teleoperate` process to a
+second robot process. `SO101Follower.connect()` performs follower
+configuration with a torque-disabled section, so reconnecting while the arm is
+already hovering above the keyboard would reintroduce an avoidable sag/handoff
+risk.
+
+Instead, `scripts/calibrate_image_jacobian.py` owns the follower and leader for
+the whole hardware session:
+
+``` text
+start with leader + follower at normal zero/home
+        ↓
+script connects follower once (safe rest pose)
+        ↓
+script connects leader
+        ↓
+in-process leader → follower teleoperation
+        ↓
+operator moves to perception-safe hover
+        ↓
+press ENTER to freeze the manual pose
+        ↓
+probe / H3.2 autonomous XY commands
+        ↓
+in-process operator recovery teleoperation resumes
+        ↓
+operator returns to normal zero/home
+        ↓
+Ctrl+C
+        ↓
+normal LeRobot disconnect / torque-off
+```
+
+This keeps the follower connected across manual positioning and autonomous
+motion, so the transition does not call `SO101Follower.connect()` again at the
+hover pose.
+
+Exit semantics are deliberately separated:
+
+- **normal Phase 3 completion:** stop autonomous corrections and resume
+  operator-controlled leader/follower teleoperation; the operator returns to
+  the normal zero/home pose and then presses Ctrl+C for normal LeRobot
+  disconnect/torque-off;
+- **controlled failure** (`target_lost`, stale-frame timeout, correction
+  budget, unexpected clipping, settle failure): stop autonomous corrections
+  and enter the same operator recovery teleoperation when the hardware link is
+  still healthy;
+- **Ctrl+C during autonomy:** cancel further autonomous commands and enter
+  operator recovery; Ctrl+C during recovery means the operator has selected a
+  safe disconnect point;
+- **physical emergency / broken communication:** do not attempt an automatic
+  recovery trajectory. Use the physical stop/power procedure as appropriate.
+
+Do not interpret "abort" as "blindly drive home". Returning home is an
+operator-controlled recovery step after autonomous motion has stopped.
+
+The first hardware action is intentionally one Cartesian command only:
+
+``` bash
+python scripts/calibrate_image_jacobian.py \
+  --robot-port /dev/ttyACM0 \
+  --leader-port /dev/ttyACM1 \
+  --probe-axis +x \
+  --probe-step-mm 5
+```
+
+Probe mode records `artifacts/image_jacobian_calibration/probe_session.json`,
+does not fit a Jacobian, and does not modify
+`calibration/image_jacobian.json`. Only after that probe is reviewed should
+the paired `+X/-X/+Y/-Y` calibration be run. The full calibration writes a
+**candidate** artifact under `artifacts/image_jacobian_calibration/`; the
+canonical calibration remains unchanged until the candidate is reviewed and
+explicitly promoted with:
+
+``` bash
+python scripts/promote_image_jacobian.py --confirm-reviewed
+```
 
 ACT, key-press execution, and screen verification remain outside the current
 Phase 3 checkpoint.
@@ -1889,11 +2001,14 @@ Goal:
 Tasks:
 
 1.  calibrate `p*`,
-2.  estimate local image Jacobian,
-3.  implement bounded XY correction,
-4.  reject stale frames,
-5.  detect target loss,
-6.  require stable multi-frame convergence.
+2.  estimate and accept the local command-space image Jacobian `J_cmd`,
+3.  integrate the existing bounded XY correction/runtime with the SO-101
+    hardware executor,
+4.  validate command-time stale-frame rejection,
+5.  validate target-loss/failure handling,
+6.  require stable multi-frame convergence,
+7.  repeat on `G` from several initial image offsets, then perform two
+    cross-keyboard transfer sanity checks without per-key Jacobians.
 
 Acceptance should include:
 
