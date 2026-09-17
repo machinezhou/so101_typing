@@ -24,14 +24,19 @@ that can:
 
 1.  receive a target string such as `ROBOT`,
 2.  choose the next requested key,
-3.  use ACT to move the SO-101 into a useful local neighborhood,
+3.  use ACT to move the SO-101 into a safe local neighborhood where the
+    requested key is clearly visible to WRIST,
 4.  visually recognize the requested key from its actual appearance,
-5.  hand control from ACT to a classical visual-servo controller,
-6.  align the physical tool with the target key,
-7.  press the key using a bounded deterministic motion,
-8.  observe the MacBook screen through an independent camera,
-9.  verify whether the intended character actually appeared,
-10. recover automatically from wrong key presses,
+5.  hand control from ACT to the deterministic wrist-vision controller,
+6.  align the detected target-key center with the calibrated WRIST pencil-tip
+    pixel reference,
+7.  once alignment is stable, descend in bounded pure-Z steps, stopping after
+    every step to reacquire vision and realign XY if needed,
+8.  observe the MacBook screen through an independent camera after each
+    stopped descent level,
+9.  stop further descent as soon as the intended character is independently
+    confirmed, then retract,
+10. recover automatically from wrong key presses or bounded press failures,
 11. repeat until the requested string is correct.
     A typical final task is:
 
@@ -164,14 +169,17 @@ The first reliable version intentionally assumes:
 V0 is intended to establish a reliable closed loop before introducing
 generalization.
 
-## 3. Screen verification is external to the motor policy
+## 3. Screen verification is external to ACT and authoritative for press success
 
 The screen camera is not part of the initial ACT observation.
 
 ACT should learn **how to approach a requested key**, not infer success
 from the MacBook display.
 
-The screen is observed by the supervisor after physical execution.
+During deterministic staged pressing, the supervisor uses the independent
+screen observation to decide whether the requested key has actually produced
+the intended character. Commanded Z depth alone is never treated as proof of
+success.
 
 ------------------------------------------------------------------------
 
@@ -402,22 +410,24 @@ The primary architecture is:
               │                               │
               ▼                               │
        VISUAL SERVO (XY)                      │
+   target center → pencil-tip pixel           │
               │                               │
         alignment stable?                     │
               │ yes                           │
               ▼                               │
-      DETERMINISTIC PRESS                     │
+       PURE-Z DESCENT STEP                    │
               │                               │
-              ▼                               │
-            RETRACT                           │
+        stop + settle                         │
               │                               │
-              └───────────────┐               │
-                              ▼               │
-                       SCREEN CAMERA           │
-                              │               │
-                    rectify + OCR              │
-                              │               │
-                success / wrong / uncertain   │
+       fresh WRIST observation                │
+        ├─ misaligned → XY realign             │
+        └─ aligned ───────────────┐             │
+                                 ▼             │
+                          SCREEN CAMERA        │
+                                 │             │
+                       rectify + OCR           │
+                                 │             │
+        success / no-change / wrong / uncertain
                               │               │
                               └───────────────►│
                                       Task Supervisor
@@ -425,10 +435,11 @@ The primary architecture is:
 
 The important architectural property is **controller ownership**:
 
-- ACT owns coarse motion.
-- Visual servo owns fine XY alignment.
-- Press control owns the bounded downward/retract motion.
-- Screen perception never commands the robot directly.
+- ACT owns coarse motion only until a perception-ready handoff.
+- After handoff, the deterministic staged controller owns XY alignment and
+  bounded pure-Z descent; ACT does not resume during the press attempt.
+- Screen perception never commands the robot directly, but its confirmed
+  result determines whether further descent is allowed.
 - The supervisor is the only module that changes high-level task state.
 
 ------------------------------------------------------------------------
@@ -466,41 +477,51 @@ HANDOFF
   ▼
 SERVO_ALIGN
   │
-  ├── target lost ─────────────► REACQUIRE
+  ├── target lost / stale ──────────────────► RECOVERY
   │
-  ├── timeout ─────────────────► RETRY / ABORT
-  │
-  ▼
-ALIGNED
+  ├── timeout / correction budget ──────────► RECOVERY
   │
   ▼
-PRESS
+ALIGNED_AT_LEVEL
+  │
+  │  initial level, or previous VERIFY_LEVEL authorized another step
+  ▼
+DESCEND_STEP
   │
   ▼
-RETRACT
+SETTLE_AND_REOBSERVE
   │
-  ▼
-WAIT_SCREEN
+  ├── alignment drifted ────────────────────► REALIGN_AFTER_STEP
+  │                                           │
+  │                                           ├── target lost / stale ─► RECOVERY
+  │                                           └── aligned ─────────────► VERIFY_LEVEL
   │
-  ▼
-VERIFY
-  │
-  ├── SUCCESS ────────────────► NEXT_TARGET
-  │
-  ├── WRONG ──────────────────► RECOVERY
-  │
-  └── UNCERTAIN ──────────────► REOBSERVE
-  │
-  ▼
+  └── alignment still valid ────────────────► VERIFY_LEVEL
+                                              │
+                                              ├── CONFIRMED_SUCCESS ───► RETRACT ─► NEXT_TARGET
+                                              ├── CONFIRMED_NO_CHANGE ─► DESCEND_STEP
+                                              ├── CONFIRMED_WRONG ─────► RETRACT ─► RECOVERY
+                                              ├── UNCERTAIN ───────────► HOLD / REOBSERVE
+                                              └── safety bound ────────► RETRACT ─► RECOVERY
+
 DONE
 ```
 
-`TARGET_ACQUIRED` and `ALIGNED` are intentionally different states:
+`TARGET_ACQUIRED` and `ALIGNED_AT_LEVEL` are intentionally different states:
 
-- `TARGET_ACQUIRED`: the system knows where the requested key is in the
-  wrist image.
-- `ALIGNED`: the physical tool has converged to the calibrated press
-  reference.
+- `TARGET_ACQUIRED`: the system knows where the requested key is in the wrist
+  image and has enough image margin for deterministic correction.
+- `ALIGNED_AT_LEVEL`: the target-key center and calibrated pencil-tip pixel are
+  stably aligned at the current stopped Z level. This authorizes **one** bounded
+  pure-Z descent step, not continuous downward motion.
+
+Every Z step invalidates the previous alignment acceptance. The controller must
+stop, settle, acquire fresh observations, and realign if necessary. If
+realignment is needed after a Z step, the controller must still verify the
+screen at that same stopped level before any further descent; successful
+realignment must not accidentally authorize an extra Z step. A press succeeds
+only on independent screen confirmation; a configured maximum descent remains
+a hard failure/safety bound.
 
 ------------------------------------------------------------------------
 
@@ -590,16 +611,18 @@ the platform has already been demonstrated with ACT.
 ### Perception-aware approach
 
 A successful ACT terminal state should make the next deterministic stage
-easy:
+observable and safe:
 
 - requested key is visible,
 - glyph is recognizable,
 - key is sufficiently large in the wrist image,
 - target is not heavily occluded by the pencil or arm,
-- target is not too close to the image boundary,
+- target has enough image-boundary margin for closed-loop correction,
 - end effector remains at a safe pre-press height.
 
-This is a **perception-aware approach pose**.
+This is a **perception-aware approach pose**. ACT is not required to precisely
+align the pencil with the key; removing the remaining image-space error is the
+job of the deterministic WRIST controller.
 
 ## ACT → Visual Servo Handoff
 
@@ -628,7 +651,8 @@ A first `servo_ready` rule can require:
 correct target label
 AND confidence >= threshold
 AND key size >= threshold
-AND center inside acquisition zone
+AND complete usable target observation
+AND enough image-boundary margin for correction
 AND stable for N consecutive fresh frames
 ```
 
@@ -639,9 +663,11 @@ When `servo_ready` becomes true:
 3.  prevent any stale ACT action from reaching the robot,
 4.  read the latest robot state,
 5.  wait for/obtain a fresh wrist frame,
-6.  transfer exclusive control ownership to visual servo.
-    This boundary is critical. ACT and visual servo must never command the
-    robot concurrently in V0.
+6.  transfer exclusive control ownership to the deterministic staged
+    visual-servo/press controller.
+    This boundary is critical. ACT and the deterministic controller must never
+    command the robot concurrently in V0. Handoff does not require the target
+    to already be precisely aligned with the pencil-tip reference.
 
 ------------------------------------------------------------------------
 
@@ -738,49 +764,50 @@ The classifier must infer identity from visible appearance.
 
 # Visual Servo
 
-The visual-servo stage performs only local closed-loop alignment.
-
-V0 should separate:
+After ACT/manual handoff, WRIST vision owns fine alignment. The V0 staged press
+uses the same alignment rule at every stopped Z level:
 
 ``` text
 XY ALIGNMENT
     ↓
-ALIGNED
+ALIGNED_AT_LEVEL
     ↓
-Z PRESS
+ONE PURE-Z STEP
+    ↓
+STOP + SETTLE + REOBSERVE
+    ↓
+REALIGN XY IF NEEDED
 ```
 
-Do not simultaneously perform lateral correction and downward pressing.
+Do not command lateral correction and downward motion simultaneously.
 
-## Tool reference point
+## Tool-tip reference point
 
-The desired image location should not be assumed to be the center of the
-wrist image.
-
-Instead, calibrate a reference point:
+The control reference is the physical pencil-tip projection in the rigid WRIST
+camera/tool image:
 
 ``` text
-p* = (u*, v*)
+p_tip = (u_tip, v_tip)
 ```
 
-where `p*` is the observed target-key center when the physical pencil
-tip is correctly aligned above that key.
+`p_tip` must be calibrated/validated directly as a WRIST tool property. The old
+H3.1 value obtained by manually placing the pencil over `G` must not be silently
+relabelled as a direct pencil-tip calibration.
 
-For a detected target center:
+For a detected target-key center:
 
 ``` text
-p = (u, v)
+p_key = (u_key, v_key)
 ```
 
 the image error is:
 
 ``` text
-e = p - p*
+e = p_key - p_tip
 ```
 
-or simply `e = (u - u*, v - v*)`.
-
-The controller drives `||e||` toward zero.
+The controller drives `||e||` toward zero. The same `p_tip` is shared across
+ordinary A-Z keys; there is no per-key tool reference.
 
 ## Local image Jacobian
 
@@ -810,6 +837,11 @@ delta_p_image ~= J_cmd @ delta_c_requested
 
 where `J_cmd` has units `px / commanded-mm`.
 
+H3.2 has already accepted this command-space mapping. The existing canonical
+`calibration/image_jacobian.json` remains the source of truth. Replacing the
+old target-derived H3.1 reference with a directly calibrated `p_tip` does not
+by itself invalidate H3.2.
+
 Then a local controller can use a damped/bounded form of:
 
 ``` text
@@ -818,15 +850,15 @@ delta_c_requested = -J_cmd^+ @ e
 
 with:
 
-- bounded Cartesian step size,
+- bounded Cartesian XY step size,
 - damping if necessary,
-- maximum iteration count,
+- maximum iteration/correction budget,
 - convergence threshold,
 - target-loss handling,
 - fresh-frame requirement.
 
-The Cartesian correction can then be converted to safe robot commands
-through the chosen kinematic/IK path.
+The Cartesian correction can then be converted to safe robot commands through
+the existing LeRobot kinematic/IK path.
 
 ## Alignment acceptance
 
@@ -835,41 +867,65 @@ Do not declare alignment from one frame.
 A robust rule should require:
 
 ``` text
-||e|| < epsilon
+||p_key - p_tip|| < epsilon
 for N consecutive fresh frames
 ```
 
-before entering `PRESS`.
+before authorizing one downward step. After every Z step, this acceptance is
+invalidated and must be established again from fresh WRIST observations.
+
+For V0, multi-frame acceptance is the first anti-chatter mechanism. If hardware
+logs later show threshold chatter or small left/right oscillation near
+convergence, add an alignment deadband/hysteresis buffer (and, if needed,
+temporal filtering or reduced near-target gain) without changing the staged
+control architecture. Do not choose the buffer width until real hardware data
+shows the noise/oscillation scale.
 
 ------------------------------------------------------------------------
 
 # Deterministic Press Controller
 
-The press stage should not be learned in V0.
-
-Conceptually:
+The press stage should not be learned in V0. It is a bounded staged descent,
+not one precomputed downward stroke:
 
 ``` text
-aligned pre-press pose
+stable XY alignment at current level
         ↓
-bounded downward motion
+one bounded pure-Z step
         ↓
-short hold
+stop + settle
         ↓
-retract to safe height
+fresh WRIST observation
+        ↓
+realign XY if needed
+        ↓
+independent SIDE/screen verification
+        ↓
+CONFIRMED_SUCCESS ? retract : next bounded level
 ```
 
 The controller must define:
 
-- maximum downward displacement,
-- maximum press duration,
+- per-step downward displacement,
+- maximum cumulative downward displacement,
 - speed/acceleration limits,
+- settle/fresh-frame requirements,
 - workspace bounds,
 - timeout behavior,
-- abort behavior.
+- abort/retract behavior.
 
-The pencil/tool should never move downward if target confidence or
-alignment state is invalid.
+A completed motion command does **not** mean the arm is physically settled. The
+SO-101 may show a short post-motion mechanical wobble, so observations captured
+during the settling window must not authorize a correction or another Z step.
+V0 may use a conservative settle delay plus consecutive stable fresh frames; a
+later optimization may replace the fixed delay with measured image/joint
+stability when hardware logs justify it.
+
+The pencil/tool must never move downward if target confidence or current-level
+alignment is invalid. Commanded descent depth is a safety/budget quantity, not
+a success detector. Further descent stops immediately when screen verification
+returns `CONFIRMED_SUCCESS`; if success is never confirmed before the hard
+maximum descent/safety bound, the attempt fails and retracts.
 
 # Screen Perception and Verification
 
@@ -902,20 +958,33 @@ Use:
 
 ``` text
 CONFIRMED_SUCCESS
+CONFIRMED_NO_CHANGE
 CONFIRMED_WRONG
 UNCERTAIN
 ```
 
-`UNCERTAIN` is important because an OCR fluctuation must not immediately
-trigger destructive recovery such as `BACKSPACE`.
+Verification is relative to the screen text confirmed immediately before the
+current key attempt. For example, if the confirmed pre-press prefix is `ROB`
+and the current requested key is `O`, the expected post-press prefix is `ROBO`.
+
+`CONFIRMED_NO_CHANGE` means fresh SIDE observations still stably match the
+confirmed pre-press text, so the stopped descent level has not yet produced the
+expected character. If all WRIST/safety gates still pass, another bounded Z
+step may be attempted. `UNCERTAIN` is different: an OCR fluctuation must not
+trigger either further descent or destructive recovery such as `BACKSPACE`
+until the observation is resolved.
 
 Example:
 
 ``` text
-expected prefix: ROBO
-observed text:   ROBO
+confirmed before attempt: ROB
+requested key:            O
+expected after success:   ROBO
 
-→ CONFIRMED_SUCCESS
+observed text:             ROB   -> CONFIRMED_NO_CHANGE
+observed text:             ROBO  -> CONFIRMED_SUCCESS
+other stable text:                -> CONFIRMED_WRONG
+unstable / low-confidence OCR:    -> UNCERTAIN
 ```
 
 If the screen result is uncertain:
@@ -1163,10 +1232,11 @@ class AlignmentResult:
 @dataclass
 class PressResult:
     completed: bool
-    downward_command: float
-    hold_s: float
+    descent_steps: int
+    cumulative_downward_command: float
     retracted: bool
     timeout: bool
+    safety_abort: bool
 ```
 
 ## `VerificationResult`
@@ -1174,6 +1244,7 @@ class PressResult:
 ``` python
 class VerificationStatus(Enum):
     CONFIRMED_SUCCESS = "confirmed_success"
+    CONFIRMED_NO_CHANGE = "confirmed_no_change"
     CONFIRMED_WRONG = "confirmed_wrong"
     UNCERTAIN = "uncertain"
 
@@ -1207,10 +1278,16 @@ target=R
 1.930  servo_error=(+22,-12)
 2.040  servo_error=(+5,-3)
 2.105  servo_error=(+1,+1)
-2.205  transition=SERVO_ALIGN->PRESS
-2.600  press=complete
-3.010  screen_text="R"
-3.011  verification=CONFIRMED_SUCCESS
+2.205  transition=SERVO_ALIGN->DESCEND_STEP
+2.260  z_step=-0.5mm cumulative_z=-0.5mm
+2.420  transition=SETTLE_AND_REOBSERVE->VERIFY_LEVEL
+2.610  verification=CONFIRMED_NO_CHANGE
+2.611  transition=VERIFY_LEVEL->DESCEND_STEP
+2.670  z_step=-0.5mm cumulative_z=-1.0mm
+2.840  alignment_error=(+2,+1)
+2.980  screen_text="R"
+2.981  verification=CONFIRMED_SUCCESS
+2.982  transition=VERIFY_LEVEL->RETRACT
 ```
 
 Recommended logged signals:
@@ -1355,7 +1432,7 @@ PHASE 2 ACCEPTED / FROZEN
         ↓
 PHASE 3 TOOL REFERENCE + VISUAL SERVO     <-- CURRENT
         ↓
-tool reference p* calibrated              ✓
+legacy H3.1 target-derived p*              ✓ historical checkpoint
         ↓
 LeRobot official Cartesian backend        ✓
         ↓
@@ -1377,11 +1454,11 @@ direction opposition X / Y                 ✓ -0.981 / -0.931
         ↓
 canonical image_jacobian.json              ✓ PROMOTED
         ↓
-closed-loop XY visual-servo hardware       <-- NEXT
+direct WRIST pencil-tip reference p_tip   <-- NEXT
         ↓
-stale-frame rejection + target-loss handling
+closed-loop p_key -> p_tip XY validation
         ↓
-stable multi-frame convergence
+small-budget staged Z / reobserve / realign validation
         ↓
 Phase 3 acceptance
 ```
@@ -1726,15 +1803,19 @@ PHASE 3 IN PROGRESS — CURRENT
 ## Phase 3 Current Checkpoint
 
 Phase 3 starts from the accepted wrist-perception runtime and does not
-require ACT. The current task remains local closed-loop geometric alignment
-from a safe teleoperated pose.
+require ACT. The current task is to validate the deterministic WRIST-controlled
+primitive from a safe teleoperated pose: direct pencil-tip reference,
+`p_key -> p_tip` XY alignment, then a small-budget staged descent that stops and
+reobserves after every Z step. Full screen-confirmed keypress completion remains
+Phase 5 integration.
 
 Completed or hardware-validated at this checkpoint:
 
-- H3.1 tool-reference calibration is complete; the WRIST tool reference
-  `p*` is available. The WRIST mount, pencil/tool mounting, SO-101 base, and
-  fixed MacBook geometry have remained unchanged since that calibration, so
-  H3.1 remains valid and does not need to be repeated.
+- H3.1 remains a historical calibration checkpoint: it measured the target-key
+  center when the operator believed the pencil was aligned over `G`. It must
+  not be silently reinterpreted as a direct physical pencil-tip pixel
+  calibration. The new staged-control design therefore requires a direct
+  WRIST `p_tip` calibration/validation before hardware staged-servo execution.
 - Cartesian motion delegates FK, end-effector bounds/safety processing, IK,
   and joint-target generation to LeRobot's SO-101 Cartesian processor path
   instead of maintaining a project-local IK contract.
@@ -1792,25 +1873,21 @@ The remaining Phase 3 sequence is:
 ``` text
 canonical J_cmd available                    ✓
         ↓
-run bounded XY visual servo on hardware      <-- NEXT
+directly calibrate / validate WRIST p_tip     <-- NEXT
         ↓
-compute pixel error relative to p*
+run bounded p_key -> p_tip XY servo on hardware
         ↓
-solve bounded Cartesian XY correction
+require stable multi-frame alignment
         ↓
-command from the current measured robot state
+authorize one small pure-Z step
         ↓
-reacquire a fresh WRIST observation
+stop + settle + fresh WRIST observation
         ↓
-reject stale frames / handle target loss
+realign XY if needed
         ↓
-require stable multi-frame convergence
+repeat only within a small cumulative Z budget
         ↓
-repeat G convergence from several image offsets
-        ↓
-perform two cross-keyboard transfer sanity checks
-        ↓
-measure final error / iterations / time / failures
+measure alignment / re-alignment / target-loss / safety behavior
         ↓
 Phase 3 acceptance
 ```
@@ -1830,8 +1907,12 @@ iterations do not reopen already-resolved branches:
 - Prefer LeRobot's existing SO-101 kinematics, calibration, and Cartesian
   processors over duplicating servo calibration or building another IK
   wrapper. The follower calibration remains owned by LeRobot.
-- Each visual-servo correction should be referenced from the **current measured
-  robot state** rather than accumulating an idealized Cartesian pose.
+- Do **not** treat the rejected V3 current-state incremental rebasing behavior
+  as an accepted runtime contract. H3.2 was accepted under conditioned
+  fixed-anchor command semantics. Runtime XY integration should preserve those
+  validated local semantics; if a larger residual error requires a new local
+  anchor/segment, the new segment must pass an explicit image-response/readiness
+  check before the canonical `J_cmd` is trusted again.
 - The calibrated Jacobian is explicitly a **command-space** mapping:
   `requested Cartesian XY delta -> observed WRIST pixel delta`. FK-derived
   displacement may be logged for diagnostics, but it is not a Phase 3
@@ -1852,18 +1933,19 @@ iterations do not reopen already-resolved branches:
   reason.
 - **Observed WRIST occlusion constraint:** when the pencil tip is less than
   roughly **1 cm above the keyboard**, the pencil/tool can occlude the target
-  key/glyph. Keep XY visual alignment at a perception-safe pre-press height
-  where possible, treat degraded visibility as target loss, and keep lateral
-  alignment separate from the later Z press.
+  key/glyph. During staged descent, stop after every Z step, treat degraded
+  visibility as target loss, and never combine lateral correction with the
+  downward command itself.
 - Robust burst consensus remains a defensive guard against transient occlusion
   or a wrong glyph candidate entering one measurement burst.
 - Do not reopen the old same-target drift / fixed-anchor planning investigation
   unless a later physical measurement produces contradictory evidence. The
   dedicated hold test and corrected fixed-anchor planning checks already closed
   that branch.
-- The next hardware gate is **closed-loop XY visual-servo validation**. It is
-  not another Jacobian probe or calibration round, and it still must not perform
-  a Z press.
+- The next hardware gates are **direct `p_tip` calibration/validation**, then
+  closed-loop `p_key -> p_tip` XY validation, followed by a deliberately small
+  cumulative-Z staged-descent test. H3.2 is not reopened unless later evidence
+  contradicts it.
 
 ### Phase 3 hardware ownership and abort contract
 
@@ -1955,8 +2037,9 @@ the canonical file is changed only by explicit review/promotion:
 python scripts/promote_image_jacobian.py --confirm-reviewed
 ```
 
-ACT, key-press execution, and screen verification remain outside the current
-Phase 3 checkpoint. The next hardware work is XY-only visual-servo convergence.
+ACT and full screen-confirmed keypress completion remain outside the current
+Phase 3 checkpoint. Phase 3 may exercise only a deliberately small, bounded
+staged descent to validate stop/reobserve/realign behavior before Phase 5.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
@@ -2055,31 +2138,42 @@ Acceptance should measure:
 
 Goal:
 
-> Starting from a teleoperated local pose, converge the target key to
-> the calibrated tool reference point.
+> Starting from a safe teleoperated local pose, align the detected target key
+> to a directly calibrated WRIST pencil-tip reference and validate the staged
+> stop/reobserve/realign primitive with a small Z budget.
 
 Tasks:
 
-1.  calibrate `p*`,
-2.  estimate and accept the local command-space image Jacobian `J_cmd`,
-3.  integrate the existing bounded XY correction/runtime with the SO-101
-    hardware executor,
-4.  validate command-time stale-frame rejection,
-5.  validate target-loss/failure handling,
-6.  require stable multi-frame convergence,
-7.  repeat on `G` from several initial image offsets, then perform two
-    cross-keyboard transfer sanity checks without per-key Jacobians.
+1.  directly calibrate/validate `p_tip` as the physical pencil-tip projection
+    in the WRIST image; do not silently reuse the old target-derived H3.1 `p*`,
+2.  retain the already accepted canonical H3.2 `J_cmd`,
+3.  integrate bounded `p_key -> p_tip` XY correction with the SO-101 hardware
+    executor,
+4.  validate fresh-frame, target-loss, FOV/safety, timeout, and correction-budget
+    handling,
+5.  require stable multi-frame alignment before any Z motion,
+6.  validate a small-budget staged loop: one pure-Z step -> stop/settle -> fresh
+    WRIST observation -> XY realignment if needed,
+7.  repeat `G` alignment from several initial image offsets and perform two
+    cross-keyboard transfer sanity checks without per-key references or
+    per-key Jacobians,
+8.  measure final alignment error, convergence time, iterations, target-loss
+    rate, re-alignment behavior, and safety-bound behavior.
 
 Acceptance should include:
 
-- convergence rate,
-- final pixel error,
-- convergence time,
-- servo iterations,
-- failure/timeout rate,
-- no unsafe downward motion.
+- reliable `p_key -> p_tip` convergence from local offsets,
+- convergence rate, final pixel error, convergence time, and servo iterations,
+- stable alignment before each permitted descent step,
+- no simultaneous XY+Z command,
+- fresh observation after every Z step,
+- successful re-alignment when descent introduces image error,
+- target-loss / timeout / failure rate,
+- hard stop/recovery on target loss, stale frames, timeout, or cumulative-Z
+  budget exhaustion.
 
-No ACT is required for this phase.
+No ACT is required for this phase. Full keypress success detection is not a
+Phase 3 acceptance requirement.
 
 ------------------------------------------------------------------------
 
@@ -2087,8 +2181,8 @@ No ACT is required for this phase.
 
 Goal:
 
-> Reliably determine whether a physical key press changed the screen as
-> expected.
+> Reliably determine whether a stopped physical press level produced the
+> expected screen change.
 
 Pipeline:
 
@@ -2103,7 +2197,7 @@ fixed typing ROI
   ↓
 OCR / text recognition
   ↓
-SUCCESS / WRONG / UNCERTAIN
+SUCCESS / NO_CHANGE / WRONG / UNCERTAIN
 ```
 
 Acceptance:
@@ -2111,7 +2205,8 @@ Acceptance:
 - controlled test strings,
 - stable perspective rectification,
 - high character recognition accuracy,
-- low false-WRONG rate,
+- low false-SUCCESS / false-WRONG rate,
+- reliable distinction between confirmed no-change and uncertain OCR,
 - explicit uncertainty behavior.
 
 ------------------------------------------------------------------------
@@ -2120,8 +2215,9 @@ Acceptance:
 
 Goal:
 
-> From a safe pose near a requested key, visually acquire, align, press,
-> retract, and verify one character.
+> From a safe pose near a requested key, visually acquire, align, descend in
+> bounded stages, stop when the screen independently confirms success, and
+> retract.
 
 Example:
 
@@ -2130,21 +2226,26 @@ target=G
    ↓
 wrist recognizes G
    ↓
-visual servo
+p_key -> p_tip XY alignment
    ↓
-aligned
+alignment stable
    ↓
-press
+one pure-Z step
    ↓
-retract
+stop + settle + fresh WRIST observation
+   ↓
+realign if needed
    ↓
 screen verify
-   ↓
-SUCCESS
+   ├── CONFIRMED_NO_CHANGE → next bounded Z step
+   ├── UNCERTAIN → hold / reobserve
+   ├── CONFIRMED_WRONG → retract / recovery
+   └── CONFIRMED_SUCCESS → retract / SUCCESS
 ```
 
-This proves the local perception-action-verification loop before learned
-coarse motion is introduced.
+This proves the local perception-action-verification loop before learned coarse
+motion is introduced. The hard maximum cumulative descent is a safety/failure
+bound, never a substitute for screen-confirmed success.
 
 ------------------------------------------------------------------------
 
@@ -2211,9 +2312,14 @@ flush/reset ACT
      ↓
 SERVO_ALIGN
      ↓
-PRESS
+DESCEND_STEP
+     ↓
+STOP / REOBSERVE / REALIGN
      ↓
 SCREEN_VERIFY
+     ├── NO_CHANGE → next bounded descent level
+     ├── UNCERTAIN → hold / reobserve
+     └── SUCCESS / WRONG / safety bound → retract / supervisor
 ```
 
 Acceptance must explicitly test:
@@ -2365,9 +2471,11 @@ Required safeguards:
 joint limits
 workspace limits
 maximum Cartesian correction per servo iteration
-maximum downward press motion
+maximum downward motion per staged Z step
+maximum cumulative downward motion per press attempt
 maximum press duration
 maximum servo iterations
+fresh-frame requirement after every Z step
 frame-age threshold
 target-confidence threshold
 controller-ownership lock
@@ -2377,12 +2485,13 @@ emergency stop
 
 Safety invariants:
 
-1.  no valid target → no press,
-2.  target lost → no press,
-3.  stale image → no servo correction,
-4.  alignment not stable → no press,
-5.  ACT and visual servo never command simultaneously,
-6.  failed verification never causes an unbounded retry loop.
+1.  no valid target → no downward step,
+2.  target lost → no downward step,
+3.  stale image → no servo correction and no downward step,
+4.  alignment not stable at the current stopped level → no downward step,
+5.  XY correction and Z descent are never commanded simultaneously,
+6.  ACT and the deterministic staged controller never command simultaneously,
+7.  failed/uncertain verification never causes an unbounded descent or retry loop.
 
 ------------------------------------------------------------------------
 
@@ -2520,19 +2629,21 @@ WRIST perception visually recognizes G
         ↓
 ACT queue is stopped/reset
         ↓
-Visual servo moves G toward p*
+Visual servo moves G toward p_tip
         ↓
-alignment stable
+alignment stable at current Z level
         ↓
-bounded deterministic press
+one bounded pure-Z step
         ↓
-retract
+stop + settle + reobserve WRIST / realign if needed
         ↓
-SIDE camera observes screen
+SIDE camera rectification + OCR
         ↓
-screen rectification + OCR
+CONFIRMED_NO_CHANGE ? repeat bounded stage
         ↓
-"G"
+"G" confirmed
+        ↓
+stop further descent + retract
         ↓
 CONFIRMED_SUCCESS
 ```
@@ -2565,11 +2676,13 @@ appearance-based wrist recognition
       ↓
 perception-triggered handoff
       ↓
-visual servo alignment
+p_key -> p_tip visual alignment
       ↓
-physical press
+bounded staged Z / stop / reobserve / realign
       ↓
-screen verification
+screen-confirmed success or bounded failure
+      ↓
+retract
       ↓
 next character / recovery
 ```
@@ -2635,7 +2748,7 @@ target selection          → deterministic supervisor
 coarse robot motion       → ACT
 local key identity        → visual appearance
 fine alignment            → classical visual servo
-physical press            → bounded deterministic control
+physical press            → bounded staged deterministic control
 result observation        → independent screen vision
 recovery planning         → deterministic supervisor
 ```
