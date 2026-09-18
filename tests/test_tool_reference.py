@@ -5,10 +5,61 @@ from pathlib import Path
 
 import numpy as np
 
-from so101_typing.control.tool_reference import ToolReferenceCalibration
+from so101_typing.control.tool_reference import (
+    LEGACY_TARGET_DERIVED,
+    WRIST_TOOL_TIP,
+    ToolReferenceCalibration,
+)
 
 
 class TestToolReferenceCalibration(unittest.TestCase):
+
+    def test_old_json_is_loaded_as_legacy_not_direct_tip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tool_reference.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "camera_name": "wrist",
+                        "image_size": [640, 480],
+                        "u": 303.0,
+                        "v": 227.5,
+                        "sample_count": 7,
+                        "std_u_px": 1.5,
+                        "std_v_px": 1.3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calibration = ToolReferenceCalibration.load(path)
+
+        assert calibration is not None
+        self.assertEqual(calibration.reference_kind, LEGACY_TARGET_DERIVED)
+        self.assertFalse(calibration.is_direct_tool_tip)
+        with self.assertRaisesRegex(RuntimeError, "TIP CALIBRATION REQUIRED"):
+            calibration.require_direct_tool_tip()
+
+    def test_direct_tip_round_trip_preserves_reference_kind(self):
+        calibration = ToolReferenceCalibration(
+            camera_name="wrist",
+            image_size=(640, 480),
+            u=310.0,
+            v=225.0,
+            sample_count=5,
+            std_u_px=0.5,
+            std_v_px=0.6,
+            reference_kind=WRIST_TOOL_TIP,
+            method="direct_manual_click_browser",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tool_reference.json"
+            calibration.save(path)
+            loaded = ToolReferenceCalibration.load(path)
+        assert loaded is not None
+        self.assertTrue(loaded.is_direct_tool_tip)
+        loaded.require_direct_tool_tip()
+        self.assertEqual(loaded.reference_kind, WRIST_TOOL_TIP)
+
     def test_uncalibrated_placeholder_returns_none(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tool_reference.json"
@@ -92,6 +143,39 @@ class TestToolReferenceCalibration(unittest.TestCase):
             calibration.std_v_px,
             float(np.std(np.asarray(samples)[:, 1], ddof=0)),
         )
+        array = np.asarray(samples, dtype=np.float64)
+        median = np.median(array, axis=0)
+        radial = np.linalg.norm(array - median, axis=1)
+        self.assertAlmostEqual(
+            calibration.rms_radial_deviation_px,
+            float(np.sqrt(np.mean(radial**2))),
+        )
+        self.assertAlmostEqual(
+            calibration.max_radial_deviation_px,
+            float(np.max(radial)),
+        )
+
+    def test_legacy_file_without_radial_fields_keeps_them_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tool_reference.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "camera_name": "wrist",
+                        "image_size": [640, 480],
+                        "u": 303.0,
+                        "v": 227.5,
+                        "sample_count": 7,
+                        "std_u_px": 1.5,
+                        "std_v_px": 1.3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calibration = ToolReferenceCalibration.load(path)
+        assert calibration is not None
+        self.assertIsNone(calibration.rms_radial_deviation_px)
+        self.assertIsNone(calibration.max_radial_deviation_px)
 
     def test_error_px_uses_readme_sign_convention(self):
         calibration = ToolReferenceCalibration(

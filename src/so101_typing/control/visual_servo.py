@@ -146,7 +146,7 @@ def compute_visual_servo_step(
 ) -> VisualServoStep:
     """Compute one bounded XY correction without commanding any robot motion.
 
-    Sign convention is frozen as ``error = p - p_star`` and
+    Sign convention is ``error = p_key - p_tip`` and
     ``delta_x = -gain * J_damped_pinv @ error``.
 
     ``WITHIN_TOLERANCE`` means only that this single observation is inside the

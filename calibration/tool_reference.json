@@ -1,12 +1,17 @@
 {
+  "schema_version": 3,
+  "reference_kind": "wrist_tool_tip",
+  "method": "direct_manual_click_browser",
   "camera_name": "wrist",
   "image_size": [
     640,
     480
   ],
-  "u": 303.0,
-  "v": 227.5,
-  "sample_count": 7,
-  "std_u_px": 1.522173357452174,
-  "std_v_px": 1.284286904919121
+  "u": 307.0,
+  "v": 238.2459788101581,
+  "sample_count": 5,
+  "std_u_px": 0.58309518948453,
+  "std_v_px": 0.30507397383397333,
+  "rms_radial_deviation_px": 0.8093929098516285,
+  "max_radial_deviation_px": 1.6241281372771104
 }

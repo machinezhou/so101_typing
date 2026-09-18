@@ -1,0 +1,1640 @@
+from __future__ import annotations
+
+import argparse
+import json
+import time
+import traceback
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
+from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
+from lerobot.utils.constants import HF_LEROBOT_HOME
+
+from calibrate_image_jacobian import (
+    DEFAULT_MAX_MEASURED_XY_ERROR_MM,
+    DEFAULT_MAX_MEASURED_Z_ERROR_MM,
+    DEFAULT_MAX_MODEL_XY_ERROR_MM,
+    DEFAULT_MAX_MODEL_Z_ERROR_MM,
+    _build_pipeline as _h32_build_pipeline,
+    _direction_consistency as _h32_direction_consistency,
+    _plan_delta as _h32_plan_delta,
+    _run_positioning_teleop,
+    _run_recovery_teleop,
+    _wait_for_initial_frame,
+    _wait_until_settled,
+)
+from so101_typing.adapters.cameras import CameraSpec, ThreadedOpenCVCamera
+from so101_typing.control.cartesian_kinematics import (
+    SO101_MOTOR_NAMES,
+    build_so101_kinematics,
+    end_effector_xyz_mm,
+    make_cartesian_delta_action,
+    ordered_joint_observation,
+)
+from so101_typing.control.image_jacobian import ImageJacobianCalibration
+from so101_typing.control.phase3_staged import (
+    ResponseGateConfig,
+    SegmentReadinessGate,
+    StagedDescentGate,
+    assess_image_response,
+    run_staged_sequence,
+    validate_frame_image_size,
+    validate_h32_runtime_context,
+    validate_joint_target_step,
+)
+from so101_typing.control.target_measurement import TargetBurstConfig, robust_target_center
+from so101_typing.control.tool_reference import ToolReferenceCalibration
+from so101_typing.control.visual_servo import (
+    VisualServoConfig,
+    VisualServoStepStatus,
+    compute_visual_servo_step,
+)
+from so101_typing.perception.glyph_runtime import RuntimeHOGGlyphRecognizer
+from so101_typing.perception.wrist_target import observe_target
+
+
+DEFAULT_URDF = HF_LEROBOT_HOME / "robot-urdfs" / "so101" / "so101_new_calib.urdf"
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _preview(path: Path, image: np.ndarray, key: np.ndarray, tip: np.ndarray, error: float) -> None:
+    out = image.copy()
+    p_key = tuple(np.rint(key).astype(int))
+    p_tip = tuple(np.rint(tip).astype(int))
+    cv2.drawMarker(out, p_tip, (255, 0, 255), cv2.MARKER_CROSS, 28, 2, cv2.LINE_AA)
+    cv2.drawMarker(out, p_key, (0, 255, 255), cv2.MARKER_CROSS, 24, 2, cv2.LINE_AA)
+    cv2.line(out, p_key, p_tip, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(
+        out,
+        f"error={error:.2f}px",
+        (12, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), out):
+        raise RuntimeError(f"failed to write preview: {path}")
+
+
+def _bbox_has_margin(
+    bbox: tuple[int, int, int, int] | None,
+    *,
+    width: int,
+    height: int,
+    margin_px: int,
+) -> bool:
+    if bbox is None:
+        return False
+    x, y, w, h = bbox
+    return (
+        x >= margin_px
+        and y >= margin_px
+        and x + w <= width - margin_px
+        and y + h <= height - margin_px
+    )
+
+
+def _capture_target_center(
+    camera: ThreadedOpenCVCamera,
+    recognizer: RuntimeHOGGlyphRecognizer,
+    target_label: str,
+    *,
+    max_frame_age_ms: float,
+    timeout_s: float,
+    after_frame_id: int | None,
+    min_capture_timestamp: float | None,
+    burst_config: TargetBurstConfig,
+    fov_margin_px: int,
+    artifact_dir: Path,
+    capture_tag: str,
+) -> tuple[np.ndarray, list[dict], np.ndarray, int]:
+    centers: list[tuple[float, float]] = []
+    records: list[dict] = []
+    last_image: np.ndarray | None = None
+    last_frame_id = -1 if after_frame_id is None else int(after_frame_id)
+    deadline = time.monotonic() + timeout_s
+
+    while len(centers) < burst_config.frame_count and time.monotonic() < deadline:
+        frame = camera.latest(copy_image=True)
+        if frame is None or frame.frame_id <= last_frame_id:
+            time.sleep(0.005)
+            continue
+        last_frame_id = int(frame.frame_id)
+        if min_capture_timestamp is not None and frame.capture_timestamp <= min_capture_timestamp:
+            continue
+        now = time.monotonic()
+        age_ms = max(frame.frame_age_ms, max(0.0, (now - frame.capture_timestamp) * 1000.0))
+        if age_ms > max_frame_age_ms:
+            continue
+        validate_frame_image_size(
+            frame.image.shape,
+            expected_image_size=(camera.spec.width, camera.spec.height),
+        )
+
+        observation = observe_target(frame.image, target_label, recognizer)
+        last_image = frame.image
+        if not observation.found or observation.center_px is None:
+            continue
+        height, width = frame.image.shape[:2]
+        if not _bbox_has_margin(
+            observation.bbox,
+            width=width,
+            height=height,
+            margin_px=fov_margin_px,
+        ):
+            continue
+
+        center = (float(observation.center_px[0]), float(observation.center_px[1]))
+        centers.append(center)
+        records.append(
+            {
+                "frame_id": int(frame.frame_id),
+                "capture_timestamp": float(frame.capture_timestamp),
+                "frame_age_ms": float(age_ms),
+                "center_px": [center[0], center[1]],
+                "bbox": None if observation.bbox is None else list(observation.bbox),
+                "vote_fraction": float(observation.vote_fraction),
+                "similarity": float(observation.similarity),
+                "quality_score": float(observation.quality_score),
+            }
+        )
+
+    if len(centers) != burst_config.frame_count or last_image is None:
+        failure = artifact_dir / f"target_failure_{capture_tag}.jpg"
+        if last_image is not None:
+            cv2.imwrite(str(failure), last_image)
+        raise RuntimeError(
+            f"Target {target_label!r} was lost/unstable/too close to the image boundary: "
+            f"accepted {len(centers)}/{burst_config.frame_count} fresh observations"
+        )
+
+    burst = robust_target_center(np.asarray(centers, dtype=np.float64), config=burst_config)
+    if not burst.accepted or burst.center_px is None:
+        raise RuntimeError(
+            "Target burst has no stable consensus: "
+            f"inliers={burst.inlier_count}/{burst.total_count}"
+        )
+    inliers = set(burst.inlier_indices)
+    for index, record in enumerate(records):
+        record["burst_inlier"] = index in inliers
+    return np.asarray(burst.center_px, dtype=np.float64), records, last_image, last_frame_id
+
+
+def _latch_xy_segment(
+    robot: SO101Follower,
+    args: argparse.Namespace,
+    *,
+    motor_names: list[str],
+    validation_kinematics,
+    segment_index: int,
+):
+    pipeline = _h32_build_pipeline(args, motor_names)
+    observation = ordered_joint_observation(robot.get_observation(), motor_names)
+    anchor_xyz_mm = end_effector_xyz_mm(validation_kinematics, observation, motor_names)
+    action, diagnostics, _, _ = _h32_plan_delta(
+        pipeline,
+        observation,
+        0.0,
+        0.0,
+        motor_names=motor_names,
+        validation_kinematics=validation_kinematics,
+        anchor_xyz_mm=anchor_xyz_mm,
+        max_delta_norm_mm=args.max_delta_norm_mm,
+        max_model_xy_error_mm=args.max_model_xy_error_mm,
+        max_model_z_error_mm=args.max_model_z_error_mm,
+    )
+    shifts = {
+        name: abs(float(action[f"{name}.pos"]) - float(observation[f"{name}.pos"]))
+        for name in motor_names
+        if name != "gripper"
+    }
+    worst = max(shifts, key=shifts.get)
+    if shifts[worst] > args.max_zero_joint_shift_deg:
+        raise RuntimeError(
+            f"fixed-anchor zero plan shifted {worst} by {shifts[worst]:.3f} deg; "
+            f"diagnostics={diagnostics}"
+        )
+    print(
+        f"[XY SEGMENT {segment_index}] anchor=({anchor_xyz_mm[0]:+.2f},"
+        f"{anchor_xyz_mm[1]:+.2f},{anchor_xyz_mm[2]:+.2f}) mm",
+        flush=True,
+    )
+    return pipeline, anchor_xyz_mm
+
+
+def _send_planned_joint_action(
+    robot: SO101Follower,
+    observation: dict,
+    joint_action: dict,
+    diagnostics: dict,
+    *,
+    motor_names: list[str],
+    validation_kinematics,
+    anchor_xyz_mm: np.ndarray,
+    expected_delta_mm: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[float, dict]:
+    relative_steps = validate_joint_target_step(
+        observation,
+        joint_action,
+        motor_names,
+        max_relative_target_deg=args.max_relative_target_deg,
+    )
+    diagnostics["planned_relative_joint_step_deg"] = relative_steps
+
+    sent_action = robot.send_action(joint_action)
+    clipped = {
+        key: (float(joint_action[key]), float(sent_action[key]))
+        for key in joint_action
+        if key.endswith(".pos")
+        and key in sent_action
+        and key != "gripper.pos"
+        and abs(float(joint_action[key]) - float(sent_action[key])) > 1e-6
+    }
+    if clipped:
+        raise RuntimeError(
+            "Joint target was clipped despite pre-send relative-step check: "
+            f"{clipped}"
+        )
+
+    settled_obs, settled_timestamp = _wait_until_settled(
+        robot,
+        sent_action,
+        tolerance_deg=args.settle_tolerance_deg,
+        stable_reads=args.settle_stable_reads,
+        timeout_s=args.settle_timeout_s,
+    )
+    settled_ordered = ordered_joint_observation(settled_obs, motor_names)
+    measured_xyz_mm = end_effector_xyz_mm(
+        validation_kinematics,
+        settled_ordered,
+        motor_names,
+    )
+    measured_delta_mm = measured_xyz_mm - anchor_xyz_mm
+    measured_error_mm = measured_delta_mm - expected_delta_mm
+    measured_xy_error_mm = float(np.linalg.norm(measured_error_mm[:2]))
+    measured_z_error_mm = abs(float(measured_error_mm[2]))
+    diagnostics.update(
+        {
+            "measured_xyz_mm": measured_xyz_mm.tolist(),
+            "measured_delta_from_anchor_mm": measured_delta_mm.tolist(),
+            "measured_error_mm": measured_error_mm.tolist(),
+            "measured_xy_error_mm": measured_xy_error_mm,
+            "measured_z_error_mm": measured_z_error_mm,
+            "measured_fk_is_diagnostic_only": True,
+        }
+    )
+    print(
+        "[MEASURED-FK] diagnostic-only delta="
+        f"({measured_delta_mm[0]:+.2f},{measured_delta_mm[1]:+.2f},"
+        f"{measured_delta_mm[2]:+.2f})mm",
+        flush=True,
+    )
+    if (
+        measured_xy_error_mm > args.max_measured_xy_error_mm
+        or measured_z_error_mm > args.max_measured_z_error_mm
+    ):
+        print(
+            "[MEASURED-FK NOTE] outside diagnostic reference thresholds; "
+            "not used as a Phase-3 positioning-accuracy gate.",
+            flush=True,
+        )
+    return settled_timestamp, diagnostics
+
+
+def _command_fixed_anchor_xy(
+    robot: SO101Follower,
+    pipeline,
+    target_xy_mm: np.ndarray,
+    *,
+    motor_names: list[str],
+    validation_kinematics,
+    anchor_xyz_mm: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[float, dict]:
+    observation = ordered_joint_observation(robot.get_observation(), motor_names)
+    joint_action, diagnostics, _, _ = _h32_plan_delta(
+        pipeline,
+        observation,
+        float(target_xy_mm[0]),
+        float(target_xy_mm[1]),
+        motor_names=motor_names,
+        validation_kinematics=validation_kinematics,
+        anchor_xyz_mm=anchor_xyz_mm,
+        max_delta_norm_mm=args.max_delta_norm_mm,
+        max_model_xy_error_mm=args.max_model_xy_error_mm,
+        max_model_z_error_mm=args.max_model_z_error_mm,
+    )
+    expected = np.asarray(
+        [float(target_xy_mm[0]), float(target_xy_mm[1]), 0.0],
+        dtype=np.float64,
+    )
+    return _send_planned_joint_action(
+        robot,
+        observation,
+        joint_action,
+        diagnostics,
+        motor_names=motor_names,
+        validation_kinematics=validation_kinematics,
+        anchor_xyz_mm=anchor_xyz_mm,
+        expected_delta_mm=expected,
+        args=args,
+    )
+
+def _latch_xyz_anchor(
+    robot: SO101Follower,
+    args: argparse.Namespace,
+    *,
+    motor_names: list[str],
+    validation_kinematics,
+):
+    pipeline = _h32_build_pipeline(args, motor_names)
+    observation = ordered_joint_observation(robot.get_observation(), motor_names)
+    anchor_xyz_mm = end_effector_xyz_mm(validation_kinematics, observation, motor_names)
+    # First zero request latches this stopped pose inside EEReferenceAndDelta.
+    delta_action = make_cartesian_delta_action(0.0, 0.0, delta_z_mm=0.0)
+    pipeline((delta_action, observation))
+    return pipeline, anchor_xyz_mm
+
+
+def _plan_xyz(
+    pipeline,
+    observation: dict,
+    *,
+    dx_mm: float,
+    dy_mm: float,
+    dz_mm: float,
+    motor_names: list[str],
+    validation_kinematics,
+    anchor_xyz_mm: np.ndarray,
+    max_delta_norm_mm: float,
+    max_model_xy_error_mm: float,
+    max_model_z_error_mm: float,
+) -> tuple[dict, dict]:
+    ordered = ordered_joint_observation(observation, motor_names)
+    delta_action = make_cartesian_delta_action(
+        dx_mm,
+        dy_mm,
+        delta_z_mm=dz_mm,
+        max_delta_norm_mm=max_delta_norm_mm,
+    )
+    joint_action = pipeline((delta_action, ordered))
+    predicted_xyz = end_effector_xyz_mm(validation_kinematics, joint_action, motor_names)
+    predicted_delta = predicted_xyz - anchor_xyz_mm
+    expected = np.asarray([dx_mm, dy_mm, dz_mm], dtype=np.float64)
+    error = predicted_delta - expected
+    xy_error = float(np.linalg.norm(error[:2]))
+    z_error = abs(float(error[2]))
+    if xy_error > max_model_xy_error_mm:
+        raise RuntimeError(
+            f"Refusing Z send_action: planned XY leakage/error {xy_error:.3f} mm exceeds "
+            f"{max_model_xy_error_mm:.3f} mm"
+        )
+    if z_error > max_model_z_error_mm:
+        raise RuntimeError(
+            f"Refusing Z send_action: planned Z error {z_error:.3f} mm exceeds "
+            f"{max_model_z_error_mm:.3f} mm"
+        )
+    if dz_mm < 0.0 and predicted_delta[2] >= -1e-6:
+        raise RuntimeError("Refusing Z send_action: FK does not predict downward motion")
+    diagnostics = {
+        "anchor_xyz_mm": anchor_xyz_mm.tolist(),
+        "expected_delta_mm": expected.tolist(),
+        "predicted_delta_mm": predicted_delta.tolist(),
+        "model_error_mm": error.tolist(),
+        "model_xy_error_mm": xy_error,
+        "model_z_error_mm": z_error,
+    }
+    print(
+        "[Z PLAN] request="
+        f"({dx_mm:+.2f},{dy_mm:+.2f},{dz_mm:+.2f}) mm "
+        f"fk=({predicted_delta[0]:+.2f},{predicted_delta[1]:+.2f},"
+        f"{predicted_delta[2]:+.2f}) mm",
+        flush=True,
+    )
+    return joint_action, diagnostics
+
+
+def _command_z_step(
+    robot: SO101Follower,
+    args: argparse.Namespace,
+    *,
+    motor_names: list[str],
+    validation_kinematics,
+) -> tuple[float, dict]:
+    pipeline, anchor_xyz_mm = _latch_xyz_anchor(
+        robot,
+        args,
+        motor_names=motor_names,
+        validation_kinematics=validation_kinematics,
+    )
+    observation = ordered_joint_observation(robot.get_observation(), motor_names)
+    joint_action, diagnostics = _plan_xyz(
+        pipeline,
+        observation,
+        dx_mm=0.0,
+        dy_mm=0.0,
+        dz_mm=args.z_step_mm,
+        motor_names=motor_names,
+        validation_kinematics=validation_kinematics,
+        anchor_xyz_mm=anchor_xyz_mm,
+        max_delta_norm_mm=args.max_delta_norm_mm,
+        max_model_xy_error_mm=args.max_model_xy_error_mm,
+        max_model_z_error_mm=args.max_model_z_error_mm,
+    )
+    expected = np.asarray([0.0, 0.0, float(args.z_step_mm)], dtype=np.float64)
+    return _send_planned_joint_action(
+        robot,
+        observation,
+        joint_action,
+        diagnostics,
+        motor_names=motor_names,
+        validation_kinematics=validation_kinematics,
+        anchor_xyz_mm=anchor_xyz_mm,
+        expected_delta_mm=expected,
+        args=args,
+    )
+
+def _cap_norm(vector: np.ndarray, limit: float) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm <= limit:
+        return vector
+    return vector * (limit / norm)
+
+
+def _make_observable_probe(
+    direction: np.ndarray,
+    jacobian: ImageJacobianCalibration,
+    *,
+    target_response_px: float,
+    max_step_mm: float,
+) -> np.ndarray:
+    vector = np.asarray(direction, dtype=np.float64)
+    if vector.shape != (2,) or not np.isfinite(vector).all():
+        raise ValueError("readiness direction must be a finite 2-vector")
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        raise RuntimeError("readiness direction is zero")
+    unit = vector / norm
+    px_per_mm = float(np.linalg.norm(jacobian.array @ unit))
+    if px_per_mm <= 1e-12:
+        raise RuntimeError("canonical J predicts zero response along readiness direction")
+    step_mm = min(float(max_step_mm), float(target_response_px) / px_per_mm)
+    return unit * step_mm
+
+
+def _assess_conditioning_cycles(
+    previous_before: list[list[float]],
+    previous_duv: list[list[float]],
+    current_before: list[list[float]],
+    current_duv: list[list[float]],
+    *,
+    args: argparse.Namespace,
+) -> dict:
+    prev_before = np.asarray(previous_before, dtype=np.float64)
+    prev_duv = np.asarray(previous_duv, dtype=np.float64)
+    cur_before = np.asarray(current_before, dtype=np.float64)
+    cur_duv = np.asarray(current_duv, dtype=np.float64)
+    for array, name in (
+        (prev_before, "previous_before"),
+        (prev_duv, "previous_duv"),
+        (cur_before, "current_before"),
+        (cur_duv, "current_duv"),
+    ):
+        if array.shape != (4, 2) or not np.isfinite(array).all():
+            raise RuntimeError(f"conditioning {name} must be finite 4x2")
+
+    max_before_drift = float(np.max(np.linalg.norm(cur_before - prev_before, axis=1)))
+    max_response_drift = float(np.max(np.linalg.norm(cur_duv - prev_duv, axis=1)))
+    direction = _h32_direction_consistency(
+        [[args.conditioning_step_mm, 0.0], [-args.conditioning_step_mm, 0.0],
+         [0.0, args.conditioning_step_mm], [0.0, -args.conditioning_step_mm]],
+        current_duv,
+    )
+    x_cos = direction["x"]["opposition_cosine"]
+    y_cos = direction["y"]["opposition_cosine"]
+    direction_ok = (
+        x_cos is not None
+        and y_cos is not None
+        and float(x_cos) <= args.conditioning_max_opposition_cosine
+        and float(y_cos) <= args.conditioning_max_opposition_cosine
+    )
+    accepted = (
+        max_before_drift <= args.conditioning_max_before_drift_px
+        and max_response_drift <= args.conditioning_max_response_drift_px
+        and direction_ok
+    )
+    return {
+        "accepted": bool(accepted),
+        "max_before_drift_px": max_before_drift,
+        "max_response_drift_px": max_response_drift,
+        "x_opposition_cosine": x_cos,
+        "y_opposition_cosine": y_cos,
+    }
+
+
+def _run_handoff_conditioning(
+    *,
+    robot: SO101Follower,
+    camera: ThreadedOpenCVCamera,
+    recognizer: RuntimeHOGGlyphRecognizer,
+    target: str,
+    jacobian: ImageJacobianCalibration,
+    validation_kinematics,
+    motor_names: list[str],
+    args: argparse.Namespace,
+    burst_config: TargetBurstConfig,
+    artifact_dir: Path,
+    session: dict,
+    session_path: Path,
+    last_frame_id: int | None,
+    min_capture_timestamp: float | None,
+) -> tuple[int, float | None, float]:
+    """Warm the handoff mechanics with bounded fixed-anchor XY cycles.
+
+    Every conditioning sample is anchor -> probe -> anchor.  The observed data
+    are used only to decide whether the handoff has stabilized; canonical J is
+    never fitted or modified here.
+    """
+    pipeline, anchor_xyz_mm = _latch_xy_segment(
+        robot,
+        args,
+        motor_names=motor_names,
+        validation_kinematics=validation_kinematics,
+        segment_index=0,
+    )
+    motions = (
+        np.asarray((args.conditioning_step_mm, 0.0), dtype=np.float64),
+        np.asarray((-args.conditioning_step_mm, 0.0), dtype=np.float64),
+        np.asarray((0.0, args.conditioning_step_mm), dtype=np.float64),
+        np.asarray((0.0, -args.conditioning_step_mm), dtype=np.float64),
+    )
+    previous_before: list[list[float]] | None = None
+    previous_duv: list[list[float]] | None = None
+    conditioning_path_mm = 0.0
+
+    print("\n===== HANDOFF XY CONDITIONING =====", flush=True)
+    print(
+        "Readiness-only +X/-X/+Y/-Y cycles; every probe returns to the fixed anchor; "
+        "canonical J_cmd is read-only.",
+        flush=True,
+    )
+
+    for cycle in range(1, args.conditioning_max_cycles + 1):
+        cycle_before: list[list[float]] = []
+        cycle_duv: list[list[float]] = []
+        cycle_records: list[dict] = []
+
+        for phase, motion in enumerate(motions, start=1):
+            before, before_records, _, last_frame_id = _capture_target_center(
+                camera,
+                recognizer,
+                target,
+                max_frame_age_ms=args.max_frame_age_ms,
+                timeout_s=args.capture_timeout_s,
+                after_frame_id=last_frame_id,
+                min_capture_timestamp=min_capture_timestamp,
+                burst_config=burst_config,
+                fov_margin_px=args.fov_margin_px,
+                artifact_dir=artifact_dir,
+                capture_tag=f"COND_C{cycle}_P{phase}_BEFORE",
+            )
+            min_capture_timestamp = None
+
+            projected = conditioning_path_mm + 2.0 * float(np.linalg.norm(motion))
+            if projected > args.max_conditioning_path_mm + 1e-9:
+                raise RuntimeError("handoff conditioning XY path safety budget exhausted")
+
+            settled_timestamp, diagnostics_out = _command_fixed_anchor_xy(
+                robot,
+                pipeline,
+                motion,
+                motor_names=motor_names,
+                validation_kinematics=validation_kinematics,
+                anchor_xyz_mm=anchor_xyz_mm,
+                args=args,
+            )
+            after_guard = settled_timestamp + args.post_settle_guard_ms / 1000.0
+            try:
+                after, after_records, image, last_frame_id = _capture_target_center(
+                    camera,
+                    recognizer,
+                    target,
+                    max_frame_age_ms=args.max_frame_age_ms,
+                    timeout_s=args.capture_timeout_s,
+                    after_frame_id=last_frame_id,
+                    min_capture_timestamp=after_guard,
+                    burst_config=burst_config,
+                    fov_margin_px=args.fov_margin_px,
+                    artifact_dir=artifact_dir,
+                    capture_tag=f"COND_C{cycle}_P{phase}_AFTER",
+                )
+            finally:
+                # Even target-loss during the probe must attempt the bounded anchor return.
+                return_timestamp, diagnostics_return = _command_fixed_anchor_xy(
+                    robot,
+                    pipeline,
+                    np.zeros(2, dtype=np.float64),
+                    motor_names=motor_names,
+                    validation_kinematics=validation_kinematics,
+                    anchor_xyz_mm=anchor_xyz_mm,
+                    args=args,
+                )
+                conditioning_path_mm = projected
+                min_capture_timestamp = (
+                    return_timestamp + args.post_settle_guard_ms / 1000.0
+                )
+
+            actual_duv = after - before
+            predicted_duv = jacobian.array @ motion
+            print(
+                f"[COND {cycle:02d}.{phase}] dXY=({motion[0]:+.1f},{motion[1]:+.1f})mm "
+                f"predicted=({predicted_duv[0]:+.2f},{predicted_duv[1]:+.2f})px "
+                f"actual=({actual_duv[0]:+.2f},{actual_duv[1]:+.2f})px",
+                flush=True,
+            )
+            _preview(
+                artifact_dir / f"conditioning_c{cycle:02d}_p{phase:02d}.jpg",
+                image,
+                after,
+                before,
+                float(np.linalg.norm(actual_duv - predicted_duv)),
+            )
+            cycle_before.append(before.tolist())
+            cycle_duv.append(actual_duv.tolist())
+            cycle_records.append(
+                {
+                    "phase": phase,
+                    "motion_mm": motion.tolist(),
+                    "before_center_px": before.tolist(),
+                    "after_center_px": after.tolist(),
+                    "predicted_duv_px": predicted_duv.tolist(),
+                    "actual_duv_px": actual_duv.tolist(),
+                    "before_observations": before_records,
+                    "after_observations": after_records,
+                    "probe_diagnostics": diagnostics_out,
+                    "return_diagnostics": diagnostics_return,
+                }
+            )
+
+        event = {
+            "type": "handoff_conditioning_cycle",
+            "cycle": cycle,
+            "path_mm": conditioning_path_mm,
+            "samples": cycle_records,
+            "assessment": None,
+        }
+        converged = False
+        if previous_before is None or previous_duv is None:
+            print(
+                f"[COND CHECK {cycle}] baseline cycle recorded; adjacent cycle required.",
+                flush=True,
+            )
+        else:
+            assessment = _assess_conditioning_cycles(
+                previous_before,
+                previous_duv,
+                cycle_before,
+                cycle_duv,
+                args=args,
+            )
+            converged = cycle >= args.conditioning_min_cycles and assessment["accepted"]
+            event["assessment"] = assessment
+            x_cos = assessment["x_opposition_cosine"]
+            y_cos = assessment["y_opposition_cosine"]
+            print(
+                f"[COND CHECK {cycle - 1}->{cycle}] BEFORE drift="
+                f"{assessment['max_before_drift_px']:.2f}px "
+                f"dUV drift={assessment['max_response_drift_px']:.2f}px "
+                f"oppX={float(x_cos):+.3f} oppY={float(y_cos):+.3f} "
+                f"=> {'PASS' if converged else 'WAIT/FAIL'}",
+                flush=True,
+            )
+
+        session["events"].append(event)
+        _write_json(session_path, session)
+        if converged:
+            print(
+                f"[CONDITIONING PASS] stable after {cycle} cycles; arm is back at anchor.",
+                flush=True,
+            )
+            return last_frame_id, min_capture_timestamp, conditioning_path_mm
+        previous_before = cycle_before
+        previous_duv = cycle_duv
+
+    raise RuntimeError(
+        "handoff XY conditioning did not converge within "
+        f"{args.conditioning_max_cycles} cycles; refusing visual servo/Z"
+    )
+
+
+def _align_current_level(
+    *,
+    robot: SO101Follower,
+    camera: ThreadedOpenCVCamera,
+    recognizer: RuntimeHOGGlyphRecognizer,
+    target: str,
+    tool_tip: np.ndarray,
+    jacobian: ImageJacobianCalibration,
+    validation_kinematics,
+    motor_names: list[str],
+    args: argparse.Namespace,
+    burst_config: TargetBurstConfig,
+    response_config: ResponseGateConfig,
+    artifact_dir: Path,
+    session: dict,
+    session_path: Path,
+    level_index: int,
+    last_frame_id: int | None,
+    min_capture_timestamp: float | None,
+    path_mm_start: float,
+) -> tuple[int, float, int, float]:
+    servo_config = VisualServoConfig(
+        gain=args.gain,
+        convergence_threshold_px=args.threshold_px,
+        max_step_norm=args.max_step_mm,
+        max_total_correction_norm=args.segment_radius_mm,
+    )
+    segment_index = 0
+    pipeline = None
+    anchor_xyz_mm = None
+    segment_offset = np.zeros(2, dtype=np.float64)
+    readiness_gate: SegmentReadinessGate | None = None
+    stable = 0
+    path_mm = float(path_mm_start)
+    readiness_path_mm = 0.0
+    pending_response: dict | None = None
+    fail_after_return: str | None = None
+
+    for iteration in range(1, args.max_xy_iterations + 1):
+        try:
+            center, records, image, last_frame_id = _capture_target_center(
+                camera,
+                recognizer,
+                target,
+                max_frame_age_ms=args.max_frame_age_ms,
+                timeout_s=args.capture_timeout_s,
+                after_frame_id=last_frame_id,
+                min_capture_timestamp=min_capture_timestamp,
+                burst_config=burst_config,
+                fov_margin_px=args.fov_margin_px,
+                artifact_dir=artifact_dir,
+                capture_tag=f"L{level_index}_I{iteration}",
+            )
+        except Exception:
+            if pending_response is not None and pipeline is not None and anchor_xyz_mm is not None:
+                print(
+                    "[READINESS EMERGENCY RETURN] post-probe observation failed; "
+                    "returning fixed anchor before propagating failure.",
+                    flush=True,
+                )
+                _command_fixed_anchor_xy(
+                    robot,
+                    pipeline,
+                    np.zeros(2, dtype=np.float64),
+                    motor_names=motor_names,
+                    validation_kinematics=validation_kinematics,
+                    anchor_xyz_mm=anchor_xyz_mm,
+                    args=args,
+                )
+            raise
+        min_capture_timestamp = None
+        error = center - tool_tip
+        error_norm = float(np.linalg.norm(error))
+
+        if fail_after_return is not None:
+            session["events"].append(
+                {
+                    "type": "segment_readiness_return_reobserve",
+                    "level": level_index,
+                    "segment": segment_index,
+                    "target_center_px": center.tolist(),
+                    "error_px": error.tolist(),
+                    "error_norm_px": error_norm,
+                    "observations": records,
+                }
+            )
+            _write_json(session_path, session)
+            raise RuntimeError(fail_after_return)
+
+        if pending_response is not None:
+            actual_duv = center - pending_response["center_before"]
+            assessment = assess_image_response(
+                pending_response["predicted_duv"],
+                actual_duv,
+                error_before_px=pending_response["error_before"],
+                error_after_px=error_norm,
+                config=response_config,
+            )
+            cosine_display = float("nan") if assessment.cosine is None else assessment.cosine
+            ratio_display = (
+                float("nan")
+                if assessment.magnitude_ratio is None
+                else assessment.magnitude_ratio
+            )
+            attempt = int(pending_response["attempt"])
+            print(
+                f"[READINESS {attempt}/{args.readiness_max_attempts}] predicted="
+                f"({pending_response['predicted_duv'][0]:+.2f},"
+                f"{pending_response['predicted_duv'][1]:+.2f})px "
+                f"actual=({actual_duv[0]:+.2f},{actual_duv[1]:+.2f})px "
+                f"cos={cosine_display:+.3f} ratio={ratio_display:.2f} "
+                f"=> {'PASS' if assessment.accepted else 'FAIL'}",
+                flush=True,
+            )
+            session["events"].append(
+                {
+                    "type": "segment_readiness",
+                    "level": level_index,
+                    "segment": segment_index,
+                    "attempt": attempt,
+                    "target_center_px": center.tolist(),
+                    "observations": records,
+                    "assessment": {
+                        "accepted": assessment.accepted,
+                        "cosine": assessment.cosine,
+                        "magnitude_ratio": assessment.magnitude_ratio,
+                        "predicted_norm_px": assessment.predicted_norm_px,
+                        "actual_norm_px": assessment.actual_norm_px,
+                        "error_before_px": assessment.error_before_px,
+                        "error_after_px": assessment.error_after_px,
+                        "reason": assessment.reason,
+                    },
+                }
+            )
+            _write_json(session_path, session)
+            assert readiness_gate is not None
+            readiness_gate.record_assessment(assessment)
+            pending_response = None
+
+            # Readiness is diagnostic-only: PASS and FAIL both return to the fixed
+            # anchor before any normal <= max_step_mm servo correction is allowed.
+            assert anchor_xyz_mm is not None
+            return_distance = float(np.linalg.norm(segment_offset))
+            prospective_readiness_path = readiness_path_mm + return_distance
+            if prospective_readiness_path > args.max_readiness_path_mm + 1e-9:
+                raise RuntimeError("readiness XY path safety budget exhausted during return")
+            print(
+                f"[READINESS RETURN] seg={segment_index} target=(+0.000,+0.000) mm "
+                f"after {'passed' if assessment.accepted else 'failed'} attempt {attempt}",
+                flush=True,
+            )
+            settled_timestamp, diagnostics = _command_fixed_anchor_xy(
+                robot,
+                pipeline,
+                np.zeros(2, dtype=np.float64),
+                motor_names=motor_names,
+                validation_kinematics=validation_kinematics,
+                anchor_xyz_mm=anchor_xyz_mm,
+                args=args,
+            )
+            readiness_path_mm = prospective_readiness_path
+            segment_offset = np.zeros(2, dtype=np.float64)
+            min_capture_timestamp = settled_timestamp + args.post_settle_guard_ms / 1000.0
+            if not assessment.accepted:
+                readiness_gate.record_return_to_anchor()
+            session["events"].append(
+                {
+                    "type": "segment_readiness_return",
+                    "level": level_index,
+                    "segment": segment_index,
+                    "attempt": attempt,
+                    "accepted_after_return": readiness_gate.accepted,
+                    "readiness_path_mm": readiness_path_mm,
+                    "diagnostics": diagnostics,
+                }
+            )
+            if readiness_gate.exhausted_after_return:
+                fail_after_return = (
+                    "new XY anchor failed image-response readiness after "
+                    f"{args.readiness_max_attempts} bounded probe/return attempts: "
+                    f"{assessment.reason}"
+                )
+            _write_json(session_path, session)
+            # Always reobserve from the anchor.  A PASS authorizes only the later
+            # normal servo step; the diagnostic probe itself is never retained.
+            continue
+
+        within = error_norm < args.threshold_px
+        stable = stable + 1 if within else 0
+        _preview(
+            artifact_dir / f"level_{level_index:02d}_iter_{iteration:02d}.jpg",
+            image,
+            center,
+            tool_tip,
+            error_norm,
+        )
+        print(
+            f"[ALIGN L{level_index} I{iteration:02d}] key=({center[0]:.1f},{center[1]:.1f}) "
+            f"tip=({tool_tip[0]:.1f},{tool_tip[1]:.1f}) "
+            f"e=({error[0]:+.1f},{error[1]:+.1f}) |e|={error_norm:.2f}px "
+            f"stable={stable}/{args.stable_bursts}",
+            flush=True,
+        )
+        session["events"].append(
+            {
+                "type": "alignment_observation",
+                "level": level_index,
+                "iteration": iteration,
+                "segment": segment_index,
+                "target_center_px": center.tolist(),
+                "error_px": error.tolist(),
+                "error_norm_px": error_norm,
+                "stable": stable,
+                "observations": records,
+            }
+        )
+        _write_json(session_path, session)
+
+        if stable >= args.stable_bursts:
+            return last_frame_id, error_norm, int(iteration), path_mm
+        if within:
+            continue
+
+        if pipeline is None:
+            if segment_index >= args.max_segments:
+                raise RuntimeError("maximum fixed-anchor XY segment count exhausted")
+            segment_index += 1
+            pipeline, anchor_xyz_mm = _latch_xy_segment(
+                robot,
+                args,
+                motor_names=motor_names,
+                validation_kinematics=validation_kinematics,
+                segment_index=segment_index,
+            )
+            segment_offset = np.zeros(2, dtype=np.float64)
+            readiness_gate = SegmentReadinessGate(max_attempts=args.readiness_max_attempts)
+
+        step = compute_visual_servo_step(
+            error,
+            jacobian,
+            config=servo_config,
+            cumulative_correction=segment_offset,
+        )
+        if step.status == VisualServoStepStatus.BUDGET_EXHAUSTED:
+            pipeline = None
+            anchor_xyz_mm = None
+            segment_offset = np.zeros(2, dtype=np.float64)
+            readiness_gate = None
+            pending_response = None
+            print(
+                "[REANCHOR] local XY command budget exhausted; stop/settle and relatch.",
+                flush=True,
+            )
+            continue
+        if step.status != VisualServoStepStatus.CORRECTION:
+            raise RuntimeError(f"unexpected visual-servo status: {step.status}")
+
+        correction = np.asarray(step.correction, dtype=np.float64)
+        readiness_attempt: int | None = None
+        segment_ready = readiness_gate is not None and readiness_gate.accepted
+        if not segment_ready:
+            assert readiness_gate is not None
+            readiness_attempt = readiness_gate.begin_probe()
+            correction = _make_observable_probe(
+                np.asarray(step.raw_correction, dtype=np.float64),
+                jacobian,
+                target_response_px=args.readiness_target_response_px,
+                max_step_mm=args.readiness_max_step_mm,
+            )
+            target_after = correction.copy()
+            predicted_probe_norm = float(np.linalg.norm(jacobian.array @ correction))
+            print(
+                f"[READINESS PROBE {readiness_attempt}/{args.readiness_max_attempts}] "
+                f"diagnostic-only norm={np.linalg.norm(correction):.3f}mm "
+                f"predicted={predicted_probe_norm:.2f}px; will return anchor before servo",
+                flush=True,
+            )
+            probe_distance = float(np.linalg.norm(correction))
+            prospective_readiness_path = readiness_path_mm + probe_distance
+            reserved_after_return = prospective_readiness_path + probe_distance
+            if reserved_after_return > args.max_readiness_path_mm + 1e-9:
+                raise RuntimeError(
+                    "readiness XY path safety budget cannot reserve probe + anchor return"
+                )
+            prospective_path = path_mm
+        else:
+            target_after = segment_offset + correction
+            if float(np.linalg.norm(target_after)) > args.segment_radius_mm + 1e-9:
+                # The pure controller normally prevents this; keep the hardware boundary explicit.
+                remaining = args.segment_radius_mm - float(np.linalg.norm(segment_offset))
+                if remaining <= 1e-9:
+                    pipeline = None
+                    readiness_gate = None
+                    continue
+                correction = _cap_norm(correction, remaining)
+                target_after = segment_offset + correction
+            prospective_path = path_mm + float(np.linalg.norm(correction))
+            if prospective_path > args.max_xy_path_mm + 1e-9:
+                raise RuntimeError("global XY path safety budget exhausted")
+        predicted_duv = jacobian.array @ correction
+        if readiness_attempt is None:
+            predicted_error = error + predicted_duv
+            if float(np.linalg.norm(predicted_error)) >= error_norm - 1e-9:
+                raise RuntimeError(
+                    "canonical J predicts a non-decreasing visual error; refusing XY motion"
+                )
+
+        print(
+            f"[XY COMMAND] seg={segment_index} target=({target_after[0]:+.3f},"
+            f"{target_after[1]:+.3f}) mm update=({correction[0]:+.3f},"
+            f"{correction[1]:+.3f}) mm dZ=0.000",
+            flush=True,
+        )
+        assert anchor_xyz_mm is not None
+        settled_timestamp, diagnostics = _command_fixed_anchor_xy(
+            robot,
+            pipeline,
+            target_after,
+            motor_names=motor_names,
+            validation_kinematics=validation_kinematics,
+            anchor_xyz_mm=anchor_xyz_mm,
+            args=args,
+        )
+        if readiness_attempt is not None:
+            readiness_path_mm = prospective_readiness_path
+        else:
+            path_mm = prospective_path
+        segment_offset = target_after
+        min_capture_timestamp = settled_timestamp + args.post_settle_guard_ms / 1000.0
+        session["events"].append(
+            {
+                "type": "xy_command",
+                "level": level_index,
+                "segment": segment_index,
+                "readiness_attempt": readiness_attempt,
+                "correction_mm": correction.tolist(),
+                "segment_target_mm": target_after.tolist(),
+                "path_mm": path_mm,
+                "readiness_path_mm": readiness_path_mm,
+                "diagnostics": diagnostics,
+            }
+        )
+        if readiness_attempt is not None:
+            pending_response = {
+                "attempt": readiness_attempt,
+                "center_before": center.copy(),
+                "error_before": error_norm,
+                "predicted_duv": predicted_duv.copy(),
+            }
+        _write_json(session_path, session)
+
+    raise RuntimeError("maximum XY iterations exhausted")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Phase 3: direct-tip XY servo plus small-budget staged Z validation."
+    )
+    parser.add_argument("--robot-port", default="/dev/ttyACM0")
+    parser.add_argument("--leader-port", default="/dev/ttyACM1")
+    parser.add_argument("--robot-id", default="lawson_follower_arm")
+    parser.add_argument("--leader-id", default="lawson_leader_arm")
+    parser.add_argument("--target", default="G")
+    parser.add_argument("--camera-config", type=Path, default=Path("configs/cameras/wrist.yaml"))
+    parser.add_argument("--model-dir", type=Path, default=Path("artifacts/models/glyph_hog_svm"))
+    parser.add_argument(
+        "--tool-reference", type=Path, default=Path("calibration/tool_reference.json")
+    )
+    parser.add_argument(
+        "--image-jacobian", type=Path, default=Path("calibration/image_jacobian.json")
+    )
+    parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
+
+    parser.add_argument("--gain", type=float, default=0.55)
+    parser.add_argument("--threshold-px", type=float, default=4.0)
+    parser.add_argument("--stable-bursts", type=int, default=3)
+    parser.add_argument("--max-step-mm", type=float, default=1.5)
+    parser.add_argument("--readiness-target-response-px", type=float, default=10.0)
+    parser.add_argument("--readiness-max-step-mm", type=float, default=5.0)
+    parser.add_argument("--readiness-max-attempts", type=int, default=3)
+    parser.add_argument("--max-readiness-path-mm", type=float, default=60.0)
+    parser.add_argument("--segment-radius-mm", type=float, default=4.0)
+    parser.add_argument("--max-segments", type=int, default=8)
+    parser.add_argument("--max-xy-path-mm", type=float, default=32.0)
+    parser.add_argument("--max-xy-iterations", type=int, default=60)
+
+    parser.add_argument("--conditioning-step-mm", type=float, default=5.0)
+    parser.add_argument("--conditioning-min-cycles", type=int, default=2)
+    parser.add_argument("--conditioning-max-cycles", type=int, default=4)
+    parser.add_argument("--conditioning-max-before-drift-px", type=float, default=10.0)
+    parser.add_argument("--conditioning-max-response-drift-px", type=float, default=8.0)
+    parser.add_argument("--conditioning-max-opposition-cosine", type=float, default=-0.5)
+    parser.add_argument("--max-conditioning-path-mm", type=float, default=160.0)
+
+    parser.add_argument("--z-step-mm", type=float, default=-0.5)
+    parser.add_argument("--max-z-steps", type=int, default=2)
+
+    parser.add_argument("--burst-frames", type=int, default=5)
+    parser.add_argument("--burst-min-inliers", type=int, default=4)
+    parser.add_argument("--burst-cluster-radius-px", type=float, default=5.0)
+    parser.add_argument("--fov-margin-px", type=int, default=20)
+    parser.add_argument("--max-frame-age-ms", type=float, default=100.0)
+    parser.add_argument("--capture-timeout-s", type=float, default=5.0)
+    parser.add_argument("--initial-timeout-s", type=float, default=5.0)
+    parser.add_argument("--post-settle-guard-ms", type=float, default=250.0)
+    parser.add_argument("--handoff-guard-ms", type=float, default=500.0)
+
+    parser.add_argument("--readiness-min-cosine", type=float, default=0.0)
+    parser.add_argument("--readiness-min-ratio", type=float, default=0.15)
+    parser.add_argument("--readiness-max-ratio", type=float, default=4.0)
+    parser.add_argument("--readiness-min-actual-response-px", type=float, default=3.0)
+    parser.add_argument("--readiness-max-error-increase-px", type=float, default=3.0)
+
+    parser.add_argument("--settle-tolerance-deg", type=float, default=1.5)
+    parser.add_argument("--settle-stable-reads", type=int, default=5)
+    parser.add_argument("--settle-timeout-s", type=float, default=3.0)
+    parser.add_argument("--max-relative-target-deg", type=float, default=10.0)
+    parser.add_argument("--max-delta-norm-mm", type=float, default=12.0)
+    parser.add_argument("--max-ee-step-m", type=float, default=0.015)
+    parser.add_argument("--orientation-weight", type=float, default=0.01)
+    parser.add_argument(
+        "--max-model-xy-error-mm", type=float, default=DEFAULT_MAX_MODEL_XY_ERROR_MM
+    )
+    parser.add_argument("--max-model-z-error-mm", type=float, default=DEFAULT_MAX_MODEL_Z_ERROR_MM)
+    parser.add_argument(
+        "--max-measured-xy-error-mm", type=float, default=DEFAULT_MAX_MEASURED_XY_ERROR_MM
+    )
+    parser.add_argument(
+        "--max-measured-z-error-mm", type=float, default=DEFAULT_MAX_MEASURED_Z_ERROR_MM
+    )
+    parser.add_argument("--max-zero-joint-shift-deg", type=float, default=0.5)
+    parser.add_argument("--teleop-hz", type=float, default=60.0)
+    parser.add_argument("--artifact-dir", type=Path, default=None)
+    parser.add_argument(
+        "--xy-only",
+        action="store_true",
+        help=(
+            "Validate conditioning + readiness + XY convergence, then recover "
+            "without any Z command."
+        ),
+    )
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    target = args.target.strip().upper()
+    if len(target) != 1 or not ("A" <= target <= "Z"):
+        raise ValueError("--target must be A-Z")
+    if not 0.0 < args.max_step_mm <= args.segment_radius_mm:
+        raise ValueError("require 0 < max-step <= segment-radius")
+    if args.segment_radius_mm > args.max_delta_norm_mm:
+        raise ValueError("segment radius must be <= max Cartesian delta")
+    if not 0.0 < args.readiness_max_step_mm <= args.max_delta_norm_mm:
+        raise ValueError("readiness max step must be in (0, max Cartesian delta]")
+    if args.readiness_max_step_mm / 1000.0 > args.max_ee_step_m:
+        raise ValueError("readiness max step exceeds --max-ee-step-m")
+    if args.readiness_target_response_px <= 0.0:
+        raise ValueError("--readiness-target-response-px must be positive")
+    if args.max_readiness_path_mm <= 0.0:
+        raise ValueError("--max-readiness-path-mm must be positive")
+    if not 0.0 < args.conditioning_step_mm <= args.max_delta_norm_mm:
+        raise ValueError("conditioning step must be in (0, max Cartesian delta]")
+    if args.conditioning_step_mm / 1000.0 > args.max_ee_step_m:
+        raise ValueError("conditioning step exceeds --max-ee-step-m")
+    if args.conditioning_min_cycles < 2:
+        raise ValueError("--conditioning-min-cycles must be >= 2")
+    if args.conditioning_max_cycles < args.conditioning_min_cycles:
+        raise ValueError("--conditioning-max-cycles must be >= conditioning min cycles")
+    if args.max_conditioning_path_mm <= 0.0:
+        raise ValueError("--max-conditioning-path-mm must be positive")
+    if args.readiness_max_attempts < 1:
+        raise ValueError("--readiness-max-attempts must be >= 1")
+    if args.conditioning_max_before_drift_px < 0.0 or args.conditioning_max_response_drift_px < 0.0:
+        raise ValueError("conditioning drift thresholds must be non-negative")
+    if not -1.0 <= args.conditioning_max_opposition_cosine <= 1.0:
+        raise ValueError("--conditioning-max-opposition-cosine must be within [-1, 1]")
+    if args.z_step_mm >= 0.0:
+        raise ValueError("--z-step-mm must be negative")
+    if abs(args.z_step_mm) > args.max_delta_norm_mm:
+        raise ValueError("Z step exceeds max Cartesian delta")
+    if args.max_z_steps < 1:
+        raise ValueError("--max-z-steps must be >= 1")
+    if args.post_settle_guard_ms < 0.0 or args.handoff_guard_ms < 0.0:
+        raise ValueError("settle/handoff guard times must be non-negative")
+
+    for path in (
+        args.camera_config,
+        args.model_dir,
+        args.image_jacobian,
+        args.urdf,
+    ):
+        if not Path(path).exists():
+            raise FileNotFoundError(path)
+
+    camera_spec = CameraSpec.from_yaml(args.camera_config)
+    if camera_spec.name != "wrist":
+        raise ValueError("Phase 3 requires the WRIST camera")
+    tool_reference = (
+        ToolReferenceCalibration.load(args.tool_reference)
+        if args.tool_reference.exists()
+        else None
+    )
+    jacobian = ImageJacobianCalibration.load(args.image_jacobian)
+    if jacobian is None:
+        raise RuntimeError("canonical image Jacobian is missing")
+    validate_h32_runtime_context(
+        camera_name=camera_spec.name,
+        configured_image_size=(camera_spec.width, camera_spec.height),
+        jacobian_motion_frame=jacobian.motion_frame,
+        jacobian_motion_unit=jacobian.motion_unit,
+    )
+    if tool_reference is not None:
+        if tool_reference.camera_name != camera_spec.name:
+            raise ValueError("tool-reference camera does not match WRIST config")
+        if tuple(tool_reference.image_size) != (camera_spec.width, camera_spec.height):
+            raise ValueError("tool-reference image size does not match WRIST config")
+
+    response_config = ResponseGateConfig(
+        min_cosine=args.readiness_min_cosine,
+        min_magnitude_ratio=args.readiness_min_ratio,
+        max_magnitude_ratio=args.readiness_max_ratio,
+        max_error_increase_px=args.readiness_max_error_increase_px,
+        min_actual_response_px=args.readiness_min_actual_response_px,
+    )
+    gate = StagedDescentGate(
+        required_stable_bursts=args.stable_bursts,
+        max_z_steps=args.max_z_steps,
+        z_step_mm=args.z_step_mm,
+    )
+    burst_config = TargetBurstConfig(
+        frame_count=args.burst_frames,
+        min_inliers=args.burst_min_inliers,
+        cluster_radius_px=args.burst_cluster_radius_px,
+    )
+
+    if args.dry_run:
+        _h32_build_pipeline(args, list(SO101_MOTOR_NAMES))
+        build_so101_kinematics(args.urdf, motor_names=list(SO101_MOTOR_NAMES))
+        RuntimeHOGGlyphRecognizer.load(args.model_dir)
+        probe = compute_visual_servo_step(
+            (-20.0, -30.0),
+            jacobian,
+            config=VisualServoConfig(
+                gain=args.gain,
+                convergence_threshold_px=args.threshold_px,
+                max_step_norm=args.max_step_mm,
+                max_total_correction_norm=args.segment_radius_mm,
+            ),
+        )
+        if probe.status != VisualServoStepStatus.CORRECTION:
+            raise RuntimeError("dry-run visual-servo preflight failed")
+        readiness_probe = _make_observable_probe(
+            np.asarray(probe.raw_correction, dtype=np.float64),
+            jacobian,
+            target_response_px=args.readiness_target_response_px,
+            max_step_mm=args.readiness_max_step_mm,
+        )
+        readiness_predicted_px = float(np.linalg.norm(jacobian.array @ readiness_probe))
+        synthetic_before = [[100.0, 100.0]] * 4
+        synthetic_duv = [
+            (jacobian.array @ np.asarray(motion, dtype=np.float64)).tolist()
+            for motion in (
+                (args.conditioning_step_mm, 0.0),
+                (-args.conditioning_step_mm, 0.0),
+                (0.0, args.conditioning_step_mm),
+                (0.0, -args.conditioning_step_mm),
+            )
+        ]
+        synthetic_conditioning = _assess_conditioning_cycles(
+            synthetic_before,
+            synthetic_duv,
+            synthetic_before,
+            synthetic_duv,
+            args=args,
+        )
+        if not synthetic_conditioning["accepted"]:
+            raise RuntimeError("dry-run conditioning-state preflight failed")
+        print("===== PHASE 3 SOFTWARE PREFLIGHT =====", flush=True)
+        print(f"[J_CMD] {np.asarray(jacobian.matrix).tolist()}", flush=True)
+        print(
+            f"[CONDITIONING] {args.conditioning_step_mm:.1f}mm +X/-X/+Y/-Y, "
+            f"adaptive {args.conditioning_min_cycles}..{args.conditioning_max_cycles} cycles",
+            flush=True,
+        )
+        print(
+            f"[READINESS] diagnostic probe={np.linalg.norm(readiness_probe):.3f}mm "
+            f"predicts {readiness_predicted_px:.2f}px; always returns anchor; "
+            f"normal servo remains <= {args.max_step_mm:.2f}mm",
+            flush=True,
+        )
+        if tool_reference is None:
+            print(
+                "[TIP] TIP CALIBRATION REQUIRED: canonical tool reference is uncalibrated.",
+                flush=True,
+            )
+        elif tool_reference.is_direct_tool_tip:
+            print(
+                f"[TIP] direct p_tip=({tool_reference.u:.2f},{tool_reference.v:.2f}) px",
+                flush=True,
+            )
+        else:
+            print(
+                "[TIP] TIP CALIBRATION REQUIRED: canonical tool reference is legacy "
+                "target-derived H3.1 data.",
+                flush=True,
+            )
+        print(
+            "DRY RUN PASS: software/J/model/kinematics wiring validated; "
+            "no camera/serial/robot/leader opened and no action sent.",
+            flush=True,
+        )
+        return
+
+    if tool_reference is None:
+        raise RuntimeError(
+            "TIP CALIBRATION REQUIRED: calibration/tool_reference.json is uncalibrated. "
+            "Run scripts/calibrate_tool_reference.py before Phase 3 autonomy."
+        )
+    tool_reference.require_direct_tool_tip()
+    tool_tip = np.asarray(tool_reference.center, dtype=np.float64)
+
+    print("===== PHASE 3 STAGED SERVO =====", flush=True)
+    print(f"[TIP] direct p_tip=({tool_tip[0]:.2f},{tool_tip[1]:.2f}) px", flush=True)
+    print(f"[J_CMD] {np.asarray(jacobian.matrix).tolist()}", flush=True)
+    z_limit_text = (
+        "DISABLED (XY-only)"
+        if args.xy_only
+        else f"{args.z_step_mm:.2f}mm x {args.max_z_steps}"
+    )
+    print(
+        f"[LIMITS] servo step<={args.max_step_mm:.2f}mm; segment<={args.segment_radius_mm:.2f}mm; "
+        f"conditioning={args.conditioning_step_mm:.1f}mm; "
+        f"readiness target={args.readiness_target_response_px:.1f}px "
+        f"step<={args.readiness_max_step_mm:.1f}mm attempts<={args.readiness_max_attempts}; "
+        f"Z={z_limit_text}; "
+        "no screen-success claim",
+        flush=True,
+    )
+
+    artifact_dir = (
+        Path("artifacts/phase3_staged_servo") / time.strftime("%Y%m%d_%H%M%S")
+        if args.artifact_dir is None
+        else args.artifact_dir
+    )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    session_path = artifact_dir / "session.json"
+    session = {
+        "protocol": "phase3_direct_tip_staged_servo_v3_conditioned_readiness",
+        "target": target,
+        "tool_reference": tool_reference.to_dict(),
+        "image_jacobian": jacobian.to_dict(),
+        "limits": {
+            "threshold_px": args.threshold_px,
+            "stable_bursts": args.stable_bursts,
+            "max_step_mm": args.max_step_mm,
+            "readiness_target_response_px": args.readiness_target_response_px,
+            "readiness_max_step_mm": args.readiness_max_step_mm,
+            "readiness_max_attempts": args.readiness_max_attempts,
+            "max_readiness_path_mm": args.max_readiness_path_mm,
+            "conditioning_step_mm": args.conditioning_step_mm,
+            "conditioning_min_cycles": args.conditioning_min_cycles,
+            "conditioning_max_cycles": args.conditioning_max_cycles,
+            "max_conditioning_path_mm": args.max_conditioning_path_mm,
+            "segment_radius_mm": args.segment_radius_mm,
+            "max_segments": args.max_segments,
+            "max_xy_path_mm": args.max_xy_path_mm,
+            "z_step_mm": args.z_step_mm,
+            "max_z_steps": args.max_z_steps,
+            "post_settle_guard_ms": args.post_settle_guard_ms,
+        },
+        "events": [],
+        "status": "starting",
+    }
+    _write_json(session_path, session)
+
+    recognizer = RuntimeHOGGlyphRecognizer.load(args.model_dir)
+    robot = SO101Follower(
+        SO101FollowerConfig(
+            port=args.robot_port,
+            id=args.robot_id,
+            use_degrees=True,
+            max_relative_target=args.max_relative_target_deg,
+            cameras={},
+        )
+    )
+    leader = SO101Leader(
+        SO101LeaderConfig(port=args.leader_port, id=args.leader_id, use_degrees=True)
+    )
+    camera = ThreadedOpenCVCamera(camera_spec)
+    motor_names = list(robot.bus.motors.keys())
+    validation_kinematics = build_so101_kinematics(args.urdf, motor_names=motor_names)
+
+    try:
+        camera.start()
+        _wait_for_initial_frame(camera, args.initial_timeout_s)
+        initial_frame = camera.latest(copy_image=False)
+        if initial_frame is None:
+            raise RuntimeError("WRIST frame disappeared after startup")
+        validate_frame_image_size(
+            initial_frame.image.shape,
+            expected_image_size=(camera_spec.width, camera_spec.height),
+        )
+        print(
+            f"[CAMERA] WRIST ready ~{camera.measured_fps:.1f} FPS "
+            f"at {camera_spec.width}x{camera_spec.height}",
+            flush=True,
+        )
+        robot.connect()
+        leader.connect()
+        if not robot.is_connected or not leader.is_connected:
+            raise RuntimeError("follower/leader connection failed")
+
+        _run_positioning_teleop(robot, leader, teleop_hz=args.teleop_hz)
+        print("[AUTONOMY] started; keep hand on physical stop/power.", flush=True)
+        session["status"] = "autonomy"
+        _write_json(session_path, session)
+
+        last_frame_id: int | None = None
+        min_capture_timestamp: float | None = (
+            time.monotonic() + args.handoff_guard_ms / 1000.0
+        )
+        xy_path_mm = 0.0
+
+        last_frame_id, min_capture_timestamp, conditioning_path_mm = _run_handoff_conditioning(
+            robot=robot,
+            camera=camera,
+            recognizer=recognizer,
+            target=target,
+            jacobian=jacobian,
+            validation_kinematics=validation_kinematics,
+            motor_names=motor_names,
+            args=args,
+            burst_config=burst_config,
+            artifact_dir=artifact_dir,
+            session=session,
+            session_path=session_path,
+            last_frame_id=last_frame_id,
+            min_capture_timestamp=min_capture_timestamp,
+        )
+        session["conditioning_path_mm"] = conditioning_path_mm
+        _write_json(session_path, session)
+
+        def _align_level_callback(level_index: int) -> dict:
+            nonlocal last_frame_id, min_capture_timestamp, xy_path_mm
+            print(f"\n===== ALIGN LEVEL {level_index} =====", flush=True)
+            last_frame_id, final_error, iterations, xy_path_mm = _align_current_level(
+                robot=robot,
+                camera=camera,
+                recognizer=recognizer,
+                target=target,
+                tool_tip=tool_tip,
+                jacobian=jacobian,
+                validation_kinematics=validation_kinematics,
+                motor_names=motor_names,
+                args=args,
+                burst_config=burst_config,
+                response_config=response_config,
+                artifact_dir=artifact_dir,
+                session=session,
+                session_path=session_path,
+                level_index=level_index,
+                last_frame_id=last_frame_id,
+                min_capture_timestamp=min_capture_timestamp,
+                path_mm_start=xy_path_mm,
+            )
+            min_capture_timestamp = None
+            return {
+                "final_error_px": final_error,
+                "iterations": iterations,
+                "xy_path_mm": xy_path_mm,
+            }
+
+        def _on_aligned(level_index: int, alignment: dict) -> None:
+            print(
+                f"[ALIGNED] level={level_index} "
+                f"error={alignment['final_error_px']:.2f}px "
+                f"iterations={alignment['iterations']}",
+                flush=True,
+            )
+
+        def _z_step_callback(step_index: int) -> dict:
+            nonlocal min_capture_timestamp
+            print(
+                f"[Z COMMAND] step {step_index}/{gate.max_z_steps}: "
+                f"dX=0 dY=0 dZ={args.z_step_mm:+.3f} commanded-mm",
+                flush=True,
+            )
+            settled_timestamp, diagnostics = _command_z_step(
+                robot,
+                args,
+                motor_names=motor_names,
+                validation_kinematics=validation_kinematics,
+            )
+            min_capture_timestamp = (
+                settled_timestamp + args.post_settle_guard_ms / 1000.0
+            )
+            return {
+                "settled_timestamp": settled_timestamp,
+                "diagnostics": diagnostics,
+            }
+
+        def _on_z_complete(step_index: int, z_result: dict) -> None:
+            session["events"].append(
+                {
+                    "type": "z_step",
+                    "step": step_index,
+                    "z_step_mm": args.z_step_mm,
+                    "cumulative_z_mm": gate.cumulative_z_mm,
+                    "settled_timestamp": z_result["settled_timestamp"],
+                    "diagnostics": z_result["diagnostics"],
+                }
+            )
+            _write_json(session_path, session)
+
+        if args.xy_only:
+            alignment = _align_level_callback(1)
+            _on_aligned(1, alignment)
+            session["status"] = "xy_only_complete"
+            session["result"] = {
+                "aligned_levels": 1,
+                "z_steps": 0,
+                "cumulative_z_mm": 0.0,
+                "final_error_px": alignment["final_error_px"],
+                "xy_path_mm": alignment["xy_path_mm"],
+                "meaning": "conditioning/readiness/XY convergence validated; NO Z command sent",
+            }
+            _write_json(session_path, session)
+            print("\n===== PHASE 3 XY-ONLY VALIDATION COMPLETE =====", flush=True)
+            print(
+                f"Final error={alignment['final_error_px']:.2f}px; "
+                "Z commands were disabled for this run.",
+                flush=True,
+            )
+            print(f"[ARTIFACTS] {artifact_dir.resolve()}", flush=True)
+            _run_recovery_teleop(robot, leader, teleop_hz=args.teleop_hz)
+            return
+
+        sequence_result = run_staged_sequence(
+            gate,
+            align_level=_align_level_callback,
+            command_z_step=_z_step_callback,
+            on_aligned=_on_aligned,
+            on_z_complete=_on_z_complete,
+        )
+
+        session["status"] = "staged_primitive_complete"
+        session["result"] = {
+            "aligned_levels": sequence_result.aligned_levels,
+            "z_steps": sequence_result.z_steps_done,
+            "cumulative_z_mm": sequence_result.cumulative_z_mm,
+            "meaning": "staged-descent primitive validated; NOT press success",
+        }
+        _write_json(session_path, session)
+        print()
+        print("===== PHASE 3 STAGED PRIMITIVE COMPLETE =====", flush=True)
+        print(
+            f"Z budget reached: {gate.z_steps_done} steps, "
+            f"{gate.cumulative_z_mm:+.2f} commanded-mm. "
+            "This is NOT a keypress-success claim.",
+            flush=True,
+        )
+        print(f"[ARTIFACTS] {artifact_dir.resolve()}", flush=True)
+        _run_recovery_teleop(robot, leader, teleop_hz=args.teleop_hz)
+
+    except KeyboardInterrupt:
+        print("\n[AUTONOMY CANCELLED] entering operator recovery.", flush=True)
+        session["status"] = "cancelled"
+        _write_json(session_path, session)
+        if robot.is_connected and leader.is_connected:
+            _run_recovery_teleop(robot, leader, teleop_hz=args.teleop_hz)
+        raise SystemExit(130)
+    except Exception as exc:
+        print(f"\n[CONTROLLED FAILURE] {type(exc).__name__}: {exc}", flush=True)
+        traceback.print_exc()
+        session["status"] = "failed"
+        session["failure"] = f"{type(exc).__name__}: {exc}"
+        _write_json(session_path, session)
+        print(f"[SESSION] {session_path.resolve()}", flush=True)
+        if robot.is_connected and leader.is_connected:
+            _run_recovery_teleop(robot, leader, teleop_hz=args.teleop_hz)
+        raise SystemExit(1)
+    finally:
+        try:
+            camera.stop()
+        except Exception as exc:
+            print(f"[CLEANUP WARNING] camera.stop failed: {exc}", flush=True)
+        try:
+            if leader.is_connected:
+                leader.disconnect()
+        except Exception as exc:
+            print(f"[CLEANUP WARNING] leader.disconnect failed: {exc}", flush=True)
+        try:
+            if robot.is_connected:
+                robot.disconnect()
+        except Exception as exc:
+            print(f"[CLEANUP WARNING] robot.disconnect failed: {exc}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
