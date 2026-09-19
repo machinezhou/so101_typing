@@ -2201,6 +2201,18 @@ Phase 3 is now accepted and frozen as the deterministic local motion checkpoint.
 ACT remains outside this checkpoint, and screen-confirmed keypress completion
 remains a Phase 5 integration task.
 
+The accepted Phase 3 hardware logic is intentionally retained in
+`scripts/validate_phase3_xyz.py` as a **hardware acceptance / regression
+validator**, not as the final production runtime. Productionizing that validated
+logic is deliberately deferred to Phase 5, after Phase 4 provides the independent
+screen-verification authority needed by the real press loop. In particular,
+Phase 5 will extract the fixed-Goal-anchor cumulative XYZ state, same-Z XY
+realignment, ownership/handoff rules, and screen-authorized descent/retract
+behavior into reusable `src/so101_typing/control/` and `runtime/` modules with new
+unit tests. Legacy pre-Goal-anchor Phase 3 runners and the old fixed `-0.5 mm`
+step-count staged abstraction are not part of the accepted runtime design and
+should not be reused as the basis of Phase 5.
+
 ## Phase 4 Current Checkpoint
 
 Phase 4 is now the active phase. The fixed SIDE camera, screen homography, and
@@ -2450,6 +2462,66 @@ screen verify
 This proves the local perception-action-verification loop before learned coarse
 motion is introduced. The hard maximum cumulative descent is a safety/failure
 bound, never a substitute for screen-confirmed success.
+
+### Phase 5 implementation migration / productionization
+
+Phase 5 is also the point where the accepted Phase 3 hardware logic is moved out
+of the validation script and into the production architecture. Do **not** revive
+or adapt the retired pre-Goal-anchor staged controller. The implementation should
+be rebuilt around the hardware-accepted contract:
+
+``` text
+motion-stable handoff
+        ↓
+read existing Goal_Position once
+        ↓
+fixed command-space anchor
+        ↓
+cumulative XY / Z command state
+        ↓
+stop + fresh WRIST observation after each command/level
+        ↓
+same-Z XY realignment when needed
+        ↓
+SIDE verification authorizes next Z level / retract / failure
+```
+
+Required Phase 5 engineering work:
+
+- extract the validated fixed-anchor cumulative XYZ command state from
+  `scripts/validate_phase3_xyz.py` into reusable control/runtime modules;
+- preserve the existing `Goal_Position` preload across the full local press
+  attempt; `Present_Position` remains diagnostics/safety/IK-seed state and must
+  never silently become a new command origin;
+- keep XYZ dead-zone/backlash semantics explicit: a small no-motion response does
+  not trigger rebasing, direction reversal, or reset-style micro-steps;
+- preserve semantic target identity through temporary near-contact glyph
+  occlusion using the guarded geometry fallback already validated in Phase 3;
+- make every Z-level transition cumulative from the original Goal-space anchor,
+  hold XY fixed during the transition, then allow XY correction only after
+  stop/settle at that same Z level;
+- integrate the Phase 4 verifier so `CONFIRMED_SUCCESS` stops further descent,
+  `CONFIRMED_NO_CHANGE` may authorize the next bounded Z level, `UNCERTAIN` holds
+  and reobserves, and `CONFIRMED_WRONG` retracts/fails;
+- implement bounded retract and operator-safe failure behavior without blind
+  automatic homing.
+
+New tests should cover at least:
+
+- fixed Goal-anchor creation and zero-delta preservation;
+- cumulative XYZ state without `Present_Position` rebasing;
+- dead-zone-safe accumulation across multiple commands;
+- Z-level advance with XY held fixed;
+- same-Z XY realignment preserving cumulative Z;
+- semantic-lock geometry fallback not selecting a new key identity;
+- no further downward command after `CONFIRMED_SUCCESS`, `CONFIRMED_WRONG`, or an
+  exhausted safety budget;
+- `UNCERTAIN` producing hold/reobserve rather than descent;
+- controller ownership and stale-command rejection at the deterministic handoff.
+
+`scripts/validate_phase3_xyz.py` should remain available as a hardware regression
+validator after this extraction; it should not become the production typing
+runtime itself.
 
 Phase 5 should also repeat the deterministic local loop on at least two
 additional letter keys without per-key `p_tip` values or per-key Jacobians. This

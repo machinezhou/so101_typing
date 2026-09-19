@@ -45,9 +45,10 @@ IMAGE_JACOBIAN = Path("calibration/image_jacobian.json")
 GLYPH_MODEL = Path("artifacts/models/glyph_hog_svm")
 CAMERA_CONFIG = Path("configs/cameras/wrist.yaml")
 
-# XY-only experiment limits. J_cmd was calibrated in command space with
-# centimetre-scale perturbations, so we accumulate small 2 mm increments around
-# one fixed anchor instead of rebasing on measured joint/FK pose each cycle.
+# Phase-3 hardware acceptance / regression limits.
+# J_cmd was calibrated in command space with 5 mm Cartesian perturbations.
+# Runtime corrections are accumulated against one fixed existing Goal_Position
+# anchor instead of rebasing on measured joint/FK pose each cycle.
 MAX_COMMANDS = 8
 MAX_STEP_NORM_MM = 5.0
 MAX_TOTAL_CORRECTION_MM = 35.0
@@ -71,8 +72,9 @@ Z_LEVEL_XY_TOLERANCE_PX = 6.0
 Z_LEVELS_MM = (-3.0, -6.0)
 MAX_XY_REALIGN_COMMANDS_PER_Z = 3
 
-# Diagnostic state only.  This experiment does NOT yet use geometry tracking
-# to drive the robot.
+# Semantic-lock tracking state.
+# Glyph recognition establishes key identity; guarded whole-keyboard geometry
+# may propagate that already-established target during autonomous occlusion.
 _TRACK_PREV_CENTERS = None
 _TRACK_PREV_TARGET = None
 
@@ -140,7 +142,7 @@ def _estimate_keyboard_translation(previous_centers, current_centers):
     }
 
 
-def capture_target(camera, recognizer, *, after_frame_id=-1, min_timestamp=None, allow_precheck_tracking=False):
+def capture_target(camera, recognizer, *, after_frame_id=-1, min_timestamp=None):
     global _TRACK_PREV_CENTERS, _TRACK_PREV_TARGET
 
     deadline = time.monotonic() + 5.0
@@ -170,14 +172,11 @@ def capture_target(camera, recognizer, *, after_frame_id=-1, min_timestamp=None,
             )
             return obs, frame
 
-        # Diagnostic only: estimate actual keyboard image motion from many
-        # visible keycaps.  We deliberately STOP after computing it rather than
-        # letting this estimate drive the robot yet.
-        # Geometry fallback is only meaningful after an autonomous motion.
-        # During PRECHECK/manual repositioning, after_frame_id remains -1,
-        # so stale geometry state must never be used.
+        # Geometry fallback is valid only after autonomy has started and
+        # semantic identity has already been established from the glyph.
+        # PRECHECK/manual positioning never uses this fallback.
         if (
-            (after_frame_id >= 0 or allow_precheck_tracking)
+            after_frame_id >= 0
             and _TRACK_PREV_CENTERS is not None
             and _TRACK_PREV_TARGET is not None
         ):
@@ -195,30 +194,6 @@ def capture_target(camera, recognizer, *, after_frame_id=-1, min_timestamp=None,
             if estimate is not None:
                 shift = estimate["translation"]
                 predicted_target = _TRACK_PREV_TARGET + shift
-
-                if allow_precheck_tracking and after_frame_id < 0:
-                    _TRACK_PREV_CENTERS = current_centers
-                    _TRACK_PREV_TARGET = predicted_target
-
-                    print(
-                        "[PRECHECK-TRACK] G glyph hidden; carrying semantic lock "
-                        "with keyboard geometry: "
-                        f"translation=({shift[0]:+.2f},{shift[1]:+.2f})px, "
-                        f"inliers={estimate['inliers']}, "
-                        f"median_residual={estimate['median_residual']:.2f}px, "
-                        f"tracked_G=({predicted_target[0]:.2f},"
-                        f"{predicted_target[1]:.2f})"
-                    )
-
-                    return (
-                        SimpleNamespace(
-                            center_px=(
-                                float(predicted_target[0]),
-                                float(predicted_target[1]),
-                            )
-                        ),
-                        frame,
-                    )
 
                 # After autonomous motion, a high-confidence whole-keyboard
                 # translation may carry the already-established semantic G lock
@@ -285,7 +260,10 @@ def capture_target(camera, recognizer, *, after_frame_id=-1, min_timestamp=None,
         centers = [candidate.center for candidate in candidates]
 
         if centers:
-            p_tip = np.asarray([307.0, 238.2459788101581], dtype=np.float64)
+            diag_tool_reference = ToolReferenceCalibration.load(TOOL_REFERENCE)
+            if diag_tool_reference is None:
+                raise RuntimeError("tool_reference.json is not calibrated")
+            p_tip = np.asarray(diag_tool_reference.center, dtype=np.float64)
             ranked = sorted(
                 (
                     (
@@ -368,7 +346,7 @@ def check_relative_joint_target(target_action, observation, motor_names):
     if violations:
         detail = ", ".join(f"{key}={delta:.2f}deg" for key, delta in violations)
         raise RuntimeError(
-            "Refusing send_action: planned joint change exceeds the 5 deg safety gate: "
+            f"Refusing send_action: planned joint change exceeds {MAX_RELATIVE_TARGET_DEG:.1f} deg safety gate: "
             + detail
         )
 
@@ -547,7 +525,7 @@ def main():
         )
 
         print("=" * 68)
-        print("XY-ONLY VISUAL CLOSED LOOP — FIXED ANCHOR / CUMULATIVE COMMAND")
+        print("PHASE 3 XYZ VALIDATION — FIXED GOAL ANCHOR / CUMULATIVE COMMAND")
         print("=" * 68)
         print("target              :", TARGET)
         print("p_tip               :", tool_reference.center)
@@ -558,9 +536,9 @@ def main():
         print("Z command           : 0 during XY; cumulative -3/-6 mm in staged Z")
         print("XY success authority: WRIST visual error only")
 
-        # Stay in manual teleoperation until the WRIST target is already
-        # inside the deliberately small local visual-servo capture region.
-        # No autonomous XY command can be sent before this gate passes.
+        # Stay in manual teleoperation until a real glyph observation is
+        # inside the Phase-3 precheck gate. Geometry propagation is intentionally
+        # disabled here; semantic identity must be visible before autonomy starts.
         while True:
             _run_positioning_teleop(robot, leader, teleop_hz=60.0)
             positioned_timestamp = time.monotonic()
@@ -569,7 +547,6 @@ def main():
                 camera,
                 recognizer,
                 min_timestamp=positioned_timestamp,
-                allow_precheck_tracking=True,
             )
             pre_error_px, pre_error_norm = visual_error(
                 tool_reference,
@@ -688,16 +665,6 @@ def main():
                 f"norm={error_norm:.2f}px "
                 f"cumulative=({cumulative[0]:+.2f},{cumulative[1]:+.2f})mm"
             )
-
-            # Two-command diagnostic only.  When command #2 has already
-            # executed, this fresh VISION observation is the result we want.
-            # Stop before planning or sending command #3.
-            if False and commands_sent >= 2:
-                print(
-                    "\n[DIAG STOP] Two autonomous XY commands completed; "
-                    "fresh visual result captured. No command #3 will be sent."
-                )
-                break
 
             step = compute_visual_servo_step(
                 error_px,

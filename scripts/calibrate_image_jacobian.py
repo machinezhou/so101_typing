@@ -924,7 +924,7 @@ def main() -> None:
         f"{args.burst_cluster_radius_px:.1f} px"
     )
     print(f"joint slew limit   = {args.max_relative_target_deg:.1f} deg/send_action")
-    print("reference mode     = fixed anchor (latched at autonomy handoff)")
+    print("reference mode     = fixed existing Goal_Position anchor")
     print(f"zero-delta joint gate = <= {args.max_zero_joint_shift_deg:.2f} deg")
     print(
         "model FK gates      = "
@@ -1031,20 +1031,68 @@ def main() -> None:
             teleop_hz=args.teleop_hz,
         )
 
-        # Freeze one kinematic operating point for the entire experiment.
-        # The pipeline is latched by a zero-delta PLAN ONLY; nothing is sent yet.
+        # Freeze one command-space operating point for the entire experiment.
+        #
+        # IMPORTANT:
+        # Preserve the servo preload already holding the arm.  Phase-3 hardware
+        # validation showed that Present_Position can differ from Goal_Position
+        # while the arm is motion-stable.  Re-basing Cartesian command space on
+        # Present_Position therefore changes the servo goal even for a nominal
+        # zero Cartesian command.
+        #
+        # H3.2 calibration must use the EXISTING Goal_Position as its fixed
+        # command-space anchor. Present_Position remains diagnostic/safety state.
         validation_kinematics = build_so101_kinematics(
             args.urdf,
             motor_names=motor_names,
         )
+
+        goal_positions = robot.bus.sync_read(
+            "Goal_Position",
+            num_retry=robot.config.num_read_retries,
+        )
+        anchor_observation = {
+            f"{name}.pos": float(goal_positions[name])
+            for name in motor_names
+        }
         anchor_observation = ordered_joint_observation(
+            anchor_observation,
+            motor_names,
+        )
+
+        # Wait for physical motion to stop without changing the Goal-space anchor.
+        _, handoff_settled_timestamp = _wait_until_settled(
+            robot,
+            anchor_observation,
+            tolerance_deg=args.settle_tolerance_deg,
+            stable_reads=args.settle_stable_reads,
+            timeout_s=args.settle_timeout_s,
+        )
+
+        present_observation = ordered_joint_observation(
             robot.get_observation(),
             motor_names,
         )
+
+        print(
+            "[COMMAND-ANCHOR] Goal - Present before H3.2: "
+            + ", ".join(
+                f"{name}="
+                f"{float(anchor_observation[name + '.pos']) - float(present_observation[name + '.pos']):+.3f}deg"
+                for name in motor_names
+                if name != "gripper"
+            )
+        )
+
         anchor_xyz_mm = end_effector_xyz_mm(
             validation_kinematics,
             anchor_observation,
             motor_names,
+        )
+
+        handoff_guard_timestamp = (
+            handoff_settled_timestamp
+            + args.post_settle_guard_ms / 1000.0
         )
         zero_joint_action, zero_plan, _, _ = _plan_delta(
             pipeline,
@@ -1144,7 +1192,7 @@ def main() -> None:
             max_frame_age_ms=args.max_frame_age_ms,
             timeout_s=args.capture_timeout_s,
             after_frame_id=last_frame_id,
-            min_capture_timestamp=None,
+            min_capture_timestamp=handoff_guard_timestamp,
             burst_config=burst_config,
         )
 
