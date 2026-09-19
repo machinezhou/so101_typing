@@ -30,8 +30,9 @@ that can:
 5.  hand control from ACT to the deterministic wrist-vision controller,
 6.  align the detected target-key center with the calibrated WRIST pencil-tip
     pixel reference,
-7.  once alignment is stable, descend in bounded pure-Z steps, stopping after
-    every step to reacquire vision and realign XY if needed,
+7.  once alignment is stable, advance through bounded cumulative Z command
+    levels relative to the same fixed command-space anchor, stopping after every
+    level to reacquire vision and realign XY at the stopped Z level if needed,
 8.  observe the MacBook screen through an independent camera after each
     stopped descent level,
 9.  stop further descent as soon as the intended character is independently
@@ -56,7 +57,8 @@ on the MacBook using only physical keyboard interaction.
 
 ## Current Project Status
 
-The project is no longer at the mechanical-feasibility stage.
+The project is no longer at the mechanical-feasibility stage. Phases 0–3 are
+accepted; Phase 4 is the current implementation phase.
 
 The current physical setup has already demonstrated:
 
@@ -73,20 +75,26 @@ The current physical setup has already demonstrated:
 - three simultaneous camera streams,
 
 - a fixed MacBook and robot workspace.
-  Therefore, the main engineering risk has shifted away from *“can the
-  SO-101 physically press a key?”* toward:
+  Therefore, the remaining engineering risk has shifted away from *“can the
+  SO-101 physically press a key?”* and from the basic local XYZ control primitive
+  toward:
 
-- local visual recognition of key identity,
+- reliable screen OCR / verification and explicit uncertainty handling,
 
-- robust ACT-to-visual-servo handoff,
+- end-to-end screen-authorized press depth and retract behavior,
 
-- image-space closed-loop alignment,
+- robust ACT-to-deterministic-controller handoff using the validated Goal-space
+  command-anchor contract,
 
-- screen verification,
-
-- runtime ownership and failure handling,
+- runtime ownership and automatic recovery,
 
 - reproducible data collection and evaluation.
+
+Phase 3 is now hardware-accepted. The deterministic WRIST-controlled primitive
+has demonstrated direct tool-tip calibration, dead-zone-aware fixed-anchor XY
+visual servoing, geometry-based target tracking through glyph occlusion, and
+cumulative staged Z with same-level XY recovery. The current project phase is
+**Phase 4 — Screen Rectification and Verification**.
 
 ------------------------------------------------------------------------
 
@@ -180,6 +188,26 @@ During deterministic staged pressing, the supervisor uses the independent
 screen observation to decide whether the requested key has actually produced
 the intended character. Commanded Z depth alone is never treated as proof of
 success.
+
+## 4. Preserve command-space preload across deterministic control
+
+Physical Phase 3 testing showed material dead zone/backlash/compliance in the
+SO-101 command chain. This applies to X, Y, and Z: a small requested Cartesian
+change can produce little or no immediate measured motion, while larger
+cumulative command changes can cross the dead zone and produce repeatable
+image-space motion.
+
+The deterministic controller therefore uses the servo's **existing
+`Goal_Position`** values at handoff as the fixed command-space anchor. The
+current `Present_Position` is still valuable for diagnostics, motion-stability
+checks, safety guards, and IK seeding, but it must not be repeatedly promoted to
+a new command origin. Doing so discards the servo preload and can create a
+visible handoff jump even for an intended zero Cartesian correction.
+
+After the anchor is latched, XYZ commands are cumulative with respect to that
+same Goal-space reference. A tiny command that appears not to move the arm is
+not, by itself, evidence that the command direction or controller logic is
+wrong.
 
 ------------------------------------------------------------------------
 
@@ -407,6 +435,8 @@ The primary architecture is:
               ▼                               │
         CONTROLLER HANDOFF                    │
       stop/reset ACT execution                │
+      wait until motion-stable                │
+      latch existing Goal_Position            │
               │                               │
               ▼                               │
        VISUAL SERVO (XY)                      │
@@ -415,12 +445,13 @@ The primary architecture is:
         alignment stable?                     │
               │ yes                           │
               ▼                               │
-       PURE-Z DESCENT STEP                    │
+     ADVANCE CUMULATIVE Z LEVEL               │
+       (hold current XY command)              │
               │                               │
         stop + settle                         │
               │                               │
        fresh WRIST observation                │
-        ├─ misaligned → XY realign             │
+        ├─ misaligned → XY realign at fixed Z │
         └─ aligned ───────────────┐             │
                                  ▼             │
                           SCREEN CAMERA        │
@@ -433,13 +464,19 @@ The primary architecture is:
                                       Task Supervisor
 ```
 
-The important architectural property is **controller ownership**:
+The important architectural property is **controller ownership and command-space continuity**:
 
 - ACT owns coarse motion only until a perception-ready handoff.
-- After handoff, the deterministic staged controller owns XY alignment and
-  bounded pure-Z descent; ACT does not resume during the press attempt.
-- Screen perception never commands the robot directly, but its confirmed
-  result determines whether further descent is allowed.
+- The handoff waits for the follower to become motion-stable and then preserves
+  the existing servo `Goal_Position` as the deterministic command-space anchor.
+- After handoff, the deterministic staged controller owns cumulative XY alignment
+  and bounded cumulative Z-level changes; ACT does not resume during the press
+  attempt.
+- A downward level transition changes cumulative Z while holding cumulative XY
+  fixed. Lateral re-alignment is performed only after stop/settle at that fixed Z
+  level.
+- Screen perception never commands the robot directly, but its confirmed result
+  determines whether further descent is allowed.
 - The supervisor is the only module that changes high-level task state.
 
 ------------------------------------------------------------------------
@@ -470,7 +507,11 @@ HANDOFF
   │
   ├── clear pending action chunk
   │
-  ├── refresh joint state
+  ├── wait until follower motion is stable
+  │
+  ├── preserve existing Goal_Position as command anchor
+  │
+  ├── refresh Present_Position for diagnostics/safety
   │
   └── acquire fresh wrist frame
   │
@@ -513,10 +554,12 @@ DONE
   image and has enough image margin for deterministic correction.
 - `ALIGNED_AT_LEVEL`: the target-key center and calibrated pencil-tip pixel are
   stably aligned at the current stopped Z level. This authorizes **one** bounded
-  pure-Z descent step, not continuous downward motion.
+  cumulative Z-level advance from the fixed Goal-space anchor, not continuous
+  downward motion.
 
-Every Z step invalidates the previous alignment acceptance. The controller must
-stop, settle, acquire fresh observations, and realign if necessary. If
+Every Z-level change invalidates the previous alignment acceptance. The
+controller must stop, settle, acquire fresh observations, and realign at the same
+stopped Z level if necessary. If
 realignment is needed after a Z step, the controller must still verify the
 screen at that same stopped level before any further descent; successful
 realignment must not accidentally authorize an extra Z step. A press succeeds
@@ -626,8 +669,8 @@ job of the deterministic WRIST controller.
 
 ## ACT → Visual Servo Handoff
 
-The handoff must be triggered by perception, not by a fixed time or a
-fixed number of ACT steps.
+The handoff must be triggered by perception, not by a fixed time or a fixed
+number of ACT steps.
 
 A conceptual observation is:
 
@@ -656,18 +699,32 @@ AND enough image-boundary margin for correction
 AND stable for N consecutive fresh frames
 ```
 
+Handoff does **not** require millimetre-level ACT placement or a sub-20-pixel
+residual. Phase 3 hardware validation demonstrated successful deterministic
+capture from an initial WRIST error of approximately **61.9 px**, reducing it
+to approximately **4.6 px**. This is evidence for the current fixed setup, not
+a guaranteed universal capture boundary.
+
 When `servo_ready` becomes true:
 
-1.  stop ACT,
-2.  clear/reset any pending ACT action chunk,
-3.  prevent any stale ACT action from reaching the robot,
-4.  read the latest robot state,
-5.  wait for/obtain a fresh wrist frame,
-6.  transfer exclusive control ownership to the deterministic staged
+1.  stop ACT and clear/reset any pending ACT action chunk,
+2.  prevent any stale ACT action from reaching the robot,
+3.  keep the follower/leader hardware session connected; do not reconnect the
+    follower at the hover pose,
+4.  wait until follower motion is stable,
+5.  read and preserve the servo's existing `Goal_Position` values as the fixed
+    deterministic command-space anchor,
+6.  read `Present_Position` separately for diagnostics, safety checks, and IK
+    seeding; do **not** use it to redefine the command origin,
+7.  acquire a fresh WRIST frame after the stable handoff,
+8.  transfer exclusive command ownership to the deterministic staged
     visual-servo/press controller.
-    This boundary is critical. ACT and the deterministic controller must never
-    command the robot concurrently in V0. Handoff does not require the target
-    to already be precisely aligned with the pencil-tip reference.
+
+This boundary is critical. ACT and the deterministic controller must never
+command the robot concurrently in V0. Preserving the existing Goal-space preload
+is equally important: hardware tests showed that rebasing a zero Cartesian
+command on `Present_Position` can move the arm, whereas resending the unchanged
+existing `Goal_Position` produced no visible or joint motion.
 
 ------------------------------------------------------------------------
 
@@ -764,22 +821,24 @@ The classifier must infer identity from visible appearance.
 
 # Visual Servo
 
-After ACT/manual handoff, WRIST vision owns fine alignment. The V0 staged press
-uses the same alignment rule at every stopped Z level:
+After ACT/manual handoff, WRIST vision owns fine alignment. The accepted V0
+primitive uses one fixed command-space anchor and a staged loop:
 
 ``` text
 XY ALIGNMENT
     ↓
 ALIGNED_AT_LEVEL
     ↓
-ONE PURE-Z STEP
+ADVANCE ONE CUMULATIVE Z LEVEL
+(hold cumulative XY fixed)
     ↓
 STOP + SETTLE + REOBSERVE
     ↓
-REALIGN XY IF NEEDED
+REALIGN XY AT FIXED Z IF NEEDED
 ```
 
-Do not command lateral correction and downward motion simultaneously.
+A Z-level transition and a lateral correction are separate stopped stages. The
+controller does not change XY and Z simultaneously as a corrective action.
 
 ## Tool-tip reference point
 
@@ -790,9 +849,16 @@ camera/tool image:
 p_tip = (u_tip, v_tip)
 ```
 
-`p_tip` must be calibrated/validated directly as a WRIST tool property. The old
-H3.1 value obtained by manually placing the pencil over `G` must not be silently
-relabelled as a direct pencil-tip calibration.
+The direct WRIST tool calibration is now complete and stored in
+`calibration/tool_reference.json`. The accepted reference is approximately:
+
+``` text
+p_tip = (307.0, 238.246) px
+```
+
+The calibration used five direct samples with a maximum radial deviation of
+approximately 1.62 px. The old H3.1 target-derived value remains historical and
+must not be relabelled as the direct tool reference.
 
 For a detected target-key center:
 
@@ -809,121 +875,191 @@ e = p_key - p_tip
 The controller drives `||e||` toward zero. The same `p_tip` is shared across
 ordinary A-Z keys; there is no per-key tool reference.
 
-## Local image Jacobian
+## Semantic lock and occlusion tracking
 
-For V0, the local mapping from a small **requested Cartesian XY command**
-to image motion can be estimated experimentally. The millimetre value is
-the command-space scaling used by the LeRobot Cartesian processor; it is
-not an independently measured TCP displacement or an SO-101 positioning-
-accuracy claim.
-
-Apply small safe perturbations around a representative pre-press pose:
+Target identity must still be established from visible glyph appearance. During
+closed-loop motion, however, the pencil can occlude the glyph as it approaches
+the target. Phase 3 therefore uses a two-stage visual contract:
 
 ``` text
-+x
--x
-+y
--y
+glyph recognition establishes target identity
+        ↓
+short-range closed-loop motion
+        ↓
+if the glyph becomes hidden:
+whole-keyboard keycap geometry estimates image translation
+        ↓
+carry forward the already-established target center
 ```
 
-and measure the corresponding target-center displacement in the wrist
-image.
+The geometry fallback is not allowed to choose a new key identity. It only
+propagates an already-established semantic lock, and only when multi-key matching
+passes strict inlier/residual gates. A single poor geometry frame is retried
+within the fresh-frame timeout rather than immediately terminating the run.
 
-Estimate the local command-space image Jacobian:
+## Local image Jacobian
+
+For V0, the mapping from a bounded **requested Cartesian XY command** to WRIST
+image motion is the accepted command-space Jacobian:
 
 ``` text
 delta_p_image ~= J_cmd @ delta_c_requested
 ```
 
-where `J_cmd` has units `px / commanded-mm`.
+where `J_cmd` has units `px / commanded-mm`. The canonical calibration remains
+`calibration/image_jacobian.json`:
 
-H3.2 has already accepted this command-space mapping. The existing canonical
-`calibration/image_jacobian.json` remains the source of truth. Replacing the
-old target-derived H3.1 reference with a directly calibrated `p_tip` does not
-by itself invalidate H3.2.
+``` text
+J_cmd =
+[[-2.386845, -0.414119],
+ [ 0.294672,  2.875000]]
+```
 
-Then a local controller can use a damped/bounded form of:
+The millimetre value is the command-space scaling used by the LeRobot Cartesian
+processor. It is not an independently measured TCP displacement or an SO-101
+positioning-accuracy claim.
+
+A local correction uses a damped/bounded form of:
 
 ``` text
 delta_c_requested = -J_cmd^+ @ e
 ```
 
-with:
+with bounded step size, cumulative command budget, fresh-frame requirements,
+target-loss handling, and convergence checks.
 
-- bounded Cartesian XY step size,
-- damping if necessary,
-- maximum iteration/correction budget,
-- convergence threshold,
-- target-loss handling,
-- fresh-frame requirement.
+## Fixed Goal-space anchor and dead-zone-aware accumulation
 
-The Cartesian correction can then be converted to safe robot commands through
-the existing LeRobot kinematic/IK path.
+Phase 3 hardware testing showed that the SO-101 can remain motion-stable with a
+non-zero `Goal_Position - Present_Position` residual. XYZ therefore must not be
+controlled by repeatedly rebasing on `Present_Position`.
+
+The accepted runtime contract is:
+
+``` text
+wait until handoff motion is stable
+        ↓
+read existing servo Goal_Position once
+        ↓
+latch it as the fixed command-space anchor
+        ↓
+apply cumulative XY / Z commands from that same anchor
+        ↓
+use Present_Position / FK only for diagnostics and safety
+        ↓
+use fresh visual outcome for XY success
+```
+
+Small requested Cartesian changes can be absorbed by dead zone/backlash. The
+controller therefore accumulates command-space correction rather than treating a
+small no-motion result as a direction failure or relatching a new origin. The
+accepted H3.2 Jacobian was calibrated with 5 mm command perturbations; Phase 3
+closed-loop validation likewise required bounded cumulative commands large
+enough to cross the hardware dead zone.
 
 ## Alignment acceptance
 
-Do not declare alignment from one frame.
-
-A robust rule should require:
+Do not declare alignment from one frame. The current Phase 3 hardware validation
+used approximately:
 
 ``` text
-||p_key - p_tip|| < epsilon
-for N consecutive fresh frames
+initial XY acceptance:  ||e|| <= 4 px for 2 consecutive fresh frames
+Z-level handoff/recheck: ||e|| <= 6 px
 ```
 
-before authorizing one downward step. After every Z step, this acceptance is
-invalidated and must be established again from fresh WRIST observations.
+These are validated V0 operating values, not claims of sub-pixel mechanical
+accuracy. Near the target, image/geometry noise and backlash can create a few
+pixels of chatter, so the controller should stop correcting inside an accepted
+deadband rather than chase 1–2 px indefinitely.
 
-For V0, multi-frame acceptance is the first anti-chatter mechanism. If hardware
-logs later show threshold chatter or small left/right oscillation near
-convergence, add an alignment deadband/hysteresis buffer (and, if needed,
-temporal filtering or reduced near-target gain) without changing the staged
-control architecture. Do not choose the buffer width until real hardware data
-shows the noise/oscillation scale.
+Two representative hardware results are:
+
+``` text
+61.89 px initial error  -> 4.56 px after bounded cumulative XY control
+43.43 px initial error  -> 1.79 px stable (2/2 fresh frames)
+```
+
+The demonstrated capture range is therefore at least about 62 px in the tested
+fixed setup; ACT should be trained to create a safe, visible servo-ready state,
+not to achieve the final pixel alignment itself.
 
 ------------------------------------------------------------------------
 
 # Deterministic Press Controller
 
-The press stage should not be learned in V0. It is a bounded staged descent,
-not one precomputed downward stroke:
+The press stage should not be learned in V0. It is a bounded staged descent from
+the same fixed Goal-space anchor, not one precomputed downward stroke and not a
+sequence that relatches from measured state:
 
 ``` text
 stable XY alignment at current level
         ↓
-one bounded pure-Z step
+advance cumulative Z level
+(hold cumulative XY fixed)
         ↓
 stop + settle
         ↓
 fresh WRIST observation
         ↓
-realign XY if needed
+realign XY at this same Z level if needed
         ↓
 independent SIDE/screen verification
         ↓
-CONFIRMED_SUCCESS ? retract : next bounded level
+CONFIRMED_SUCCESS ? retract : next authorized Z level
 ```
+
+The current validated Phase 3 primitive used cumulative commanded Z levels of
+`-3 mm` and `-6 mm` from the original Goal-space anchor. These are command-space
+validation levels, not measured TCP displacement and not the final press-depth
+policy. Phase 5 will let screen verification authorize any further bounded level.
 
 The controller must define:
 
-- per-step downward displacement,
-- maximum cumulative downward displacement,
+- bounded cumulative Z command levels,
+- maximum cumulative downward command budget,
+- maximum XY correction and total Cartesian command budget,
 - speed/acceleration limits,
 - settle/fresh-frame requirements,
-- workspace bounds,
+- workspace/joint safety bounds,
 - timeout behavior,
 - abort/retract behavior.
 
 A completed motion command does **not** mean the arm is physically settled. The
-SO-101 may show a short post-motion mechanical wobble, so observations captured
-during the settling window must not authorize a correction or another Z step.
-V0 may use a conservative settle delay plus consecutive stable fresh frames; a
-later optimization may replace the fixed delay with measured image/joint
-stability when hardware logs justify it.
+SO-101 may show a short post-motion wobble, non-zero servo residual, and XYZ
+dead zone/backlash. Observations captured during the settling window must not
+authorize a correction or another Z level.
 
-The pencil/tool must never move downward if target confidence or current-level
-alignment is invalid. Commanded descent depth is a safety/budget quantity, not
-a success detector. Further descent stops immediately when screen verification
+The important dead-zone rule is:
+
+> **Do not interpret a small commanded XYZ change with little measured motion as
+> controller failure, and do not relatch the command origin from
+> `Present_Position`.**
+
+Instead, keep one existing-`Goal_Position` anchor and advance bounded cumulative
+commands. `Present_Position` and measured FK remain diagnostic/safety signals;
+they are not press-success detectors.
+
+Phase 3 hardware validation demonstrated the full local primitive:
+
+``` text
+XY stable at 1.79 px
+        ↓
+cumulative Z = -3 mm
+        ↓
+XY drift detected and re-aligned at the same Z level
+        ↓
+XY = 4.26 px
+        ↓
+cumulative Z = -6 mm
+        ↓
+XY = 2.88 px
+        ↓
+staged XYZ primitive complete
+```
+
+The pencil/tool must never advance to a deeper Z level if the current visual
+alignment is invalid. Commanded descent depth is a safety/budget quantity, not a
+success detector. Further descent stops immediately when screen verification
 returns `CONFIRMED_SUCCESS`; if success is never confirmed before the hard
 maximum descent/safety bound, the attempt fails and retracts.
 
@@ -1279,15 +1415,17 @@ target=R
 2.040  servo_error=(+5,-3)
 2.105  servo_error=(+1,+1)
 2.205  transition=SERVO_ALIGN->DESCEND_STEP
-2.260  z_step=-0.5mm cumulative_z=-0.5mm
-2.420  transition=SETTLE_AND_REOBSERVE->VERIFY_LEVEL
-2.610  verification=CONFIRMED_NO_CHANGE
-2.611  transition=VERIFY_LEVEL->DESCEND_STEP
-2.670  z_step=-0.5mm cumulative_z=-1.0mm
-2.840  alignment_error=(+2,+1)
-2.980  screen_text="R"
-2.981  verification=CONFIRMED_SUCCESS
-2.982  transition=VERIFY_LEVEL->RETRACT
+2.260  fixed_goal_anchor=latched cumulative_xyz=(+6.8,+15.0,-3.0)mm
+2.420  transition=SETTLE_AND_REOBSERVE->REALIGN_AFTER_STEP
+2.500  alignment_error=(-7,+0)
+2.700  cumulative_xyz=(+3.7,+15.4,-3.0)mm
+2.840  transition=REALIGN_AFTER_STEP->VERIFY_LEVEL
+2.980  verification=CONFIRMED_NO_CHANGE
+2.981  transition=VERIFY_LEVEL->DESCEND_STEP
+3.050  cumulative_xyz=(+3.7,+15.4,-6.0)mm
+3.260  screen_text="R"
+3.261  verification=CONFIRMED_SUCCESS
+3.262  transition=VERIFY_LEVEL->RETRACT
 ```
 
 Recommended logged signals:
@@ -1388,8 +1526,8 @@ to solve the entire contact task itself.
 # Implementation Progress and Current Checkpoint
 
 This section tracks the actual implementation and integration status of
-the project. The detailed technical definition and acceptance criteria
-for each phase remain unchanged in the Development Roadmap below.
+the project. The Development Roadmap below is updated when hardware evidence
+changes a phase boundary, command contract, or acceptance criterion.
 
 ## Overall Progress
 
@@ -1398,8 +1536,8 @@ for each phase remain unchanged in the Development Roadmap below.
 | Phase 0  | Mechanical Feasibility                              | **Completed**             |
 | Phase 1  | Freeze Camera Geometry and Build Camera Sanity Tool | **Completed**             |
 | Phase 2  | Wrist Keycap Detection and Glyph Recognition        | **Completed**             |
-| Phase 3  | Tool Reference and Visual Servo                     | **IN PROGRESS — CURRENT** |
-| Phase 4  | Screen Rectification and Verification               | Not Started               |
+| Phase 3  | Tool Reference and Visual Servo                     | **Completed**             |
+| Phase 4  | Screen Rectification and Verification               | **IN PROGRESS — CURRENT** |
 | Phase 5  | Deterministic Local Single-Key Closed Loop          | Not Started               |
 | Phase 6  | Target-Conditioned ACT Dataset                      | Not Started               |
 | Phase 7  | ACT Coarse Policy                                   | Not Started               |
@@ -1416,51 +1554,47 @@ phase.
 ## Current Phase
 
 ``` text
-Phase 3 — Tool Reference and Visual Servo
+Phase 4 — Screen Rectification and Verification
 ```
 
 Current checkpoint:
 
 ``` text
-Phase 1 camera/software foundation
+Phase 1 camera/software foundation             ✓ COMPLETED
         ↓
-PHASE 1 ACCEPTED / FROZEN
+Phase 2 wrist perception                         ✓ COMPLETED
         ↓
-Phase 2 wrist perception
+Phase 3 tool reference + visual servo             ✓ COMPLETED
         ↓
-PHASE 2 ACCEPTED / FROZEN
+canonical J_cmd                                   ✓
         ↓
-PHASE 3 TOOL REFERENCE + VISUAL SERVO     <-- CURRENT
+direct WRIST p_tip                                ✓ (307.0, 238.246)
         ↓
-legacy H3.1 target-derived p*              ✓ historical checkpoint
+existing Goal_Position command anchor             ✓
         ↓
-LeRobot official Cartesian backend        ✓
+dead-zone-aware cumulative XY servo               ✓
         ↓
-fixed-anchor Cartesian planning            ✓
+semantic lock + geometry tracking under occlusion ✓
         ↓
-H3.2 conditioned physical calibration      ✓ ACCEPTED
+wide local capture: 61.89 px -> 4.56 px           ✓ demonstrated
         ↓
-conditioning convergence                   ✓ 3 cycles
+stable XY: 43.43 px -> 1.79 px (2 fresh frames)  ✓
         ↓
-formal paired samples                      ✓ 8 samples
+cumulative Z 0 -> -3 -> -6 mm                    ✓
         ↓
-J_cmd [px/commanded-mm]                    ✓
-[[-2.386845, -0.414119],
- [ 0.294672,  2.875000]]
+low-Z XY re-alignment at fixed Z                  ✓
         ↓
-residual RMS / condition number            ✓ 3.256 px / 1.391
+final staged-Z validation error 2.88 px           ✓
         ↓
-direction opposition X / Y                 ✓ -0.981 / -0.931
+PHASE 3 ACCEPTED
         ↓
-canonical image_jacobian.json              ✓ PROMOTED
+PHASE 4 SCREEN RECTIFICATION + VERIFICATION       <-- CURRENT
         ↓
-direct WRIST pencil-tip reference p_tip   <-- NEXT
+SIDE homography + text ROI                         ✓ existing from Phase 1
         ↓
-closed-loop p_key -> p_tip XY validation
+live rectified ROI / OCR verification              <-- NEXT
         ↓
-small-budget staged Z / reobserve / realign validation
-        ↓
-Phase 3 acceptance
+SUCCESS / NO_CHANGE / WRONG / UNCERTAIN
 ```
 
 ## Phase 1 Completion Record
@@ -1675,7 +1809,9 @@ PHASE 1 COMPLETED
         ↓
 PHASE 2 COMPLETED
         ↓
-PHASE 3 IN PROGRESS — CURRENT
+PHASE 3 COMPLETED
+        ↓
+PHASE 4 IN PROGRESS — CURRENT
 ```
 
 ## Phase 2 Completion Record
@@ -1797,52 +1933,23 @@ TargetObservation runtime integration
         ↓
 PHASE 2 COMPLETED
         ↓
-PHASE 3 IN PROGRESS — CURRENT
+PHASE 3 COMPLETED
+        ↓
+PHASE 4 IN PROGRESS — CURRENT
 ```
 
-## Phase 3 Current Checkpoint
+## Phase 3 Completion Record
 
-Phase 3 starts from the accepted wrist-perception runtime and does not
-require ACT. The current task is to validate the deterministic WRIST-controlled
-primitive from a safe teleoperated pose: direct pencil-tip reference,
-`p_key -> p_tip` XY alignment, then a small-budget staged descent that stops and
-reobserves after every Z step. Full screen-confirmed keypress completion remains
-Phase 5 integration.
+Phase 3 is accepted. It validated the deterministic WRIST-controlled primitive
+from a safe teleoperated pose without requiring ACT or screen-confirmed keypress
+success.
 
-Completed or hardware-validated at this checkpoint:
+### Accepted calibration and perception/control references
 
-- H3.1 remains a historical calibration checkpoint: it measured the target-key
-  center when the operator believed the pencil was aligned over `G`. It must
-  not be silently reinterpreted as a direct physical pencil-tip pixel
-  calibration. The new staged-control design therefore requires a direct
-  WRIST `p_tip` calibration/validation before hardware staged-servo execution.
-- Cartesian motion delegates FK, end-effector bounds/safety processing, IK,
-  and joint-target generation to LeRobot's SO-101 Cartesian processor path
-  instead of maintaining a project-local IK contract.
-- Project-facing visual-servo corrections use `base_link_xy` and
-  **commanded millimetres**. These are requested Cartesian command units,
-  not independently measured TCP displacement or positioning-accuracy
-  claims. LeRobot owns conversion through the robot kinematics path.
-- The project-side Cartesian regression investigated before physical H3.2 was
-  isolated and corrected. A same-target hardware hold repeatedly sent one
-  unchanged joint target at 30 Hz and passed with **0.000 deg observed span
-  on every joint**. The corrected fixed-anchor zero request also reproduced
-  the anchor with **0.000 deg maximum planned joint shift**.
-- A fixed-anchor `+X 5.00` commanded-mm plan check returned approximately
-  `(+4.95,-0.01,-0.09) mm` relative to the model anchor, with **0.05 mm XY
-  model error** and **0.09 mm Z model error**. This remains a model-consistency
-  and safety check, not a physical TCP-accuracy claim.
-- H3.2 now uses an **adaptive conditioned fixed-anchor protocol**. Conditioning
-  runs repeated `+X/-X/+Y/-Y` cycles as readiness-only data and never includes
-  those samples in the Jacobian fit. Readiness requires adjacent same-phase
-  cycles to satisfy the configured image-position drift, image-response drift,
-  and X/Y opposition gates.
-- On the accepted physical run, conditioning correctly rejected the first
-  adjacent-cycle comparison and converged on the next one. The protocol passed
-  after **3 conditioning cycles**. Only then did the script start a fresh
-  formal H3.2 dataset.
-- The formal dataset contains **8** paired `+X/-X/+Y/-Y` motion samples. The
-  accepted command-space image Jacobian is:
+- The direct physical WRIST pencil-tip reference is now calibrated in
+  `calibration/tool_reference.json` at approximately `(307.0, 238.246) px`,
+  using five direct samples with approximately 1.62 px maximum radial deviation.
+- H3.2 remains the canonical command-space image Jacobian checkpoint:
 
   ``` text
   J_cmd [px/commanded-mm] =
@@ -1850,102 +1957,151 @@ Completed or hardware-validated at this checkpoint:
    [ 0.29467163085937503,  2.87500000000000000]]
   ```
 
-- Formal H3.2 acceptance metrics were **residual RMS = 3.256 px**,
-  **condition number = 1.391**, **X opposition = -0.981**, and
-  **Y opposition = -0.931**. The candidate was accepted with no reported
-  acceptance errors.
-- The accepted candidate was explicitly promoted with
-  `scripts/promote_image_jacobian.py --confirm-reviewed`. The canonical
-  calibration is now `calibration/image_jacobian.json` with
-  `sample_count = 8` and `input_semantics = requested_cartesian_delta`.
-- Measured-joint FK remains **diagnostic-only** for H3.2. The calibrated
-  mapping is `requested Cartesian XY delta -> observed WRIST pixel delta`;
-  measured FK must not be reintroduced as an open-loop millimetre-accuracy
-  acceptance gate.
-- The pre-H3.2 software baseline had **141/141 unit tests passing**. The final
-  promotion checkpoint also passed Python compilation and `git diff --check`.
-- **H3.2 is complete and should now be treated as a saved calibration
-  checkpoint.** Do not repeat it unless the fixed camera/tool/keyboard geometry
-  changes or later closed-loop evidence contradicts the local calibration.
+- H3.2 acceptance metrics remain **residual RMS = 3.256 px**, **condition
+  number = 1.391**, **X opposition = -0.981**, and **Y opposition = -0.931**.
+- The canonical `calibration/image_jacobian.json` keeps
+  `input_semantics = requested_cartesian_delta`. Measured-joint FK remains
+  diagnostic-only for physical accuracy.
 
-The remaining Phase 3 sequence is:
+### Dead zone / preload finding and command-anchor correction
+
+Physical integration exposed a critical SO-101 behavior: the arm can be
+motion-stable with a non-zero `Goal_Position - Present_Position` residual. XYZ
+also exhibit dead zone/backlash/compliance, so small command increments can be
+absorbed without immediate visible motion.
+
+A zero-delta handoff experiment isolated the failure mode:
+
+- rebasing a nominal zero Cartesian command on `Present_Position` caused a
+  visible WRIST jump even though the planned Cartesian delta was zero;
+- waiting for the arm to settle did not remove that effect;
+- resending the **existing `Goal_Position` unchanged** produced zero Goal change,
+  zero measured joint change after settle, and zero WRIST target shift.
+
+The accepted command contract is therefore:
 
 ``` text
-canonical J_cmd available                    ✓
+manual / ACT motion stops
         ↓
-directly calibrate / validate WRIST p_tip     <-- NEXT
+wait for physical motion stability
         ↓
-run bounded p_key -> p_tip XY servo on hardware
+read existing Goal_Position once
         ↓
-require stable multi-frame alignment
+fixed command-space anchor
         ↓
-authorize one small pure-Z step
+cumulative XYZ commands relative to that anchor
         ↓
-stop + settle + fresh WRIST observation
+Present_Position / FK = diagnostics + safety only
         ↓
-realign XY if needed
-        ↓
-repeat only within a small cumulative Z budget
-        ↓
-measure alignment / re-alignment / target-loss / safety behavior
-        ↓
-Phase 3 acceptance
+WRIST outcome = XY success authority
 ```
+
+Do **not** relatch the command origin from `Present_Position` after a small step,
+and do not treat a tiny command with little measured motion as evidence that the
+controller direction is wrong.
+
+### Accepted XY visual-servo behavior
+
+The final Phase 3 XY controller uses bounded cumulative command-space correction
+with a 5 mm per-step limit, fresh WRIST observations, and whole-keyboard geometry
+tracking when the already-identified glyph becomes occluded by the pencil.
+
+Hardware validation demonstrated:
+
+``` text
+61.89 px initial error
+        ↓
+bounded cumulative XY control
+        ↓
+4.56 px final error
+```
+
+A separate staged-XYZ validation converged:
+
+``` text
+43.43 px initial error
+        ↓
+1.79 px stable alignment
+(2/2 fresh frames)
+```
+
+The old 20 px debug capture gate is retired. The demonstrated deterministic
+capture range is at least about 62 px in the tested fixed setup. This does not
+make 62 px a universal hard threshold; it establishes that ACT does not need to
+place the tool within 20 px before handoff.
+
+### Accepted occlusion handling
+
+Near alignment the pencil can obscure the target glyph. Immediate target-loss
+abort was therefore replaced with a guarded semantic-lock/geometry-tracking
+strategy:
+
+- glyph recognition establishes the target identity;
+- if the glyph later disappears, multi-key keyboard geometry estimates image
+  translation and propagates the already-established target center;
+- geometry tracking must pass strict match/inlier/residual gates;
+- a poor geometry frame is retried within the capture timeout rather than being
+  accepted or immediately treated as controller failure.
+
+Geometry tracking never chooses a new key identity.
+
+### Accepted cumulative XYZ staged primitive
+
+Phase 3 completed the same-anchor staged primitive using cumulative command-space
+Z levels `0 -> -3 -> -6 mm`. These are commanded-mm levels, not measured TCP
+displacement claims.
+
+The accepted hardware run was:
+
+``` text
+XY stable = 1.79 px
+        ↓
+cumulative Z = -3 mm
+        ↓
+XY drift = 7.26 px
+        ↓
+three same-Z cumulative XY corrections
+        ↓
+XY restored = 4.26 px
+        ↓
+cumulative Z = -6 mm
+        ↓
+XY = 2.88 px
+        ↓
+Z stage status = complete
+```
+
+This validates fixed-anchor cumulative XYZ, stop/settle/reobserve behavior, and
+same-level XY recovery. It is **not** a keypress-success claim. Screen-confirmed
+success and any further bounded descent belong to Phase 5 after Phase 4 screen
+verification is available.
 
 ### Phase 3 implementation notes / pitfalls
 
-These notes capture lessons from the current integration work so later
-iterations do not reopen already-resolved branches:
+These lessons are now part of the accepted runtime design:
 
-- Do **not** treat FK -> IK -> FK consistency inside one URDF model as proof of
-  real-world millimetre accuracy. It validates model consistency, not the
-  physical SO-101.
-- Do **not** make sub-millimetre open-loop Cartesian accuracy a prerequisite
-  for Phase 3. The low-cost arm has mechanical backlash/compliance and the
-  project already has visual feedback; fine alignment should be closed-loop
-  and measured in the image.
-- Prefer LeRobot's existing SO-101 kinematics, calibration, and Cartesian
-  processors over duplicating servo calibration or building another IK
-  wrapper. The follower calibration remains owned by LeRobot.
-- Do **not** treat the rejected V3 current-state incremental rebasing behavior
-  as an accepted runtime contract. H3.2 was accepted under conditioned
-  fixed-anchor command semantics. Runtime XY integration should preserve those
-  validated local semantics; if a larger residual error requires a new local
-  anchor/segment, the new segment must pass an explicit image-response/readiness
-  check before the canonical `J_cmd` is trusted again.
-- The calibrated Jacobian is explicitly a **command-space** mapping:
-  `requested Cartesian XY delta -> observed WRIST pixel delta`. FK-derived
-  displacement may be logged for diagnostics, but it is not a Phase 3
-  positioning-accuracy metric.
-- Keep safety limits distinct from accuracy requirements. A maximum Cartesian
-  step is a motion bound, not a claim that the arm can position to that
-  tolerance.
-- Keep the adaptive H3.2 conditioning protocol. The accepted run demonstrated
-  a real first-cycle transient; conditioning prevented that transient from
-  contaminating the formal Jacobian fit. Conditioning samples are readiness
-  data only and must remain excluded from `J_cmd` fitting.
-- Do not relatch the fixed Cartesian command anchor during conditioning. The
-  accepted protocol keeps one fixed command anchor, detects convergence from
-  adjacent complete cycles, and starts a fresh formal dataset only after
-  readiness passes.
-- Use the SO-101 URDF from LeRobot's configured cache (`HF_LEROBOT_HOME`);
-  do not introduce a second project-specific URDF location without a concrete
-  reason.
-- **Observed WRIST occlusion constraint:** when the pencil tip is less than
-  roughly **1 cm above the keyboard**, the pencil/tool can occlude the target
-  key/glyph. During staged descent, stop after every Z step, treat degraded
-  visibility as target loss, and never combine lateral correction with the
-  downward command itself.
-- Robust burst consensus remains a defensive guard against transient occlusion
-  or a wrong glyph candidate entering one measurement burst.
-- Do not reopen the old same-target drift / fixed-anchor planning investigation
-  unless a later physical measurement produces contradictory evidence. The
-  dedicated hold test and corrected fixed-anchor planning checks already closed
-  that branch.
-- The next hardware gates are **direct `p_tip` calibration/validation**, then
-  closed-loop `p_key -> p_tip` XY validation, followed by a deliberately small
-  cumulative-Z staged-descent test. H3.2 is not reopened unless later evidence
-  contradicts it.
+- Do **not** treat FK -> IK -> FK consistency as physical millimetre accuracy.
+- Do **not** use `Present_Position` as a new command anchor during deterministic
+  runtime control; preserve the existing Goal-space preload.
+- X, Y, and Z all require dead-zone-aware cumulative command semantics. A small
+  no-motion result is not a direction/failure test.
+- Do not repeatedly issue tiny reset-style corrections that restart inside the
+  dead zone. Use bounded cumulative commands from the fixed Goal anchor.
+- `Present_Position` and FK may be used for motion stability, diagnostics,
+  workspace/joint safety, and IK seeding, but not as the authority for XY
+  convergence or press success.
+- The calibrated `J_cmd` is a command-space mapping:
+  `requested Cartesian XY delta -> observed WRIST pixel delta`.
+- Preserve strict separation between a Z-level change and an XY correction: hold
+  cumulative XY fixed while advancing Z, then stop/settle and realign XY at the
+  same fixed Z level if necessary.
+- Target identity comes from glyph appearance. Geometry tracking is only a
+  temporary propagation mechanism after semantic identity is already known.
+- Do not chase sub-pixel error near convergence. The validated V0 control band is
+  a few pixels; Phase 3 used 4 px / 2 fresh frames for initial alignment and a
+  6 px Z-level handoff/recheck tolerance.
+- Keep H3.2 as a saved calibration checkpoint unless fixed camera/tool/keyboard
+  geometry changes or later closed-loop evidence contradicts it.
 
 ### Phase 3 hardware ownership and abort contract
 
@@ -1969,9 +2125,13 @@ in-process leader -> follower teleoperation
         ↓
 operator moves to perception-safe hover
         ↓
-press ENTER to freeze the manual pose
+press ENTER to end manual positioning
         ↓
-autonomous bounded XY visual-servo corrections
+wait until follower motion is stable
+        ↓
+latch existing Goal_Position as fixed command anchor
+        ↓
+autonomous bounded cumulative XY / staged-Z control
         ↓
 in-process operator recovery teleoperation resumes
         ↓
@@ -1988,7 +2148,7 @@ hover pose.
 
 Exit semantics remain deliberately separated:
 
-- **normal Phase 3 completion:** stop autonomous corrections and resume
+- **normal deterministic-stage completion:** stop autonomous corrections and resume
   operator-controlled leader/follower teleoperation; the operator returns to
   the normal zero/home pose and then presses Ctrl+C for normal LeRobot
   disconnect/torque-off;
@@ -2016,7 +2176,7 @@ When recalibration is actually required, preserve the accepted protocol:
 ``` text
 teleoperate to perception-safe hover
         ↓
-latch one fixed Cartesian command anchor
+latch the existing Goal_Position as one fixed command-space anchor
         ↓
 adaptive +X/-X/+Y/-Y conditioning
         ↓
@@ -2037,9 +2197,39 @@ the canonical file is changed only by explicit review/promotion:
 python scripts/promote_image_jacobian.py --confirm-reviewed
 ```
 
-ACT and full screen-confirmed keypress completion remain outside the current
-Phase 3 checkpoint. Phase 3 may exercise only a deliberately small, bounded
-staged descent to validate stop/reobserve/realign behavior before Phase 5.
+Phase 3 is now accepted and frozen as the deterministic local motion checkpoint.
+ACT remains outside this checkpoint, and screen-confirmed keypress completion
+remains a Phase 5 integration task.
+
+## Phase 4 Current Checkpoint
+
+Phase 4 is now the active phase. The fixed SIDE camera, screen homography, and
+text ROI were already calibrated and validated during Phase 1. The remaining
+work is to turn that geometric calibration into an authoritative screen outcome
+observer.
+
+Current Phase 4 sequence:
+
+``` text
+SIDE live frame
+        ↓
+load calibration/screen_homography.json
+        ↓
+rectify to canonical screen
+        ↓
+crop fixed typing ROI
+        ↓
+OCR / text recognition
+        ↓
+compare with confirmed pre-press prefix
+        ↓
+CONFIRMED_SUCCESS / CONFIRMED_NO_CHANGE / CONFIRMED_WRONG / UNCERTAIN
+        ↓
+Phase 4 acceptance
+```
+
+Phase 4 should begin with a live screen/ROI probe and an OCR baseline. No robot
+motion is required to validate the first screen-perception checkpoint.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
@@ -2134,50 +2324,53 @@ Acceptance should measure:
 
 ------------------------------------------------------------------------
 
-## Phase 3 — Tool Reference and Visual Servo
+## Phase 3 — Tool Reference and Visual Servo — **Completed**
 
 Goal:
 
 > Starting from a safe teleoperated local pose, align the detected target key
-> to a directly calibrated WRIST pencil-tip reference and validate the staged
-> stop/reobserve/realign primitive with a small Z budget.
+> to a directly calibrated WRIST pencil-tip reference and validate a fixed-anchor,
+> dead-zone-aware staged XYZ primitive.
 
-Tasks:
+Accepted scope:
 
-1.  directly calibrate/validate `p_tip` as the physical pencil-tip projection
-    in the WRIST image; do not silently reuse the old target-derived H3.1 `p*`,
-2.  retain the already accepted canonical H3.2 `J_cmd`,
-3.  integrate bounded `p_key -> p_tip` XY correction with the SO-101 hardware
-    executor,
-4.  validate fresh-frame, target-loss, FOV/safety, timeout, and correction-budget
-    handling,
-5.  require stable multi-frame alignment before any Z motion,
-6.  validate a small-budget staged loop: one pure-Z step -> stop/settle -> fresh
-    WRIST observation -> XY realignment if needed,
-7.  repeat `G` alignment from several initial image offsets and perform two
-    cross-keyboard transfer sanity checks without per-key references or
-    per-key Jacobians,
-8.  measure final alignment error, convergence time, iterations, target-loss
-    rate, re-alignment behavior, and safety-bound behavior.
+1.  direct physical WRIST `p_tip` calibration,
+2.  canonical H3.2 command-space `J_cmd`,
+3.  motion-stable handoff that preserves existing `Goal_Position` as the fixed
+    command-space anchor,
+4.  bounded cumulative `p_key -> p_tip` XY correction with fresh-frame control,
+5.  semantic target lock plus guarded geometry tracking through near-target glyph
+    occlusion,
+6.  stable multi-frame XY acceptance,
+7.  cumulative staged Z levels from the same Goal anchor,
+8.  stop/settle/fresh-WRIST observation after every Z-level change,
+9.  same-level XY re-alignment without relatching the command origin.
 
-Acceptance should include:
+Hardware acceptance evidence includes:
 
-- reliable `p_key -> p_tip` convergence from local offsets,
-- convergence rate, final pixel error, convergence time, and servo iterations,
-- stable alignment before each permitted descent step,
-- no simultaneous XY+Z command,
-- fresh observation after every Z step,
-- successful re-alignment when descent introduces image error,
-- target-loss / timeout / failure rate,
-- hard stop/recovery on target loss, stale frames, timeout, or cumulative-Z
-  budget exhaustion.
+- direct `p_tip ~= (307.0, 238.246) px`,
+- demonstrated XY capture from approximately 61.9 px residual to 4.56 px,
+- a separate stable 1.79 px / 2-frame XY acceptance,
+- cumulative Z `0 -> -3 -> -6 commanded-mm`,
+- successful low-Z XY re-alignment,
+- final staged-Z visual error of 2.88 px,
+- `Z stage status = complete`.
 
-No ACT is required for this phase. Full keypress success detection is not a
-Phase 3 acceptance requirement.
+Planning adjustment after hardware evidence:
+
+- `Present_Position`-based runtime rebasing is rejected; existing
+  `Goal_Position` is the deterministic command anchor.
+- XYZ are all treated as dead-zone/backlash affected; cumulative commands are
+  preserved across steps.
+- Cross-key end-to-end transfer is no longer a Phase 3 acceptance gate. It is
+  more meaningfully exercised in Phase 5 once screen verification can confirm
+  real physical outcomes on multiple keys.
+
+No ACT and no screen-confirmed keypress success are required for Phase 3.
 
 ------------------------------------------------------------------------
 
-## Phase 4 — Screen Rectification and Verification
+## Phase 4 — Screen Rectification and Verification — **IN PROGRESS — CURRENT**
 
 Goal:
 
@@ -2199,6 +2392,17 @@ OCR / text recognition
   ↓
 SUCCESS / NO_CHANGE / WRONG / UNCERTAIN
 ```
+
+Already available from Phase 1:
+
+- fixed SIDE camera geometry,
+- `calibration/screen_homography.json`,
+- canonical `1280x800` rectified screen,
+- fixed `960x694` typing ROI,
+- visually readable rectified screen content.
+
+Current Phase 4 work is the live ROI/OCR path and stable verification-state
+logic; no robot motion is required for the first checkpoint.
 
 Acceptance:
 
@@ -2230,7 +2434,7 @@ p_key -> p_tip XY alignment
    ↓
 alignment stable
    ↓
-one pure-Z step
+advance one bounded cumulative Z level
    ↓
 stop + settle + fresh WRIST observation
    ↓
@@ -2246,6 +2450,11 @@ screen verify
 This proves the local perception-action-verification loop before learned coarse
 motion is introduced. The hard maximum cumulative descent is a safety/failure
 bound, never a substitute for screen-confirmed success.
+
+Phase 5 should also repeat the deterministic local loop on at least two
+additional letter keys without per-key `p_tip` values or per-key Jacobians. This
+absorbs the cross-key transfer sanity check that was removed from Phase 3 after
+the control architecture changed during hardware validation.
 
 ------------------------------------------------------------------------
 
@@ -2471,7 +2680,7 @@ Required safeguards:
 joint limits
 workspace limits
 maximum Cartesian correction per servo iteration
-maximum downward motion per staged Z step
+maximum cumulative Z-level increment
 maximum cumulative downward motion per press attempt
 maximum press duration
 maximum servo iterations
@@ -2489,9 +2698,12 @@ Safety invariants:
 2.  target lost → no downward step,
 3.  stale image → no servo correction and no downward step,
 4.  alignment not stable at the current stopped level → no downward step,
-5.  XY correction and Z descent are never commanded simultaneously,
-6.  ACT and the deterministic staged controller never command simultaneously,
-7.  failed/uncertain verification never causes an unbounded descent or retry loop.
+5.  a downward level transition changes cumulative Z while holding cumulative XY
+    fixed; any lateral correction occurs only after stop/settle at that fixed Z,
+6.  deterministic commands remain cumulative from one fixed Goal-space anchor;
+    `Present_Position` is never silently promoted to a new runtime command origin,
+7.  ACT and the deterministic staged controller never command simultaneously,
+8.  failed/uncertain verification never causes an unbounded descent or retry loop.
 
 ------------------------------------------------------------------------
 
@@ -2629,13 +2841,15 @@ WRIST perception visually recognizes G
         ↓
 ACT queue is stopped/reset
         ↓
+wait for follower stability + preserve existing Goal_Position anchor
+        ↓
 Visual servo moves G toward p_tip
         ↓
 alignment stable at current Z level
         ↓
-one bounded pure-Z step
+advance one bounded cumulative Z level
         ↓
-stop + settle + reobserve WRIST / realign if needed
+stop + settle + reobserve WRIST / realign at fixed Z if needed
         ↓
 SIDE camera rectification + OCR
         ↓
@@ -2676,9 +2890,11 @@ appearance-based wrist recognition
       ↓
 perception-triggered handoff
       ↓
+settle + preserve existing Goal_Position command anchor
+      ↓
 p_key -> p_tip visual alignment
       ↓
-bounded staged Z / stop / reobserve / realign
+fixed-anchor cumulative Z / stop / reobserve / same-level realign
       ↓
 screen-confirmed success or bounded failure
       ↓
