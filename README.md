@@ -57,8 +57,8 @@ on the MacBook using only physical keyboard interaction.
 
 ## Current Project Status
 
-The project is no longer at the mechanical-feasibility stage. Phases 0–3 are
-accepted; Phase 4 is the current implementation phase.
+The project is no longer at the mechanical-feasibility stage. Phases 0–4 are
+accepted; Phase 5 is the current implementation phase.
 
 The current physical setup has already demonstrated:
 
@@ -79,9 +79,8 @@ The current physical setup has already demonstrated:
   SO-101 physically press a key?”* and from the basic local XYZ control primitive
   toward:
 
-- reliable screen OCR / verification and explicit uncertainty handling,
-
-- end-to-end screen-authorized press depth and retract behavior,
+- end-to-end integration of the accepted screen verifier with bounded press depth
+  and retract behavior,
 
 - robust ACT-to-deterministic-controller handoff using the validated Goal-space
   command-anchor contract,
@@ -90,11 +89,14 @@ The current physical setup has already demonstrated:
 
 - reproducible data collection and evaluation.
 
-Phase 3 is now hardware-accepted. The deterministic WRIST-controlled primitive
+Phase 3 is hardware-accepted. The deterministic WRIST-controlled primitive
 has demonstrated direct tool-tip calibration, dead-zone-aware fixed-anchor XY
 visual servoing, geometry-based target tracking through glyph occlusion, and
-cumulative staged Z with same-level XY recovery. The current project phase is
-**Phase 4 — Screen Rectification and Verification**.
+cumulative staged Z with same-level XY recovery. Phase 4 is also accepted: the
+fixed SIDE view now produces a conservative four-state screen outcome through
+line-level Tesseract OCR, semantic prefix/expected-character comparison, and
+multi-frame voting. The current project phase is **Phase 5 — Deterministic Local
+Single-Key Closed Loop**.
 
 ------------------------------------------------------------------------
 
@@ -1537,8 +1539,8 @@ changes a phase boundary, command contract, or acceptance criterion.
 | Phase 1  | Freeze Camera Geometry and Build Camera Sanity Tool | **Completed**             |
 | Phase 2  | Wrist Keycap Detection and Glyph Recognition        | **Completed**             |
 | Phase 3  | Tool Reference and Visual Servo                     | **Completed**             |
-| Phase 4  | Screen Rectification and Verification               | **IN PROGRESS — CURRENT** |
-| Phase 5  | Deterministic Local Single-Key Closed Loop          | Not Started               |
+| Phase 4  | Screen Rectification and Verification               | **Completed**             |
+| Phase 5  | Deterministic Local Single-Key Closed Loop          | **IN PROGRESS — CURRENT** |
 | Phase 6  | Target-Conditioned ACT Dataset                      | Not Started               |
 | Phase 7  | ACT Coarse Policy                                   | Not Started               |
 | Phase 8  | ACT + Visual Servo Handoff                          | Not Started               |
@@ -1554,7 +1556,7 @@ phase.
 ## Current Phase
 
 ``` text
-Phase 4 — Screen Rectification and Verification
+Phase 5 — Deterministic Local Single-Key Closed Loop
 ```
 
 Current checkpoint:
@@ -1588,13 +1590,21 @@ final staged-Z validation error 2.88 px           ✓
         ↓
 PHASE 3 ACCEPTED
         ↓
-PHASE 4 SCREEN RECTIFICATION + VERIFICATION       <-- CURRENT
-        ↓
 SIDE homography + text ROI                         ✓ existing from Phase 1
         ↓
-live rectified ROI / OCR verification              <-- NEXT
+line-level Tesseract OCR                            ✓
         ↓
-SUCCESS / NO_CHANGE / WRONG / UNCERTAIN
+semantic prefix + expected-character comparison    ✓
+        ↓
+9-frame conservative voting                         ✓
+        ↓
+NO_CHANGE / SUCCESS / WRONG live validation        ✓ 9/9 each
+        ↓
+UNCERTAIN fail-safe behavior                        ✓ unit-tested
+        ↓
+PHASE 4 ACCEPTED
+        ↓
+PHASE 5 DETERMINISTIC SINGLE-KEY CLOSED LOOP      <-- CURRENT
 ```
 
 ## Phase 1 Completion Record
@@ -1811,7 +1821,9 @@ PHASE 2 COMPLETED
         ↓
 PHASE 3 COMPLETED
         ↓
-PHASE 4 IN PROGRESS — CURRENT
+PHASE 4 COMPLETED
+        ↓
+PHASE 5 IN PROGRESS — CURRENT
 ```
 
 ## Phase 2 Completion Record
@@ -1935,7 +1947,9 @@ PHASE 2 COMPLETED
         ↓
 PHASE 3 COMPLETED
         ↓
-PHASE 4 IN PROGRESS — CURRENT
+PHASE 4 COMPLETED
+        ↓
+PHASE 5 IN PROGRESS — CURRENT
 ```
 
 ## Phase 3 Completion Record
@@ -2213,35 +2227,108 @@ unit tests. Legacy pre-Goal-anchor Phase 3 runners and the old fixed `-0.5 mm`
 step-count staged abstraction are not part of the accepted runtime design and
 should not be reused as the basis of Phase 5.
 
-## Phase 4 Current Checkpoint
+## Phase 4 Completion Record
 
-Phase 4 is now the active phase. The fixed SIDE camera, screen homography, and
-text ROI were already calibrated and validated during Phase 1. The remaining
-work is to turn that geometric calibration into an authoritative screen outcome
-observer.
+Phase 4 is accepted as the independent screen-observation checkpoint. The fixed
+SIDE camera, Phase 1 screen homography, and fixed text ROI were retained; no
+screen recalibration was required.
 
-Current Phase 4 sequence:
+The accepted V0 OCR / verification path is:
 
 ``` text
-SIDE live frame
+SIDE 640x480 fresh frame
         ↓
-load calibration/screen_homography.json
+calibration/screen_homography.json
         ↓
-rectify to canonical screen
+1280x800 rectified screen
         ↓
-crop fixed typing ROI
+fixed 960x694 typing ROI
         ↓
-OCR / text recognition
+detect dark text-line bands
         ↓
-compare with confirmed pre-press prefix
+per-line crop + 3x upscale + CLAHE
         ↓
-CONFIRMED_SUCCESS / CONFIRMED_NO_CHANGE / CONFIRMED_WRONG / UNCERTAIN
+Tesseract 5.3.4, OEM 1, PSM 7, English model
+A-Z / 0-9 character whitelist
         ↓
-Phase 4 acceptance
+compare OCR lines with confirmed prefix + expected character
+        ↓
+9 fresh-frame semantic voting, 60% confirmation threshold
+        ↓
+CONFIRMED_SUCCESS / CONFIRMED_NO_CHANGE /
+CONFIRMED_WRONG / UNCERTAIN
 ```
 
-Phase 4 should begin with a live screen/ROI probe and an OCR baseline. No robot
-motion is required to validate the first screen-perception checkpoint.
+Tesseract is used as the system OCR engine with its pretrained English model;
+Phase 4 does **not** train a project-specific OCR network. The project deliberately
+keeps OCR observation separate from semantic verification: ambiguous characters
+such as `O/0` or `I/1` are not silently rewritten to the expected answer.
+
+A whole-ROI / whole-text baseline was tested first. It produced readable text but
+only `2/9` exact-string consensus on a fixed screen, so exact full-text equality
+was rejected as the authority criterion. The accepted implementation instead
+uses physical text-line localization, single-line OCR, tolerant confirmed-prefix
+matching, the observed continuation character, and multi-frame voting. This also
+makes harmless editor decorations such as the visible leading line number `1`
+non-authoritative.
+
+Controlled live acceptance used confirmed prefix `KEYPRESS`, expected character
+`G`, and wrong-character probe `H`:
+
+``` text
+screen = KEYPRESS
+    -> CONFIRMED_NO_CHANGE   9/9 votes
+
+screen = KEYPRESSG
+    -> CONFIRMED_SUCCESS     9/9 votes
+
+screen = KEYPRESSH
+    -> CONFIRMED_WRONG       9/9 votes
+       observed wrong char = H
+```
+
+`UNCERTAIN` is the fail-safe result whenever no authoritative outcome reaches the
+required vote threshold; disagreement and unstable wrong-character evidence are
+covered by unit tests. The verifier therefore favors withholding authorization
+over inventing a success or wrong-key claim.
+
+Accepted Phase 4 implementation artifacts are intended to be:
+
+- `src/so101_typing/perception/screen_ocr.py` — line detection, Tesseract OCR,
+  normalization, and OCR observation contracts;
+- `src/so101_typing/supervisor/verification.py` — four-state semantic verifier;
+- `tests/test_screen_ocr.py`, `tests/test_screen_line_ocr.py`, and
+  `tests/test_screen_verification.py` — offline OCR/verifier tests;
+- `scripts/validate_phase4_screen_verification.py` — live SIDE-camera acceptance
+  validator without robot motion.
+
+The exploratory whole-ROI OCR probe and exact-string consensus validator are not
+part of the accepted runtime architecture and may be removed after this checkpoint.
+
+## Phase 5 Current Checkpoint
+
+Phase 5 is now the active phase. Its job is to integrate the two independently
+accepted deterministic subsystems without changing their authority boundaries:
+
+``` text
+Phase 3 WRIST controller
+fixed existing Goal_Position anchor
++ cumulative XY/Z
++ same-Z XY recovery
+        ↓
+stop + settle + fresh observations
+        ↓
+Phase 4 SIDE verifier
+CONFIRMED_NO_CHANGE / CONFIRMED_SUCCESS /
+CONFIRMED_WRONG / UNCERTAIN
+        ↓
+press-depth authorization / retract / recovery
+```
+
+The first Phase 5 target is one deterministic local keypress from a safe local
+pose. ACT remains outside this checkpoint. Screen verification is authoritative
+for physical keypress success; commanded depth remains only a bounded motion
+budget and safety quantity.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
@@ -2382,14 +2469,14 @@ No ACT and no screen-confirmed keypress success are required for Phase 3.
 
 ------------------------------------------------------------------------
 
-## Phase 4 — Screen Rectification and Verification — **IN PROGRESS — CURRENT**
+## Phase 4 — Screen Rectification and Verification — **Completed**
 
 Goal:
 
 > Reliably determine whether a stopped physical press level produced the
 > expected screen change.
 
-Pipeline:
+Accepted pipeline:
 
 ``` text
 SIDE
@@ -2400,34 +2487,48 @@ canonical screen
   ↓
 fixed typing ROI
   ↓
-OCR / text recognition
+dark text-line detection
   ↓
-SUCCESS / NO_CHANGE / WRONG / UNCERTAIN
+3x line crop + CLAHE
+  ↓
+Tesseract 5.3.4 / OEM 1 / PSM 7 / eng / A-Z0-9 whitelist
+  ↓
+confirmed-prefix + expected-character semantic comparison
+  ↓
+9-frame vote (60% confirmation threshold)
+  ↓
+CONFIRMED_SUCCESS / CONFIRMED_NO_CHANGE /
+CONFIRMED_WRONG / UNCERTAIN
 ```
 
-Already available from Phase 1:
+Phase 1 assets were reused unchanged:
 
 - fixed SIDE camera geometry,
 - `calibration/screen_homography.json`,
 - canonical `1280x800` rectified screen,
-- fixed `960x694` typing ROI,
-- visually readable rectified screen content.
+- fixed `960x694` typing ROI.
 
-Current Phase 4 work is the live ROI/OCR path and stable verification-state
-logic; no robot motion is required for the first checkpoint.
+Phase 4 deliberately rejected whole-ROI exact-string OCR consensus after live
+experiments showed only `2/9` exact matches despite readable content. The accepted
+scheme localizes real text lines first and uses Tesseract only as an observation
+engine; the verifier then compares against the already-confirmed prefix and the
+expected next character. It never repairs OCR output into the expected answer.
 
-Acceptance:
+Live acceptance evidence:
 
-- controlled test strings,
-- stable perspective rectification,
-- high character recognition accuracy,
-- low false-SUCCESS / false-WRONG rate,
-- reliable distinction between confirmed no-change and uncertain OCR,
-- explicit uncertainty behavior.
+- `KEYPRESS` -> `CONFIRMED_NO_CHANGE`, **9/9** votes;
+- `KEYPRESSG` -> `CONFIRMED_SUCCESS`, **9/9** votes;
+- `KEYPRESSH` -> `CONFIRMED_WRONG`, **9/9** votes with wrong character `H`;
+- `UNCERTAIN` behavior for disagreement / insufficient evidence is covered by
+  unit tests.
+
+This completes the independent screen-verification authority required by the
+Phase 5 physical press loop.
 
 ------------------------------------------------------------------------
 
-## Phase 5 — Deterministic Local Single-Key Closed Loop
+## Phase 5 — Deterministic Local Single-Key Closed Loop — **IN PROGRESS — CURRENT**
+
 
 Goal:
 
@@ -2867,13 +2968,16 @@ so101_typing/
 │   ├── calibrate_image_jacobian.py
 │   ├── collect_wrist_dataset.py
 │   ├── benchmark_glyph_models.py
-│   ├── test_visual_servo.py
-│   ├── test_screen_verification.py
+│   ├── validate_phase3_xyz.py
+│   ├── validate_phase4_screen_verification.py
 │   ├── collect_act_data.py
 │   ├── train_act.py
 │   └── run_typing_demo.py
 │
 ├── tests/
+│   ├── test_screen_ocr.py
+│   ├── test_screen_line_ocr.py
+│   ├── test_screen_verification.py
 │   ├── test_state_machine.py
 │   ├── test_recovery.py
 │   ├── test_target_encoding.py
