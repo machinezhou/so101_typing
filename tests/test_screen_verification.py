@@ -183,5 +183,23 @@ class TestScreenVerification(unittest.TestCase):
         )
 
 
+    def test_lowercase_distant_continuation_is_success(self):
+        evidence = classify_frame_text(
+            "1 KEYPRESS                 g",
+            confirmed_prefix="KEYPRESS",
+            expected_char="G",
+        )
+
+        self.assertEqual(
+            evidence.kind,
+            FrameEvidenceKind.SUCCESS,
+        )
+
+        self.assertEqual(
+            evidence.continuation,
+            "G",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

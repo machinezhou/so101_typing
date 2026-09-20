@@ -188,9 +188,12 @@ def build_official_cartesian_pipeline(
 ]:
     """Build the Cartesian-delta -> joint-target pipeline.
 
-    ``use_latched_reference=False`` is appropriate for incremental closed-loop
-    corrections. Calibration must explicitly pass ``True`` so every +/- sample
-    is defined around one fixed anchor instead of rebasing on the previous sample.
+    ``use_latched_reference=True`` is required by the accepted deterministic
+    typing runtime and fixed-anchor calibration: every cumulative Cartesian
+    command remains defined around one preserved command-space anchor.
+
+    ``False`` is only for explicitly present-relative/incremental workflows and
+    must not be used for the Phase-5 fixed-Goal-anchor press controller.
     """
 
     urdf_path = Path(urdf_path)

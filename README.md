@@ -30,15 +30,18 @@ that can:
 5.  hand control from ACT to the deterministic wrist-vision controller,
 6.  align the detected target-key center with the calibrated WRIST pencil-tip
     pixel reference,
-7.  once alignment is stable, advance through bounded cumulative Z command
-    levels relative to the same fixed command-space anchor, stopping after every
-    level to reacquire vision and realign XY at the stopped Z level if needed,
-8.  observe the MacBook screen through an independent camera after each
-    stopped descent level,
-9.  stop further descent as soon as the intended character is independently
-    confirmed, then retract,
-10. recover automatically from wrong key presses or bounded press failures,
-11. repeat until the requested string is correct.
+7.  once alignment is stable, advance through small cumulative Z command
+    increments relative to the same fixed command-space anchor, stopping after
+    each commanded motion to reacquire WRIST and realign XY at the same Z when
+    needed,
+8.  keep an independent SIDE screen-change watcher active during the press so a
+    persistent new continuation glyph can preempt any further descent/XY chase,
+9.  on a latched SIDE event, release the key first with a short staged upward Z
+    move, then classify the released character independently,
+10. use screen evidence to choose SUCCESS / WRONG / UNCERTAIN and execute a
+    bounded staged retract without treating commanded Z depth as success,
+11. recover from wrong/uncertain/bounded failures and repeat until the requested
+    string is correct.
     A typical final task is:
 
 ``` text
@@ -57,48 +60,51 @@ on the MacBook using only physical keyboard interaction.
 
 ## Current Project Status
 
-The project is no longer at the mechanical-feasibility stage. Phases 0–4 are
-accepted; Phase 5 is the current implementation phase.
+Phases 0–4 are accepted. Phase 5 remains the current implementation phase, but
+its **core deterministic single-key G loop has now completed one full hardware
+SUCCESS run**. Phase 5 is intentionally not marked complete yet because the
+release path still has one stale-state bug to remove and the roadmap requires
+cross-key transfer on at least two additional letters.
 
-The current physical setup has already demonstrated:
+The current physical/software setup has demonstrated:
 
-- a calibrated SO-101 follower/leader setup,
-
-- stable teleoperation,
-
+- calibrated SO-101 follower/leader operation and stable teleoperation,
 - a previous ACT block-manipulation demo,
+- a pencil tool mechanically attached to the gripper,
+- three simultaneous camera streams in the fixed MacBook workspace,
+- appearance-based WRIST target acquisition,
+- fixed-`Goal_Position` cumulative Cartesian command semantics,
+- WRIST visual servoing with guarded semantic/geometry tracking through glyph
+  occlusion,
+- independent SIDE screen rectification and conservative semantic verification,
+- a high-priority SIDE change watcher that detects a new screen glyph before
+  line OCR is allowed to authorize another press step,
+- staged key release before character classification,
+- segmented retract back to command-space `Z=0`,
+- one complete hardware result with controller state `SUCCEEDED` and outcome
+  `SUCCESS` for target `G`.
 
-- a pencil mechanically attached to the gripper with cable ties,
+The latest software checkpoint passes **214 unit tests**. The validated G run
+latched a SIDE event after two consecutive changed frames, released from
+`Z=-64` to `-62` to `-60 commanded-mm`, classified the released character as
+`G` in 4/5 frames, and retracted in six 10 mm-or-smaller Z segments to
+command-space `Z=0`.
 
-- successful physical MacBook key presses using that tool,
+The remaining Phase 5 work is now narrow and explicit:
 
-- three simultaneous camera streams,
+- fix stale command-state propagation when a SIDE event interrupts an inner
+  WRIST alignment call so release preserves the latest commanded XY exactly;
+- validate the same deterministic loop on at least two additional letter keys
+  without per-key `p_tip` or Jacobian tuning;
+- keep the operator-recovery path after autonomous completion; command-space
+  `Z=0` is the fixed local anchor level, not the robot's physical home pose;
+- then freeze the Phase 5 interfaces before collecting the Phase 6 ACT dataset.
 
-- a fixed MacBook and robot workspace.
-  Therefore, the remaining engineering risk has shifted away from *“can the
-  SO-101 physically press a key?”* and from the basic local XYZ control primitive
-  toward:
-
-- end-to-end integration of the accepted screen verifier with bounded press depth
-  and retract behavior,
-
-- robust ACT-to-deterministic-controller handoff using the validated Goal-space
-  command-anchor contract,
-
-- runtime ownership and automatic recovery,
-
-- reproducible data collection and evaluation.
-
-Phase 3 is hardware-accepted. The deterministic WRIST-controlled primitive
-has demonstrated direct tool-tip calibration, dead-zone-aware fixed-anchor XY
-visual servoing, geometry-based target tracking through glyph occlusion, and
-cumulative staged Z with same-level XY recovery. Phase 4 is also accepted: the
-fixed SIDE view now produces a conservative four-state screen outcome through
-line-level Tesseract OCR, semantic prefix/expected-character comparison, and
-multi-frame voting. The current project phase is **Phase 5 — Deterministic Local
-Single-Key Closed Loop**.
-
-------------------------------------------------------------------------
+Phase 3 remains the hardware-accepted deterministic motion foundation. Phase 4
+remains the accepted conservative line-OCR semantic verifier. Phase 5 extends
+those checkpoints rather than replacing them: WRIST remains the XY authority,
+SIDE remains the physical outcome authority, and commanded depth remains a
+motion/safety variable rather than a success detector.
 
 ## Research Questions
 
@@ -187,9 +193,10 @@ ACT should learn **how to approach a requested key**, not infer success
 from the MacBook display.
 
 During deterministic staged pressing, the supervisor uses the independent
-screen observation to decide whether the requested key has actually produced
-the intended character. Commanded Z depth alone is never treated as proof of
-success.
+screen observation in two layers: a fast persistent-change event can immediately
+stop any further press progression and trigger key release, while OCR determines
+which character actually appeared. Commanded Z depth alone is never treated as
+proof of success.
 
 ## 4. Preserve command-space preload across deterministic control
 
@@ -365,15 +372,19 @@ WRIST RGB
 
 ## SIDE / SCREEN — independent outcome verification
 
-The SIDE camera is positioned as close to the MacBook screen as the
-robot workspace safely permits. A view around 45° is acceptable.
+The SIDE camera is positioned as close to the MacBook screen as the robot
+workspace safely permits. A view around 45° is acceptable.
 
-It answers:
+It answers two different questions with two different paths:
 
-> **Did the physical action actually produce the intended result?**
+> **Did any new keypress result appear on the screen?**
 
-Because the MacBook and camera are fixed, perspective distortion can be
-removed with a one-time screen homography:
+and, after the tool has been released:
+
+> **Which character did that physical action produce?**
+
+Because the MacBook and camera are fixed, perspective distortion is removed with
+one screen homography. Phase 5 now uses the rectified view in two layers:
 
 ``` text
 SIDE raw frame
@@ -382,23 +393,29 @@ fixed screen quadrilateral
       ↓
 perspective rectification
       ↓
-canonical screen image
-      ↓
-fixed text ROI
-      ↓
-OCR / text recognition
-      ↓
-observed string
+canonical screen + fixed typing ROI
+      ├──► FAST EVENT PATH
+      │      pre-press baseline learns normal cursor ON/OFF variation
+      │      continuation-region foreground change
+      │      persistent for 2 consecutive frames
+      │      → latch press event
+      │      → forbid further descent / XY chase
+      │      → release key first
+      │
+      └──► SEMANTIC VERIFICATION PATH
+             Phase 4 line OCR for stable NO_CHANGE / WRONG / SUCCESS evidence
+             + Phase 5 released-character single-glyph OCR after event release
 ```
 
-The SIDE/SCREEN stream should remain outside the initial ACT
-observation.
+The fast event path deliberately does **not** run Tesseract on every frame. Its
+job is only to detect a persistent new foreground component quickly. OCR remains
+the semantic classifier, not the event detector.
 
-------------------------------------------------------------------------
+The SIDE/SCREEN stream remains outside the initial ACT observation.
 
 # System Architecture
 
-The primary architecture is:
+The primary architecture is now:
 
 ``` text
                          TARGET TEXT
@@ -408,167 +425,135 @@ The primary architecture is:
                      ┌─────────────────┐
                      │ Task Supervisor │
                      └────────┬────────┘
+                              │ target key
+                              ▼
+                         ACT APPROACH
+                    TOP + WRIST + state
                               │
-                       target key = R
+                       servo-ready pose
+                              ▼
+                    CONTROLLER HANDOFF
+                 stop/clear ACT action chunk
+                 wait until motion-stable
+                 latch existing Goal_Position
                               │
-              ┌───────────────┴───────────────┐
-              │                               │
-              ▼                               │
-      target-key encoding                     │
-              │                               │
-       TOP RGB + WRIST RGB                    │
-       + robot joint state                    │
-              │                               │
-              ▼                               │
-          ┌───────┐                           │
-          │  ACT  │                           │
-          └───┬───┘                           │
-              │ coarse joint actions          │
-              ▼                               │
-       perception-aware                       │
-        approach region                       │
-              │                               │
-              ▼                               │
-     WRIST KEY PERCEPTION                     │
-   keycaps → glyphs → target                  │
-              │                               │
-        target acquired?                      │
-              │ yes                           │
-              ▼                               │
-        CONTROLLER HANDOFF                    │
-      stop/reset ACT execution                │
-      wait until motion-stable                │
-      latch existing Goal_Position            │
-              │                               │
-              ▼                               │
-       VISUAL SERVO (XY)                      │
-   target center → pencil-tip pixel           │
-              │                               │
-        alignment stable?                     │
-              │ yes                           │
-              ▼                               │
-     ADVANCE CUMULATIVE Z LEVEL               │
-       (hold current XY command)              │
-              │                               │
-        stop + settle                         │
-              │                               │
-       fresh WRIST observation                │
-        ├─ misaligned → XY realign at fixed Z │
-        └─ aligned ───────────────┐             │
-                                 ▼             │
-                          SCREEN CAMERA        │
-                                 │             │
-                       rectify + OCR           │
-                                 │             │
-        success / no-change / wrong / uncertain
-                              │               │
-                              └───────────────►│
-                                      Task Supervisor
+                              ▼
+                    WRIST LOCAL CONTROLLER
+                semantic lock + visual-servo XY
+                              │
+                    small cumulative Z step
+                              │
+                  stop / settle / fresh WRIST
+                              │
+                same-Z XY realignment if needed
+                              │
+                              ├───────────────────────────────┐
+                              │                               │
+                              │                        SIDE WATCHER
+                              │                  persistent new foreground?
+                              │                               │ yes
+                              │                               ▼
+                              │                    PRESS EVENT LATCHED
+                              │                     no more Z-down / XY
+                              │                               │
+                              │                        staged release
+                              │                         +2 mm +2 mm
+                              │                               │
+                              │                    released-char OCR
+                              │                               │
+                              │                 SUCCESS / WRONG / UNCERTAIN
+                              │                               │
+                              └──────── no event ─────────────┤
+                                                              ▼
+                                                    staged retract / recovery
 ```
 
-The important architectural property is **controller ownership and command-space continuity**:
+A conservative Phase 4 line-OCR verification pass is still useful at stopped,
+aligned levels when no fast event has fired. It can confirm `NO_CHANGE` before
+authorizing another descent step. Once the fast SIDE event is latched, the press
+attempt becomes one-way: no later observation may authorize more downward
+motion.
+
+The important architectural property is **controller ownership and command-space
+continuity**:
 
 - ACT owns coarse motion only until a perception-ready handoff.
-- The handoff waits for the follower to become motion-stable and then preserves
-  the existing servo `Goal_Position` as the deterministic command-space anchor.
-- After handoff, the deterministic staged controller owns cumulative XY alignment
-  and bounded cumulative Z-level changes; ACT does not resume during the press
-  attempt.
-- A downward level transition changes cumulative Z while holding cumulative XY
-  fixed. Lateral re-alignment is performed only after stop/settle at that fixed Z
-  level.
-- Screen perception never commands the robot directly, but its confirmed result
-  determines whether further descent is allowed.
+- The handoff waits for physical motion stability and preserves the existing
+  servo `Goal_Position` as one immutable deterministic command-space anchor.
+- The deterministic controller owns cumulative XY alignment and cumulative Z
+  press/release/retract commands after handoff.
+- WRIST is the authority for local target alignment; semantic identity is
+  established visually and geometry may only propagate an already-established
+  identity through temporary occlusion.
+- SIDE is the autonomous press-outcome authority. Its fast event latch has
+  priority over normal press-loop progression and permanently disables further
+  descent for that attempt.
+- Robot commands remain on the foreground control thread. The current event
+  watcher preempts at control-loop checkpoints; it does not yet cancel a
+  `send_action()` call that is already in flight.
 - The supervisor is the only module that changes high-level task state.
-
-------------------------------------------------------------------------
 
 # Runtime State Machine
 
-The runtime should be implemented as an explicit state machine rather
-than a loose sequence of function calls.
+The runtime is an explicit state machine rather than a loose sequence of
+function calls.
 
 ``` text
 IDLE
-  │
-  ▼
+  ↓
 SET_TARGET
-  │
-  ▼
+  ↓
 ACT_APPROACH
-  │
-  ├── target not visible / not ready ───────► continue ACT
-  │
-  ▼
+  ├── target not visible / not ready ─────► continue ACT
+  ↓
 TARGET_ACQUIRED
-  │
-  ▼
+  ↓
 HANDOFF
-  │
-  ├── stop ACT
-  │
-  ├── clear pending action chunk
-  │
+  ├── stop ACT / clear pending action chunk
   ├── wait until follower motion is stable
-  │
-  ├── preserve existing Goal_Position as command anchor
-  │
-  ├── refresh Present_Position for diagnostics/safety
-  │
-  └── acquire fresh wrist frame
-  │
-  ▼
+  ├── preserve existing Goal_Position as fixed command anchor
+  └── acquire fresh WRIST frame
+  ↓
 SERVO_ALIGN
-  │
-  ├── target lost / stale ──────────────────► RECOVERY
-  │
-  ├── timeout / correction budget ──────────► RECOVERY
-  │
-  ▼
+  ├── target lost / stale / safety failure ─► RECOVERY
+  └── SIDE_EVENT at any checkpoint ─────────► PRESS_EVENT_LATCHED
+  ↓
 ALIGNED_AT_LEVEL
-  │
-  │  initial level, or previous VERIFY_LEVEL authorized another step
-  ▼
+  ↓
 DESCEND_STEP
-  │
-  ▼
+  └── SIDE_EVENT ───────────────────────────► PRESS_EVENT_LATCHED
+  ↓
 SETTLE_AND_REOBSERVE
-  │
-  ├── alignment drifted ────────────────────► REALIGN_AFTER_STEP
-  │                                           │
-  │                                           ├── target lost / stale ─► RECOVERY
-  │                                           └── aligned ─────────────► VERIFY_LEVEL
-  │
-  └── alignment still valid ────────────────► VERIFY_LEVEL
-                                              │
-                                              ├── CONFIRMED_SUCCESS ───► RETRACT ─► NEXT_TARGET
-                                              ├── CONFIRMED_NO_CHANGE ─► DESCEND_STEP
-                                              ├── CONFIRMED_WRONG ─────► RETRACT ─► RECOVERY
-                                              ├── UNCERTAIN ───────────► HOLD / REOBSERVE
-                                              └── safety bound ────────► RETRACT ─► RECOVERY
+  ├── drifted ─► REALIGN_AFTER_STEP
+  │                └── SIDE_EVENT ──────────► PRESS_EVENT_LATCHED
+  └── aligned ─► VERIFY_LEVEL
+                  ├── CONFIRMED_NO_CHANGE ─► DESCEND_STEP
+                  ├── UNCERTAIN ───────────► HOLD / REOBSERVE
+                  ├── CONFIRMED_WRONG ─────► RETRACT ─► RECOVERY
+                  └── CONFIRMED_SUCCESS ───► RETRACT ─► NEXT_TARGET
 
-DONE
+PRESS_EVENT_LATCHED
+  ├── permanently forbid more Z-down / XY chase for this attempt
+  ↓
+RELEASE_KEY
+  ├── +2 mm Z
+  └── +2 mm Z   (current validated release = 4 mm total)
+  ↓
+VERIFY_RELEASED_CHARACTER
+  ├── expected char ─► RETRACT ─► SUCCESS / NEXT_TARGET
+  ├── wrong char ────► RETRACT ─► RECOVERY
+  └── uncertain ─────► bounded reobserve only; NEVER descend
 ```
 
-`TARGET_ACQUIRED` and `ALIGNED_AT_LEVEL` are intentionally different states:
-
-- `TARGET_ACQUIRED`: the system knows where the requested key is in the wrist
-  image and has enough image margin for deterministic correction.
-- `ALIGNED_AT_LEVEL`: the target-key center and calibrated pencil-tip pixel are
-  stably aligned at the current stopped Z level. This authorizes **one** bounded
-  cumulative Z-level advance from the fixed Goal-space anchor, not continuous
-  downward motion.
-
-Every Z-level change invalidates the previous alignment acceptance. The
+`TARGET_ACQUIRED` and `ALIGNED_AT_LEVEL` remain intentionally different states.
+Every Z-level change invalidates the previous WRIST alignment acceptance. The
 controller must stop, settle, acquire fresh observations, and realign at the same
-stopped Z level if necessary. If
-realignment is needed after a Z step, the controller must still verify the
-screen at that same stopped level before any further descent; successful
-realignment must not accidentally authorize an extra Z step. A press succeeds
-only on independent screen confirmation; a configured maximum descent remains
-a hard failure/safety bound.
+stopped Z level if necessary.
 
-------------------------------------------------------------------------
+The fast SIDE event adds a stronger invariant: **once a persistent screen change
+is latched, the attempt may release, observe, retract, or recover, but it may
+never descend again.** Commanded Z remains a command-space variable, not proof
+of contact or success.
 
 # Module Responsibilities and Interfaces
 
@@ -989,149 +974,159 @@ not to achieve the final pixel alignment itself.
 
 # Deterministic Press Controller
 
-The press stage should not be learned in V0. It is a bounded staged descent from
-the same fixed Goal-space anchor, not one precomputed downward stroke and not a
-sequence that relatches from measured state:
+The press stage is deterministic in V0. It uses one fixed Goal-space anchor,
+small cumulative Z steps, stopped WRIST re-observation, SIDE event detection,
+and independent result verification.
+
+Current supervised Phase 5 behavior is:
 
 ``` text
-stable XY alignment at current level
+stable WRIST alignment
         ↓
-advance cumulative Z level
-(hold cumulative XY fixed)
+small cumulative Z step (2 commanded-mm)
         ↓
-stop + settle
+wait until motion-stable
         ↓
 fresh WRIST observation
         ↓
-realign XY at this same Z level if needed
+realign XY at the same Z if needed
         ↓
-independent SIDE/screen verification
+if no fast SIDE event:
+    conservative line OCR may confirm NO_CHANGE
+    → authorize one more 2 mm Z step
+
+at any control-loop checkpoint:
+    persistent SIDE continuation change (2 frames)
         ↓
-CONFIRMED_SUCCESS ? retract : next authorized Z level
+    PRESS_EVENT_LATCHED
+        ↓
+    forbid all further Z-down and XY chase
+        ↓
+    release +2 mm +2 mm
+        ↓
+    classify released character
+        ↓
+    staged retract to command-space Z=0
 ```
 
-The current validated Phase 3 primitive used cumulative commanded Z levels of
-`-3 mm` and `-6 mm` from the original Goal-space anchor. These are command-space
-validation levels, not measured TCP displacement and not the final press-depth
-policy. Phase 5 will let screen verification authorize any further bounded level.
+The current supervised hardware validator deliberately uses
+`max_descent_mm=None`. There is no arbitrary cumulative command-space Z cap in
+the accepted supervised experiment because earlier hard depth levels incorrectly
+assumed ACT/manual placement had already brought the tool close to contact. The
+operator therefore remains the absolute-depth safety authority during this
+checkpoint and uses Ctrl+C if the physical pose becomes unsafe. A future fully
+autonomous runtime must add an absolute workspace/contact safety mechanism that
+does not reintroduce the old assumption.
 
-The controller must define:
+Other active safety/control limits remain explicit:
 
-- bounded cumulative Z command levels,
-- maximum cumulative downward command budget,
-- maximum XY correction and total Cartesian command budget,
-- speed/acceleration limits,
-- settle/fresh-frame requirements,
-- workspace/joint safety bounds,
-- timeout behavior,
-- abort/retract behavior.
+- press XY correction is bounded per step and by cumulative spatial budget,
+- normal press planning keeps the strict 1.0 mm XY FK model-consistency gate,
+- event release uses a local 2.0 mm XY FK gate,
+- full retract uses a local 3.0 mm XY FK gate,
+- release is currently 4 mm total in two 2 mm upward steps,
+- deep retract is segmented into at most 10 commanded-mm Z changes so the
+  LeRobot EE-jump guard is not violated,
+- joint/workspace/clipping checks remain active,
+- `Present_Position` and FK remain diagnostics/safety/IK-seed signals rather
+  than press-success authority.
+
+The current event/retract-specific gates do not relax normal press alignment.
+They exist because upward escape motion has a different objective from precise
+key targeting.
 
 A completed motion command does **not** mean the arm is physically settled. The
-SO-101 may show a short post-motion wobble, non-zero servo residual, and XYZ
-dead zone/backlash. Observations captured during the settling window must not
-authorize a correction or another Z level.
-
-The important dead-zone rule is:
-
-> **Do not interpret a small commanded XYZ change with little measured motion as
-> controller failure, and do not relatch the command origin from
-> `Present_Position`.**
-
-Instead, keep one existing-`Goal_Position` anchor and advance bounded cumulative
-commands. `Present_Position` and measured FK remain diagnostic/safety signals;
-they are not press-success detectors.
-
-Phase 3 hardware validation demonstrated the full local primitive:
-
-``` text
-XY stable at 1.79 px
-        ↓
-cumulative Z = -3 mm
-        ↓
-XY drift detected and re-aligned at the same Z level
-        ↓
-XY = 4.26 px
-        ↓
-cumulative Z = -6 mm
-        ↓
-XY = 2.88 px
-        ↓
-staged XYZ primitive complete
-```
-
-The pencil/tool must never advance to a deeper Z level if the current visual
-alignment is invalid. Commanded descent depth is a safety/budget quantity, not a
-success detector. Further descent stops immediately when screen verification
-returns `CONFIRMED_SUCCESS`; if success is never confirmed before the hard
-maximum descent/safety bound, the attempt fails and retracts.
+SO-101 can retain sizeable Goal-vs-Present residuals because of preload,
+backlash, compliance, and servo limits. The deterministic command state remains
+cumulative from the original Goal anchor throughout the attempt.
 
 # Screen Perception and Verification
 
-The screen camera is an independent observer.
+The SIDE camera is an independent observer and now has two complementary
+responsibilities.
 
-Because the SIDE camera may view the screen at approximately 45°, V0
-should explicitly rectify the screen before OCR.
+## Stable semantic verifier — Phase 4 authority
 
-## Calibration
-
-Record the four screen corners once:
+The Phase 4 path remains accepted for stable screen interpretation:
 
 ``` text
-raw SIDE frame
-      ↓
-screen quadrilateral
-      ↓
-homography H_screen
-      ↓
-canonical screen
+SIDE frame
+  ↓
+rectify with calibration/screen_homography.json
+  ↓
+fixed typing ROI
+  ↓
+dark text-line localization
+  ↓
+3x crop + CLAHE
+  ↓
+Tesseract 5.3.4 / OEM 1 / PSM 7
+whole-line whitelist = A-Z + 0-9
+  ↓
+confirmed-prefix + expected-character comparison
+  ↓
+9-frame vote
+  ↓
+CONFIRMED_SUCCESS / CONFIRMED_NO_CHANGE /
+CONFIRMED_WRONG / UNCERTAIN
 ```
 
-Then use a fixed typing ROI.
+The whole-line whitelist intentionally remains uppercase-only. A Phase 5 hardware
+attempt showed why: allowing `a-z` across the full line caused low-confidence
+noise to be decoded as long runs of `g/a/q`, destroying the otherwise stable
+`KEYPRESS` prefix. The verifier already normalizes case semantically, so the
+solution is **not** to broaden the whole-line OCR alphabet.
 
-## Verification states
+## Fast press-event detector — Phase 5 extension
 
-Screen verification should not be binary.
-
-Use:
+A press event should be detected faster than a full OCR vote. Before autonomy
+starts, the SIDE watcher records a short baseline (currently about 1.4 s) so
+normal cursor ON/OFF states are represented. During pressing it watches only the
+continuation region after the confirmed prefix.
 
 ``` text
-CONFIRMED_SUCCESS
-CONFIRMED_NO_CHANGE
-CONFIRMED_WRONG
-UNCERTAIN
+baseline frames (cursor ON/OFF included)
+        ↓
+current rectified continuation ROI
+        ↓
+foreground difference vs best matching baseline state
+        ↓
+connected-component / novel-pixel gates
+        ↓
+persistent for 2 consecutive frames
+        ↓
+PRESS_EVENT_LATCHED
 ```
 
-Verification is relative to the screen text confirmed immediately before the
-current key attempt. For example, if the confirmed pre-press prefix is `ROB`
-and the current requested key is `O`, the expected post-press prefix is `ROBO`.
+The detector asks only **"did a persistent new glyph-like foreground appear?"**
+It does not try to recognize the character and therefore does not need to run
+Tesseract at camera rate.
 
-`CONFIRMED_NO_CHANGE` means fresh SIDE observations still stably match the
-confirmed pre-press text, so the stopped descent level has not yet produced the
-expected character. If all WRIST/safety gates still pass, another bounded Z
-step may be attempted. `UNCERTAIN` is different: an OCR fluctuation must not
-trigger either further descent or destructive recovery such as `BACKSPACE`
-until the observation is resolved.
+## Released-character verification
 
-Example:
+After a press event is latched, the controller first releases the key. Only then
+is the new continuation component classified. The single-character OCR path may
+accept lowercase letters because the physical MacBook input can display lowercase
+`g` even though the semantic target is `G`; the result is normalized before
+comparison.
+
+The first successful hardware run produced:
 
 ``` text
-confirmed before attempt: ROB
-requested key:            O
-expected after success:   ROBO
-
-observed text:             ROB   -> CONFIRMED_NO_CHANGE
-observed text:             ROBO  -> CONFIRMED_SUCCESS
-other stable text:                -> CONFIRMED_WRONG
-unstable / low-confidence OCR:    -> UNCERTAIN
+fast event: 759 novel pixels, one 29x49 component, 2 consecutive frames
+release:    Z -64 -> -62 -> -60 commanded-mm
+char OCR:   G, G, G, G, Q
+result:     CONFIRMED_SUCCESS (4/5 success votes)
 ```
 
-If the screen result is uncertain:
+This separates three concerns cleanly:
 
-``` text
-wait / reacquire / OCR again
-```
+- **fast screen change** decides when to release,
+- **OCR** decides which character appeared,
+- **the supervisor** decides success/wrong/uncertain and recovery.
 
-rather than modifying the typed string immediately.
+`UNCERTAIN` never authorizes deeper descent. Once the fast press event is latched,
+no later observation can return the attempt to the descent path.
 
 # Automatic Recovery
 
@@ -1540,7 +1535,7 @@ changes a phase boundary, command contract, or acceptance criterion.
 | Phase 2  | Wrist Keycap Detection and Glyph Recognition        | **Completed**             |
 | Phase 3  | Tool Reference and Visual Servo                     | **Completed**             |
 | Phase 4  | Screen Rectification and Verification               | **Completed**             |
-| Phase 5  | Deterministic Local Single-Key Closed Loop          | **IN PROGRESS — CURRENT** |
+| Phase 5  | Deterministic Local Single-Key Closed Loop          | **IN PROGRESS — G CORE LOOP PASSED** |
 | Phase 6  | Target-Conditioned ACT Dataset                      | Not Started               |
 | Phase 7  | ACT Coarse Policy                                   | Not Started               |
 | Phase 8  | ACT + Visual Servo Handoff                          | Not Started               |
@@ -1562,50 +1557,44 @@ Phase 5 — Deterministic Local Single-Key Closed Loop
 Current checkpoint:
 
 ``` text
-Phase 1 camera/software foundation             ✓ COMPLETED
+Phase 1 camera/software foundation                 ✓ COMPLETED
         ↓
-Phase 2 wrist perception                         ✓ COMPLETED
+Phase 2 wrist perception                           ✓ COMPLETED
         ↓
-Phase 3 tool reference + visual servo             ✓ COMPLETED
+Phase 3 fixed Goal anchor + WRIST visual servo     ✓ COMPLETED
         ↓
-canonical J_cmd                                   ✓
+Phase 4 line OCR + four-state verifier              ✓ COMPLETED
         ↓
-direct WRIST p_tip                                ✓ (307.0, 238.246)
+Phase 5 reusable fixed-anchor XYZ/planner            ✓
         ↓
-existing Goal_Position command anchor             ✓
+Phase 5 press supervisor / iterative 2 mm descent    ✓
         ↓
-dead-zone-aware cumulative XY servo               ✓
+low-Z similarity geometry tracking                  ✓ validated through Z=-64
         ↓
-semantic lock + geometry tracking under occlusion ✓
+SIDE cursor-aware fast change detector               ✓
         ↓
-wide local capture: 61.89 px -> 4.56 px           ✓ demonstrated
+high-priority screen-event latch                     ✓
         ↓
-stable XY: 43.43 px -> 1.79 px (2 fresh frames)  ✓
+staged release before OCR                            ✓  -64 -> -62 -> -60
         ↓
-cumulative Z 0 -> -3 -> -6 mm                    ✓
+released single-character OCR                        ✓  G in 4/5 frames
         ↓
-low-Z XY re-alignment at fixed Z                  ✓
+CONFIRMED_SUCCESS                                    ✓
         ↓
-final staged-Z validation error 2.88 px           ✓
+segmented retract                                    ✓  -60 -> ... -> 0
         ↓
-PHASE 3 ACCEPTED
+controller SUCCEEDED / outcome SUCCESS               ✓
         ↓
-SIDE homography + text ROI                         ✓ existing from Phase 1
+G CORE SINGLE-KEY CLOSED LOOP HARDWARE PASS          ✓
         ↓
-line-level Tesseract OCR                            ✓
+fix event-interrupt stale XY state                   ← CURRENT CODE ISSUE
         ↓
-semantic prefix + expected-character comparison    ✓
-        ↓
-9-frame conservative voting                         ✓
-        ↓
-NO_CHANGE / SUCCESS / WRONG live validation        ✓ 9/9 each
-        ↓
-UNCERTAIN fail-safe behavior                        ✓ unit-tested
-        ↓
-PHASE 4 ACCEPTED
-        ↓
-PHASE 5 DETERMINISTIC SINGLE-KEY CLOSED LOOP      <-- CURRENT
+repeat on >=2 additional letters                     ← REQUIRED FOR PHASE 5 ACCEPTANCE
 ```
+
+Latest software checkpoint: **214 tests pass**. Phase 5 is not yet marked
+complete because one release-state correctness issue remains and cross-key
+transfer has not yet been demonstrated.
 
 ## Phase 1 Completion Record
 
@@ -2305,30 +2294,126 @@ Accepted Phase 4 implementation artifacts are intended to be:
 The exploratory whole-ROI OCR probe and exact-string consensus validator are not
 part of the accepted runtime architecture and may be removed after this checkpoint.
 
+Phase 5 hardware integration exposed an additional case that does not invalidate
+Phase 4: the MacBook may display a lowercase physical keypress while the semantic
+target is uppercase. Broadening the **whole-line** whitelist to lowercase was
+tried and rejected because it caused severe `g/a/q` noise. Phase 5 therefore
+keeps the stable Phase 4 line OCR unchanged and adds a separate released-character
+single-glyph OCR path only after the fast SIDE event has caused the key to be
+released.
+
 ## Phase 5 Current Checkpoint
 
-Phase 5 is now the active phase. Its job is to integrate the two independently
-accepted deterministic subsystems without changing their authority boundaries:
+Phase 5 has now passed its first **complete deterministic G hardware loop** from a
+safe manually positioned local pose. ACT remains outside this checkpoint.
+
+The reusable Phase 5 implementation now includes:
+
+- `src/so101_typing/control/fixed_anchor_xyz.py` — immutable fixed-Goal anchor and
+  cumulative XYZ command state, including bounded segmented Z targets to zero;
+- `src/so101_typing/control/fixed_anchor_planner.py` — same-anchor IK/planning and
+  model/FK/joint/clipping safety gates;
+- `src/so101_typing/perception/semantic_target_lock.py` — semantic identity lock,
+  guarded re-entry, and similarity-based keyboard geometry propagation;
+- `src/so101_typing/perception/screen_change.py` — cursor-aware fast SIDE
+  press-event detection;
+- `src/so101_typing/supervisor/press_controller.py` — explicit one-key press
+  supervisor including event latch/release semantics;
+- `scripts/validate_phase5_single_key.py` — the integrated hardware acceptance /
+  regression runner.
+
+### Problems found during Phase 5 hardware integration
+
+Several failures materially changed the implementation:
+
+1. **Translation-only keyboard propagation failed near contact.** At deeper Z,
+   WRIST appearance changed enough that a pure translation model lost the target.
+   The geometry fallback was upgraded to a bounded similarity transform
+   (translation + small rotation + uniform scale) with inlier/residual/scale/
+   rotation/target-motion gates. This kept the already-established G identity
+   alive through the deep press run.
+
+2. **Whole-line lowercase OCR degraded badly.** The physical MacBook produced a
+   lowercase `g`; uppercase-only line OCR initially forced it toward `Q`. Adding
+   lowercase to the whole-line whitelist then caused large low-confidence
+   `g/a/q` hallucination strings. The accepted fix is to restore the stable
+   uppercase Phase 4 line OCR and use a separate single-character OCR only on the
+   new released continuation component.
+
+3. **Waiting for line OCR before release allowed key repeat.** Screen change is
+   now detected by a lightweight persistent foreground watcher. Once two
+   consecutive changed frames are seen, the event is latched and all further
+   descent/XY chase is forbidden before semantic OCR runs.
+
+4. **One-shot deep retract violated LeRobot's EE-jump guard.** A direct
+   `-64 -> 0` command was rejected. Retract is now segmented into <=10
+   commanded-mm Z changes.
+
+5. **The press-time 1 mm XY FK gate was too strict for escape motion.** The
+   strict 1 mm gate remains for precise pressing. Release and retract use local
+   2 mm and 3 mm model-consistency gates respectively, while all other safety
+   gates remain active.
+
+### Successful G hardware result
+
+The accepted checkpoint run reached the contact region at `Z=-64 commanded-mm`.
+A persistent SIDE change was detected with 759 novel pixels and a 29x49 component
+for two consecutive frames. The controller then:
 
 ``` text
-Phase 3 WRIST controller
-fixed existing Goal_Position anchor
-+ cumulative XY/Z
-+ same-Z XY recovery
+SIDE event latched
         ↓
-stop + settle + fresh observations
+no more Z-down / no more XY chase
         ↓
-Phase 4 SIDE verifier
-CONFIRMED_NO_CHANGE / CONFIRMED_SUCCESS /
-CONFIRMED_WRONG / UNCERTAIN
+release -64 -> -62 -> -60
         ↓
-press-depth authorization / retract / recovery
+released-char OCR = G, G, G, G, Q
+        ↓
+CONFIRMED_SUCCESS (4/5)
+        ↓
+retract -60 -> -50 -> -40 -> -30 -> -20 -> -10 -> 0
+        ↓
+controller state = SUCCEEDED
+outcome          = SUCCESS
 ```
 
-The first Phase 5 target is one deterministic local keypress from a safe local
-pose. ACT remains outside this checkpoint. Screen verification is authoritative
-for physical keypress success; commanded depth remains only a bounded motion
-budget and safety quantity.
+The segmented retract completed without the previous EE-jump failure or the old
+1 mm retract-gate failure. Command-space `Z=0` is the local fixed-anchor level;
+the normal operator-recovery teleoperation still returns the robot to physical
+home before disconnect.
+
+### Current open issue before Phase 5 acceptance
+
+The success run exposed one correctness issue in the event-interrupt path. The
+last executed command before the SIDE event was approximately:
+
+``` text
+(+18.78, -7.05, -64.00) mm
+```
+
+but `RELEASE 1` started from approximately:
+
+``` text
+(+16.87, -4.56, -62.00) mm
+```
+
+The event was raised inside an inner WRIST alignment call before its latest local
+`state` could be returned to the outer loop. The outer exception handler
+therefore used a stale command state and unintentionally rolled XY back by about
+3.1 mm while beginning the release. This did not prevent success, but it violates
+the intended invariant that event release should change only Z.
+
+Required fix: make the latest sent command state authoritative across event
+interrupts (for example by carrying the latest state in the event object or by
+using one shared command-state owner), then verify that release preserves the
+latest XY exactly.
+
+After that fix, Phase 5 still requires deterministic transfer validation on at
+least **two additional letter keys** with the same `p_tip`, `J_cmd`, tracking,
+SIDE event logic, and press/release/retract parameters. No per-key calibration is
+allowed.
+
+The current software checkpoint passes **214 unit tests**.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
@@ -2527,107 +2612,91 @@ Phase 5 physical press loop.
 
 ------------------------------------------------------------------------
 
-## Phase 5 — Deterministic Local Single-Key Closed Loop — **IN PROGRESS — CURRENT**
-
+## Phase 5 — Deterministic Local Single-Key Closed Loop — **IN PROGRESS — G CORE LOOP PASSED**
 
 Goal:
 
-> From a safe pose near a requested key, visually acquire, align, descend in
-> bounded stages, stop when the screen independently confirms success, and
-> retract.
+> From a safe local pose near a requested key, visually acquire and align the
+> target, descend in small same-anchor command increments, detect the first
+> persistent screen change with independent SIDE vision, release immediately,
+> verify the released character, and retract safely.
 
-Example:
+Current implemented loop:
 
 ``` text
 target=G
    ↓
-wrist recognizes G
+WRIST recognizes G and latches semantic identity
    ↓
-p_key -> p_tip XY alignment
+p_key -> p_tip visual alignment
    ↓
-alignment stable
+iterative cumulative Z step = -2 commanded-mm
    ↓
-advance one bounded cumulative Z level
+stop + fresh WRIST / same-Z XY realignment as needed
    ↓
-stop + settle + fresh WRIST observation
-   ↓
-realign if needed
-   ↓
-screen verify
-   ├── CONFIRMED_NO_CHANGE → next bounded Z step
-   ├── UNCERTAIN → hold / reobserve
-   ├── CONFIRMED_WRONG → retract / recovery
-   └── CONFIRMED_SUCCESS → retract / SUCCESS
+SIDE watcher continuously checks continuation-region change
+   ├── no event + stable NO_CHANGE → one more Z step
+   └── persistent new foreground (2 frames)
+           ↓
+       PRESS_EVENT_LATCHED
+           ↓
+       permanently forbid more Z-down / XY chase
+           ↓
+       release +2 mm +2 mm
+           ↓
+       single-character OCR on released new component
+           ↓
+       SUCCESS / WRONG / UNCERTAIN
+           ↓
+       segmented retract (<=10 mm Z per segment)
 ```
 
-This proves the local perception-action-verification loop before learned coarse
-motion is introduced. The hard maximum cumulative descent is a safety/failure
-bound, never a substitute for screen-confirmed success.
+### Current hardware checkpoint
 
-### Phase 5 implementation migration / productionization
+One complete G run has passed:
 
-Phase 5 is also the point where the accepted Phase 3 hardware logic is moved out
-of the validation script and into the production architecture. Do **not** revive
-or adapt the retired pre-Goal-anchor staged controller. The implementation should
-be rebuilt around the hardware-accepted contract:
+- similarity-based low-Z geometry tracking remained usable through the deep
+  press region;
+- event detected at the `Z=-64 commanded-mm` stage;
+- release completed at `-62`, then `-60`;
+- released-character OCR voted `G` in 4/5 frames;
+- result was `CONFIRMED_SUCCESS`;
+- retract completed through `-50, -40, -30, -20, -10, 0`;
+- final controller state was `SUCCEEDED`, outcome `SUCCESS`.
 
-``` text
-motion-stable handoff
-        ↓
-read existing Goal_Position once
-        ↓
-fixed command-space anchor
-        ↓
-cumulative XY / Z command state
-        ↓
-stop + fresh WRIST observation after each command/level
-        ↓
-same-Z XY realignment when needed
-        ↓
-SIDE verification authorizes next Z level / retract / failure
-```
+### Acceptance still pending
 
-Required Phase 5 engineering work:
+Phase 5 is **not complete yet**. Before acceptance:
 
-- extract the validated fixed-anchor cumulative XYZ command state from
-  `scripts/validate_phase3_xyz.py` into reusable control/runtime modules;
-- preserve the existing `Goal_Position` preload across the full local press
-  attempt; `Present_Position` remains diagnostics/safety/IK-seed state and must
-  never silently become a new command origin;
-- keep XYZ dead-zone/backlash semantics explicit: a small no-motion response does
-  not trigger rebasing, direction reversal, or reset-style micro-steps;
-- preserve semantic target identity through temporary near-contact glyph
-  occlusion using the guarded geometry fallback already validated in Phase 3;
-- make every Z-level transition cumulative from the original Goal-space anchor,
-  hold XY fixed during the transition, then allow XY correction only after
-  stop/settle at that same Z level;
-- integrate the Phase 4 verifier so `CONFIRMED_SUCCESS` stops further descent,
-  `CONFIRMED_NO_CHANGE` may authorize the next bounded Z level, `UNCERTAIN` holds
-  and reobserves, and `CONFIRMED_WRONG` retracts/fails;
-- implement bounded retract and operator-safe failure behavior without blind
-  automatic homing.
+- fix the stale-XY command-state rollback exposed by the event interrupt so
+  release changes only Z from the latest actually sent command state;
+- add/retain regression coverage for this interrupt-state invariant;
+- repeat the deterministic loop on at least two additional letter keys without
+  per-key `p_tip`, Jacobian, OCR, tracking, or press-depth tuning;
+- keep `scripts/validate_phase3_xyz.py` as the Phase 3 hardware regression
+  validator and `scripts/validate_phase5_single_key.py` as the Phase 5 hardware
+  acceptance/regression runner.
 
-New tests should cover at least:
+Current supervised validation intentionally has no arbitrary cumulative-Z
+software cap (`max_descent_mm=None`); the operator is the absolute-depth safety
+authority. A future autonomous version must add a physically meaningful safety
+bound without requiring ACT to start at a fixed distance from the keyboard.
 
-- fixed Goal-anchor creation and zero-delta preservation;
-- cumulative XYZ state without `Present_Position` rebasing;
-- dead-zone-safe accumulation across multiple commands;
-- Z-level advance with XY held fixed;
-- same-Z XY realignment preserving cumulative Z;
-- semantic-lock geometry fallback not selecting a new key identity;
-- no further downward command after `CONFIRMED_SUCCESS`, `CONFIRMED_WRONG`, or an
-  exhausted safety budget;
-- `UNCERTAIN` producing hold/reobserve rather than descent;
-- controller ownership and stale-command rejection at the deterministic handoff.
+### Phase 5 code organization
 
-`scripts/validate_phase3_xyz.py` should remain available as a hardware regression
-validator after this extraction; it should not become the production typing
-runtime itself.
+The current Phase 5 modules are part of the intended implementation, not
+throw-away transition code:
 
-Phase 5 should also repeat the deterministic local loop on at least two
-additional letter keys without per-key `p_tip` values or per-key Jacobians. This
-absorbs the cross-key transfer sanity check that was removed from Phase 3 after
-the control architecture changed during hardware validation.
+- `fixed_anchor_xyz.py`
+- `fixed_anchor_planner.py`
+- `semantic_target_lock.py`
+- `screen_change.py`
+- `press_controller.py`
+- `validate_phase5_single_key.py`
+- their focused unit/regression tests.
+
+Temporary patch installers and backup directories under `artifacts/` are not
+runtime code and should not be committed.
 
 ------------------------------------------------------------------------
 
@@ -2694,14 +2763,17 @@ flush/reset ACT
      ↓
 SERVO_ALIGN
      ↓
-DESCEND_STEP
+small cumulative DESCEND_STEP
      ↓
-STOP / REOBSERVE / REALIGN
+STOP / REOBSERVE / SAME-Z REALIGN
      ↓
-SCREEN_VERIFY
-     ├── NO_CHANGE → next bounded descent level
-     ├── UNCERTAIN → hold / reobserve
-     └── SUCCESS / WRONG / safety bound → retract / supervisor
+SIDE watcher
+     ├── no event + confirmed NO_CHANGE → next descent step
+     └── persistent screen change → EVENT LATCH → RELEASE
+                                      ↓
+                                released-char verify
+                                      ↓
+                                retract / supervisor
 ```
 
 Acceptance must explicitly test:
@@ -2854,7 +2926,7 @@ joint limits
 workspace limits
 maximum Cartesian correction per servo iteration
 maximum cumulative Z-level increment
-maximum cumulative downward motion per press attempt
+production/autonomous absolute-depth or workspace safety bound
 maximum press duration
 maximum servo iterations
 fresh-frame requirement after every Z step
@@ -2876,7 +2948,10 @@ Safety invariants:
 6.  deterministic commands remain cumulative from one fixed Goal-space anchor;
     `Present_Position` is never silently promoted to a new runtime command origin,
 7.  ACT and the deterministic staged controller never command simultaneously,
-8.  failed/uncertain verification never causes an unbounded descent or retry loop.
+8.  a latched persistent SIDE press event permanently disables further Z-down and
+    XY chase for that attempt,
+9.  release preserves the latest authoritative cumulative XY and changes only Z,
+10. failed/uncertain verification never causes an unbounded descent or retry loop.
 
 ------------------------------------------------------------------------
 
@@ -2930,13 +3005,16 @@ so101_typing/
 │       │   ├── keycaps.py
 │       │   ├── glyphs.py
 │       │   ├── target_observation.py
+│       │   ├── semantic_target_lock.py
 │       │   ├── screen_rectify.py
-│       │   └── screen_ocr.py
+│       │   ├── screen_ocr.py
+│       │   └── screen_change.py
 │       │
 │       ├── control/
 │       │   ├── visual_servo.py
 │       │   ├── image_jacobian.py
-│       │   ├── press_controller.py
+│       │   ├── fixed_anchor_xyz.py
+│       │   ├── fixed_anchor_planner.py
 │       │   ├── controller_owner.py
 │       │   └── safety.py
 │       │
@@ -2948,6 +3026,7 @@ so101_typing/
 │       ├── supervisor/
 │       │   ├── state_machine.py
 │       │   ├── typing.py
+│       │   ├── press_controller.py
 │       │   ├── verification.py
 │       │   └── recovery.py
 │       │
@@ -2970,6 +3049,7 @@ so101_typing/
 │   ├── benchmark_glyph_models.py
 │   ├── validate_phase3_xyz.py
 │   ├── validate_phase4_screen_verification.py
+│   ├── validate_phase5_single_key.py
 │   ├── collect_act_data.py
 │   ├── train_act.py
 │   └── run_typing_demo.py
@@ -2997,53 +3077,51 @@ so101_typing/
 
 # First End-to-End Milestone
 
-The first complete milestone remains intentionally small:
+The deterministic local portion of the first milestone has now been demonstrated
+for target `G` from a safe manually positioned local pose. The **full hybrid
+ACT+deterministic milestone** remains future work.
+
+Current achieved deterministic behavior:
 
 ``` text
-Input:
-"G"
+Input: G
+   ↓
+WRIST visually recognizes G
+   ↓
+fixed Goal-space anchor
+   ↓
+WRIST visual servo + similarity geometry fallback
+   ↓
+iterative 2 mm cumulative Z descent
+   ↓
+SIDE persistent screen-change event
+   ↓
+immediate staged release
+   ↓
+released-character OCR
+   ↓
+CONFIRMED_SUCCESS
+   ↓
+segmented retract to command-space Z=0
+   ↓
+controller SUCCEEDED
 ```
 
-Expected behavior:
+Remaining work before the complete first hybrid milestone:
 
 ``` text
-Supervisor requests G
-        ↓
 ACT uses TOP + WRIST + state + target=G
         ↓
-ACT creates a servo-ready local viewpoint
+ACT creates the same kind of servo-ready local viewpoint
         ↓
-WRIST perception visually recognizes G
+perception-triggered handoff preserves existing Goal_Position
         ↓
-ACT queue is stopped/reset
-        ↓
-wait for follower stability + preserve existing Goal_Position anchor
-        ↓
-Visual servo moves G toward p_tip
-        ↓
-alignment stable at current Z level
-        ↓
-advance one bounded cumulative Z level
-        ↓
-stop + settle + reobserve WRIST / realign at fixed Z if needed
-        ↓
-SIDE camera rectification + OCR
-        ↓
-CONFIRMED_NO_CHANGE ? repeat bounded stage
-        ↓
-"G" confirmed
-        ↓
-stop further descent + retract
-        ↓
-CONFIRMED_SUCCESS
+run the already-validated deterministic local loop
 ```
 
-Nothing beyond this is required to prove the primary architecture.
-
-Once this primitive is reliable, multi-character typing is repeated
-execution plus deterministic recovery.
-
-------------------------------------------------------------------------
+Nothing beyond this is required to prove the primary ACT-to-deterministic
+architecture. Multi-character typing then becomes repeated execution plus
+supervisor-driven recovery.
 
 # Final Demonstration
 
@@ -3072,9 +3150,11 @@ p_key -> p_tip visual alignment
       ↓
 fixed-anchor cumulative Z / stop / reobserve / same-level realign
       ↓
-screen-confirmed success or bounded failure
+SIDE fast event latch on first persistent screen change
       ↓
-retract
+staged release + released-character verification
+      ↓
+segmented retract / recovery
       ↓
 next character / recovery
 ```
@@ -3141,7 +3221,7 @@ coarse robot motion       → ACT
 local key identity        → visual appearance
 fine alignment            → classical visual servo
 physical press            → bounded staged deterministic control
-result observation        → independent screen vision
+result observation        → SIDE fast event + independent screen OCR
 recovery planning         → deterministic supervisor
 ```
 

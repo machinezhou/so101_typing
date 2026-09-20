@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 
 from so101_typing.perception.screen_ocr import (
+    TesseractScreenLineOCR,
+    TesseractSingleCharacterOCR,
     detect_screen_text_lines,
 )
 
@@ -63,6 +65,17 @@ class TestScreenLineOCR(unittest.TestCase):
             detect_screen_text_lines(image),
             (),
         )
+
+
+    def test_whole_line_whitelist_stays_uppercase_only(self):
+        whitelist = TesseractScreenLineOCR.DEFAULT_WHITELIST
+        for character in "abcdefghijklmnopqrstuvwxyz":
+            self.assertNotIn(character, whitelist)
+
+    def test_single_character_whitelist_accepts_lowercase(self):
+        whitelist = TesseractSingleCharacterOCR.DEFAULT_WHITELIST
+        for character in "abcdefghijklmnopqrstuvwxyz":
+            self.assertIn(character, whitelist)
 
 
 if __name__ == "__main__":

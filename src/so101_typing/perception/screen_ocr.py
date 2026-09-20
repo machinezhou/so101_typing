@@ -778,3 +778,91 @@ class TesseractScreenLineOCR:
             ),
             processed_image=diagnostic,
         )
+
+class TesseractSingleCharacterOCR(TesseractScreenLineOCR):
+    """Recognize exactly one released key continuation character.
+
+    Unlike the stable whole-line OCR, lowercase letters are intentionally
+    allowed here because a physical keyboard press in the editor produces a
+    lowercase character.  PSM 10 treats the crop as one character.
+    """
+
+    DEFAULT_WHITELIST = (
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789"
+    )
+
+    def __init__(
+        self,
+        *,
+        language: str = "eng",
+        scale: float = 4.0,
+        clahe_clip_limit: float = 2.0,
+        dark_threshold: int = 185,
+        whitelist: str = DEFAULT_WHITELIST,
+    ) -> None:
+        super().__init__(
+            language=language,
+            scale=scale,
+            clahe_clip_limit=clahe_clip_limit,
+            dark_threshold=dark_threshold,
+            whitelist=whitelist,
+        )
+
+    def _recognize_line(
+        self,
+        line_bgr: np.ndarray,
+    ) -> tuple[str, float, int]:
+        processed = self._prepare_line(line_bgr)
+
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "screen_character.png"
+
+            if not cv2.imwrite(str(input_path), processed):
+                raise RuntimeError("failed to write temporary character OCR image")
+
+            completed = subprocess.run(
+                [
+                    self.executable,
+                    str(input_path),
+                    "stdout",
+                    "--oem",
+                    "1",
+                    "--psm",
+                    "10",
+                    "-l",
+                    self.language,
+                    "-c",
+                    "tessedit_char_whitelist=" + self.whitelist,
+                    "tsv",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or f"return code {completed.returncode}"
+            raise RuntimeError(f"Tesseract character OCR failed: {detail}")
+
+        return parse_tesseract_tsv(
+            completed.stdout,
+            min_word_confidence=0.0,
+        )
+
+    def recognize_character(
+        self,
+        crop_bgr: np.ndarray,
+    ) -> tuple[str | None, float]:
+        if crop_bgr is None or crop_bgr.size == 0:
+            return None, 0.0
+
+        text, confidence, _ = self._recognize_line(crop_bgr)
+        compact = "".join(ch for ch in normalize_ocr_text(text) if ch.isalnum())
+
+        if len(compact) != 1:
+            return None, float(confidence)
+
+        return compact.upper(), float(confidence)
