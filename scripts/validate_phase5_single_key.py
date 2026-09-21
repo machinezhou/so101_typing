@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import copy
 import json
 import math
@@ -90,7 +91,8 @@ from so101_typing.supervisor.verification import (
 ROBOT_PORT = "/dev/ttyACM0"
 LEADER_PORT = "/dev/ttyACM1"
 
-TARGET = "G"
+DEFAULT_TARGET = "G"
+TARGET = DEFAULT_TARGET
 CONFIRMED_PREFIX = "KEYPRESS"
 
 URDF = (
@@ -2799,5 +2801,37 @@ def main():
             robot.disconnect()
 
 
+def parse_cli_target() -> str:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate the Phase-5 deterministic "
+            "single-key closed loop."
+        ),
+    )
+    parser.add_argument(
+        "--target",
+        default=DEFAULT_TARGET,
+        help=(
+            "Single A-Z target key. "
+            f"Default: {DEFAULT_TARGET}"
+        ),
+    )
+
+    args = parser.parse_args()
+    target = str(args.target).strip().upper()
+
+    if (
+        len(target) != 1
+        or target < "A"
+        or target > "Z"
+    ):
+        parser.error(
+            "--target must be exactly one letter A-Z"
+        )
+
+    return target
+
+
 if __name__ == "__main__":
+    TARGET = parse_cli_target()
     main()

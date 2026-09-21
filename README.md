@@ -60,64 +60,61 @@ on the MacBook using only physical keyboard interaction.
 
 ## Current Project Status
 
-Phases 0–4 are accepted. Phase 5 remains the current implementation phase and
-its deterministic single-key `G` loop now has a clean hardware SUCCESS checkpoint
-with the high-priority SIDE-event release path operating as intended. Phase 5 is
-not marked complete yet because cross-key transfer on at least two additional
-letters is still required.
+Phases 0–5 are accepted. Phase 5 is now complete after the same deterministic
+single-key closed loop passed on three letter keys (`G`, `F`, and `H`) without
+per-key tuning. Phase 6 — Target-Conditioned ACT Dataset — is the next project
+phase.
 
-The current physical/software setup has demonstrated:
+The accepted Phase 5 physical/software loop now demonstrates:
 
 - calibrated SO-101 follower/leader operation and stable teleoperation,
-- a previous ACT block-manipulation demo,
-- a pencil tool mechanically attached to the gripper,
-- three simultaneous camera streams in the fixed MacBook workspace,
 - appearance-based WRIST target acquisition,
-- fixed-`Goal_Position` cumulative Cartesian command semantics,
+- one immutable `Goal_Position` command-space anchor per deterministic attempt,
 - WRIST visual servoing with guarded semantic/geometry tracking through glyph
   occlusion,
+- iterative cumulative Z descent with fresh WRIST observation and same-Z XY
+  correction,
 - independent SIDE screen rectification and conservative semantic verification,
 - a high-priority SIDE watcher with two event paths:
-  - a strong continuation-region glyph can latch on the first frame,
+  - a strong continuation-region glyph may latch on the first qualifying frame,
   - ordinary smaller changes still require two consecutive frames,
-- immutable event ownership once latched: no later observation can authorize
-  additional Z-down or XY chase for that press attempt,
-- release from the latest actually-sent XYZ command state, eliminating the
-  stale-outer-state XY rollback found in the earlier hardware run,
+- immutable event ownership once latched: no later observation may authorize
+  more Z-down or XY chase in that attempt,
+- release from the latest actually-sent XYZ command state, preventing stale
+  outer-state XY rollback,
 - one upward `+20 commanded-mm` release escape before character classification,
-- released-character OCR after the key has been released,
+- released-character OCR after release,
 - segmented retract back to command-space `Z=0`,
-- a complete hardware result with controller state `SUCCEEDED` and outcome
-  `SUCCESS` for target `G`.
+- successful end-to-end hardware runs on `G`, `F`, and `H`.
 
-The latest successful G checkpoint produced a strong SIDE event on the first
-changed frame (`novel_pixels ~= 765`, largest component ~= 765 px), sent the
-release command about 18 ms after that captured frame, preserved the latest-sent
-XY exactly, and produced one stable new-character component. Released-character
-OCR voted `G` in 3/5 frames and the controller completed with `SUCCESS`.
+Cross-key acceptance evidence:
 
-Hardware diagnostics also confirmed the Phase 3 command-space lesson under
-contact load: requested Cartesian millimetres are not a claim of physical
-millimetre-level TCP accuracy. During the successful `+20 commanded-mm` release,
-the arm physically moved enough to cross the keyboard release point, but
-`Present_Position` did not converge to the full `Goal_Position` before becoming
-motion-stable. This low-level Goal/Present tracking behavior is recorded as a
-future servo/contact-control optimization rather than a Phase 5 blocker.
+``` text
+G  -> SUCCEEDED / SUCCESS
+F  -> SUCCEEDED / SUCCESS
+H  -> SUCCEEDED / SUCCESS
+```
 
-The remaining Phase 5 work is therefore narrow:
+No per-key `p_tip`, `J_cmd`, tracking, OCR, SIDE-event, or press/release tuning
+was introduced for the F/H acceptance runs.
 
-- validate the same deterministic loop on at least two additional letter keys,
-- do not tune `p_tip`, `J_cmd`, SIDE thresholds, tracking, OCR, or release depth
-  per key,
-- keep the operator-recovery path after autonomous completion; command-space
-  `Z=0` is the fixed local anchor level, not the robot's physical home pose,
-- then freeze the Phase 5 interfaces before collecting the Phase 6 ACT dataset.
+The F run latched a strong screen event at `Z=-28 commanded-mm`, preserved the
+latest-sent XY, released once to `Z=-8`, and classified `F` in 5/5 released-char
+frames. The H run also completed `SUCCEEDED / SUCCESS`; its released-character
+vote reached `CONFIRMED_SUCCESS` while preserving the same shared controller
+parameters.
 
-Phase 3 remains the hardware-accepted deterministic motion foundation. Phase 4
-remains the accepted conservative line-OCR semantic verifier. Phase 5 extends
-those checkpoints rather than replacing them: WRIST remains the XY authority,
-SIDE remains the physical outcome authority, and commanded depth remains a
-motion/safety variable rather than a success detector.
+Hardware diagnostics continue to confirm the Phase 3 command-space lesson under
+contact load: requested Cartesian millimetres are control-space units, not a
+claim of millimetre-level physical TCP positioning accuracy. Goal/Present
+under-tracking, load-dependent servo response, backlash/compliance, and improved
+motion-completion/contact sensing are deferred low-level optimization topics and
+are not blockers for the accepted Phase 5 architecture.
+
+Phase 3 remains the deterministic motion foundation, Phase 4 remains the
+independent screen-verification foundation, and Phase 5 closes the local
+single-key interaction primitive. The project can now move to Phase 6 data
+collection for target-conditioned ACT coarse approach.
 
 ## Research Questions
 
@@ -1536,10 +1533,6 @@ to solve the entire contact task itself.
 
 # Implementation Progress and Current Checkpoint
 
-This section tracks the actual implementation and integration status of
-the project. The Development Roadmap below is updated when hardware evidence
-changes a phase boundary, command contract, or acceptance criterion.
-
 ## Overall Progress
 
 | Phase    | Description                                         | Status |
@@ -1549,24 +1542,21 @@ changes a phase boundary, command contract, or acceptance criterion.
 | Phase 2  | Wrist Keycap Detection and Glyph Recognition        | **Completed** |
 | Phase 3  | Tool Reference and Visual Servo                     | **Completed** |
 | Phase 4  | Screen Rectification and Verification               | **Completed** |
-| Phase 5  | Deterministic Local Single-Key Closed Loop          | **IN PROGRESS — G CLEAN PASS; CROSS-KEY ACCEPTANCE PENDING** |
-| Phase 6  | Target-Conditioned ACT Dataset                      | Not Started |
+| Phase 5  | Deterministic Local Single-Key Closed Loop          | **Completed** |
+| Phase 6  | Target-Conditioned ACT Dataset                      | **IN PROGRESS — CURRENT** |
 | Phase 7  | ACT Coarse Policy                                   | Not Started |
 | Phase 8  | ACT + Visual Servo Handoff                          | Not Started |
 | Phase 9  | Multi-Key Typing                                    | Not Started |
 | Phase 10 | Automatic Recovery                                  | Not Started |
 | Phase 11 | Controlled Generalization and Ablations             | Not Started |
 
-A phase is complete only after its acceptance criteria have been validated on
-the intended system.
-
 ## Current Phase
 
 ``` text
-Phase 5 — Deterministic Local Single-Key Closed Loop
+Phase 6 — Target-Conditioned ACT Dataset
 ```
 
-Current checkpoint:
+Accepted deterministic foundation:
 
 ``` text
 Phase 1 camera/software foundation                 ✓ COMPLETED
@@ -1577,19 +1567,13 @@ Phase 3 fixed Goal anchor + WRIST visual servo     ✓ COMPLETED
         ↓
 Phase 4 line OCR + four-state verifier             ✓ COMPLETED
         ↓
-Phase 5 reusable fixed-anchor XYZ/planner          ✓
+Phase 5 fixed-anchor press supervisor              ✓
         ↓
-Phase 5 press supervisor / iterative 2 mm descent  ✓
+iterative Z / fresh-WRIST / same-Z XY correction  ✓
         ↓
-low-Z semantic/geometry tracking                   ✓
-        ↓
-SIDE cursor-aware fast change detector             ✓
-        ↓
-strong glyph fast path: first-frame latch          ✓
-ordinary event path: 2-frame confirmation          ✓
+SIDE strong/confirmed event latch                  ✓
         ↓
 latest-sent command-state ownership                ✓
-stale event-interrupt XY rollback                  ✓ FIXED
         ↓
 one +20 commanded-mm upward release                ✓
         ↓
@@ -1597,29 +1581,26 @@ released single-character OCR                      ✓
         ↓
 segmented retract to command-space Z=0             ✓
         ↓
-controller SUCCEEDED / outcome SUCCESS on G        ✓
+G  SUCCEEDED / SUCCESS                             ✓
+F  SUCCEEDED / SUCCESS                             ✓
+H  SUCCEEDED / SUCCESS                             ✓
         ↓
-Goal/Present under-tracking under contact load     ↪ DEFERRED LOW-LEVEL OPTIMIZATION
+PHASE 5 ACCEPTED                                   ✓
         ↓
-repeat on >=2 additional letters                   ← CURRENT ACCEPTANCE WORK
+Target-conditioned ACT dataset                     ← CURRENT
 ```
 
-The current G checkpoint validates the intended architecture rather than
-millimetre-level SO-101 TCP accuracy. The release command only needs to cross
-the physical keyboard release point reliably; `Goal_Position == Present_Position`
-is not a Phase 5 success requirement.
+Phase 5 acceptance is specifically cross-key: the same `p_tip`, `J_cmd`,
+tracking logic, SIDE event detector, OCR configuration, and press/release
+parameters were retained across `G`, `F`, and `H`.
 
-The Phase 5 code being committed is intended implementation code, not temporary
-patch code:
+Low-level SO-101 Goal/Present tracking under load remains a deferred performance
+optimization. The accepted controller depends on WRIST for local XY authority
+and SIDE for physical press outcome, rather than assuming millimetre-level TCP
+execution from command-space millimetres.
 
-- `src/so101_typing/control/fixed_anchor_xyz.py`
-- `src/so101_typing/perception/screen_change.py`
-- `scripts/validate_phase5_single_key.py`
-- focused regression tests for latest-sent state ownership and the strong-event
-  fast path.
-
-Temporary patch installers, backup directories, generated debug images, and
-one-off servo telemetry files under `artifacts/` are not runtime source and
+Temporary patch installers, generated debug images, cross-key logs, telemetry
+files, and backup directories under `artifacts/` are not runtime source and
 should not be committed.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
@@ -1819,7 +1800,7 @@ Phase 5 physical press loop.
 
 ------------------------------------------------------------------------
 
-## Phase 5 — Deterministic Local Single-Key Closed Loop — **IN PROGRESS — G CLEAN PASS; CROSS-KEY ACCEPTANCE PENDING**
+## Phase 5 — Deterministic Local Single-Key Closed Loop — **Completed**
 
 Goal:
 
@@ -1828,12 +1809,12 @@ Goal:
 > screen-change evidence with independent SIDE vision, release immediately,
 > verify the released character, and retract safely.
 
-Current implemented loop:
+Accepted loop:
 
 ``` text
-target=G
+requested key
    ↓
-WRIST recognizes G and latches semantic identity
+WRIST recognizes target and latches semantic identity
    ↓
 p_key -> p_tip visual alignment
    ↓
@@ -1843,16 +1824,16 @@ stop + fresh WRIST / same-Z XY realignment as needed
    ↓
 SIDE watcher continuously checks continuation-region change
    ├── no event + stable NO_CHANGE → one more Z step
-   ├── strong new glyph → latch on first changed frame
+   ├── strong new glyph → latch on first qualifying frame
    └── ordinary smaller change → latch after 2 consecutive frames
            ↓
        PRESS_EVENT_LATCHED
            ↓
        permanently forbid more Z-down / XY chase
            ↓
-       use latest actually-sent XYZ command state
+       recover latest actually-sent XYZ command state
            ↓
-       one +20 commanded-mm upward release
+       one +20 commanded-mm upward release escape
            ↓
        single-character OCR on released new component
            ↓
@@ -1861,73 +1842,58 @@ SIDE watcher continuously checks continuation-region change
        segmented retract (<=10 commanded-mm Z per segment)
 ```
 
-### Current hardware checkpoint
+### Hardware acceptance
 
-The current G run passed cleanly:
+The same deterministic loop passed on three letter keys without per-key tuning:
 
-- strong SIDE event detected on the first changed frame;
-- event evidence was approximately `765` novel pixels with a largest connected
-  component of approximately `765 px`;
-- event-to-release-command latency was approximately `17.6 ms`;
-- release preserved the latest actually-sent XY command state;
-- release changed command-space Z from `-42` to `-22` in one upward escape;
-- released-character OCR produced `G / Q / G / G / Q`, resulting in
-  `CONFIRMED_SUCCESS`;
-- segmented retract returned command-space Z to `0`;
-- final controller state was `SUCCEEDED`, outcome `SUCCESS`.
+``` text
+G  -> SUCCEEDED / SUCCESS
+F  -> SUCCEEDED / SUCCESS
+H  -> SUCCEEDED / SUCCESS
+```
 
-The earlier event-interrupt stale-state bug is fixed. The release path no longer
-uses the stale outer control state when an event arrives during an inner WRIST
-motion; it uses the latest command that was actually sent to the robot.
+Shared across all three runs:
 
-### Low-level tracking note
+- direct WRIST `p_tip`,
+- canonical `J_cmd`,
+- semantic/geometry tracking,
+- SIDE event thresholds,
+- OCR configuration,
+- iterative press policy,
+- latest-sent command-state ownership,
+- one `+20 commanded-mm` release escape,
+- segmented retract.
+
+The F acceptance run produced a strong SIDE event with approximately `579`
+novel pixels / `579 px` largest component, preserved the latest-sent XY, released
+from `Z=-28` to `Z=-8`, and classified `F` in 5/5 released-character frames.
+
+The H acceptance run also reached `CONFIRMED_SUCCESS` and final
+`SUCCEEDED / SUCCESS` using the same shared parameters.
+
+The earlier event-interrupt stale-state bug is fixed: if SIDE interrupts while
+an inner WRIST command is in flight, release uses the latest command state that
+actually passed `send_action` validation instead of stale outer-loop XY.
+
+### Deferred low-level optimization
 
 Phase 5 does not require millimetre-level physical TCP tracking from the SO-101.
-As already established in Phase 3, command-space millimetres are control units,
-not a guarantee of equal measured TCP displacement.
+As established in Phase 3, command-space millimetres are control units, not a
+guarantee of equal measured TCP displacement.
 
-Servo telemetry from the latest G checkpoint showed that the upward release
-produced enough physical motion to cross the keyboard release point, while the
-arm became motion-stable before `Present_Position` fully converged to
-`Goal_Position`. Load-dependent Goal/Present tracking, backlash/compliance,
-motion-completion semantics, and possible contact/load sensing are therefore
-deferred performance optimizations, not blockers for the deterministic typing
-architecture.
+Servo telemetry showed that release can cross the physical keyboard release
+point even when `Present_Position` does not fully converge to `Goal_Position`
+before motion becomes stable. Load-dependent tracking, backlash/compliance,
+better goal-reached semantics, and optional contact/load sensing are deferred
+performance optimizations.
 
-### Acceptance still pending
+### Phase 5 acceptance result
 
-Phase 5 is not complete yet. Before acceptance:
+Phase 5 is accepted.
 
-- run the same deterministic loop on at least two additional letter keys;
-- do not introduce per-key `p_tip`, `J_cmd`, OCR, tracking, SIDE-event, or
-  press/release tuning;
-- retain the current G parameters unless cross-key evidence exposes a generic
-  architecture issue;
-- keep `scripts/validate_phase3_xyz.py` as the Phase 3 hardware regression
-  validator and `scripts/validate_phase5_single_key.py` as the Phase 5 hardware
-  acceptance/regression runner.
-
-Current supervised validation intentionally has no arbitrary cumulative-Z
-software cap (`max_descent_mm=None`); the operator remains the absolute-depth
-safety authority. A future autonomous version must add a physically meaningful
-safety bound without requiring ACT to start at a fixed distance from the
-keyboard.
-
-### Phase 5 code organization
-
-The following modules are intended implementation code:
-
-- `fixed_anchor_xyz.py`
-- `fixed_anchor_planner.py`
-- `semantic_target_lock.py`
-- `screen_change.py`
-- `press_controller.py`
-- `validate_phase5_single_key.py`
-- their focused unit/regression tests.
-
-Temporary patch installers, generated telemetry/debug outputs, and backup
-directories under `artifacts/` are transition/debug artifacts and should not be
-committed.
+The deterministic local single-key primitive is now frozen as the foundation
+for Phase 6. Future changes to this primitive should be regression-tested against
+the accepted `G/F/H` behavior before being used by ACT handoff experiments.
 
 ## Phase 6 — Target-Conditioned ACT Dataset
 
@@ -2306,8 +2272,8 @@ so101_typing/
 
 # First End-to-End Milestone
 
-The deterministic local portion of the first milestone has now been demonstrated
-for target `G` from a safe manually positioned local pose. The **full hybrid
+The deterministic local portion of the first milestone has now been accepted
+across `G`, `F`, and `H` from safe manually positioned local poses. The **full hybrid
 ACT+deterministic milestone** remains future work.
 
 Current achieved deterministic behavior:
