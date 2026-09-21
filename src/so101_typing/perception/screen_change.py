@@ -29,6 +29,13 @@ class FastScreenChangeConfig:
     continuation_overlap_px: int = 14
     min_novel_pixels: int = 45
     min_component_area_px: int = 18
+
+    # A very strong single-frame continuation glyph can trigger the safety
+    # release immediately. Ordinary changes still require normal
+    # consecutive-frame confirmation.
+    strong_min_novel_pixels: int = 300
+    strong_min_component_area_px: int = 250
+
     required_consecutive_frames: int = 2
     max_frame_age_ms: float = 120.0
     poll_interval_s: float = 0.005
@@ -37,6 +44,7 @@ class FastScreenChangeConfig:
 @dataclass(frozen=True, slots=True)
 class FastScreenChangeObservation:
     changed: bool
+    strong_changed: bool
     triggered: bool
     consecutive_frames: int
     novel_pixels: int
@@ -169,16 +177,25 @@ class FastScreenChangeModel:
             and max_area >= self.config.min_component_area_px
         )
 
+        strong_changed = (
+            novel_pixels >= self.config.strong_min_novel_pixels
+            and max_area >= self.config.strong_min_component_area_px
+        )
+
         if changed:
             self._streak += 1
         else:
             self._streak = 0
 
-        if self._streak >= self.config.required_consecutive_frames:
+        if (
+            strong_changed
+            or self._streak >= self.config.required_consecutive_frames
+        ):
             self._triggered = True
 
         return FastScreenChangeObservation(
             changed=changed,
+            strong_changed=strong_changed,
             triggered=self._triggered,
             consecutive_frames=self._streak,
             novel_pixels=novel_pixels,
@@ -359,6 +376,7 @@ class FastSidePressEventWatcher:
                         "capture_timestamp": float(frame.capture_timestamp),
                         "novel_pixels": observation.novel_pixels,
                         "max_component_area_px": observation.max_component_area_px,
+                        "strong_changed": observation.strong_changed,
                         "consecutive_frames": observation.consecutive_frames,
                         "continuation_x0": observation.continuation_x0,
                         "bbox_xywh": observation.bbox_xywh,

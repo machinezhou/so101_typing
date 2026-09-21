@@ -40,6 +40,7 @@ from so101_typing.control.fixed_anchor_planner import (
 from so101_typing.control.fixed_anchor_xyz import (
     FixedAnchorXYZCommandState,
     FixedGoalAnchor,
+    LatestSentXYZCommandState,
     stepped_z_targets_to_zero,
 )
 from so101_typing.control.image_jacobian import (
@@ -189,9 +190,19 @@ SCREEN_MAX_FRAME_AGE_MS = 100.0
 
 SCREEN_EVENT_BASELINE_S = 1.4
 SCREEN_EVENT_CHAR_FRAMES = 5
-SCREEN_EVENT_RELEASE_MM = 4.0
-SCREEN_EVENT_RELEASE_STEP_MM = 2.0
-RELEASE_MAX_MODEL_XY_ERROR_MM = 2.0
+# Hardware evidence:
+# - +2/+2 commanded-mm release was too small under load/backlash.
+# - one +10 commanded-mm release reduced repeats, but immediate Present-FK
+#   motion was only about +3.3 mm and the key still repeated.
+#
+# Use one +20 commanded-mm upward escape command. This remains below the
+# LeRobot 35 mm EE-jump guard. Latest-sent XY is preserved exactly.
+SCREEN_EVENT_RELEASE_MM = 20.0
+SCREEN_EVENT_RELEASE_STEP_MM = 20.0
+# Release is an upward safety retreat. Give it the same bounded
+# planner-model XY tolerance used by segmented retract. Normal press motion
+# keeps the existing stricter default planner gate.
+RELEASE_MAX_MODEL_XY_ERROR_MM = 3.0
 RETRACT_MAX_MODEL_XY_ERROR_MM = 3.0
 
 # The watcher only latches an event. Robot commands always remain on the
@@ -1010,6 +1021,8 @@ def send_command_state(
     motor_names,
     *,
     label,
+    sent_state_tracker,
+    event_capture_timestamp=None,
 ):
     observation = (
         ordered_joint_observation(
@@ -1048,6 +1061,19 @@ def send_command_state(
         f"model_error_z={plan.model_z_error_mm:.3f}"
     )
 
+    action_send_timestamp = time.monotonic()
+
+    if event_capture_timestamp is not None:
+        event_to_send_ms = (
+            action_send_timestamp
+            - float(event_capture_timestamp)
+        ) * 1000.0
+
+        print(
+            "[RELEASE LATENCY] "
+            f"event_capture_to_send={event_to_send_ms:.1f}ms"
+        )
+
     sent_action = robot.send_action(
         plan.joint_action
     )
@@ -1055,6 +1081,13 @@ def send_command_state(
     planner.validate_sent_action(
         plan,
         sent_action,
+    )
+
+    # The command has now been accepted by the robot interface. Record it
+    # BEFORE waiting for motion stability because the asynchronous SIDE watcher
+    # may interrupt from inside wait_motion_stable().
+    sent_state_tracker.record_sent(
+        state
     )
 
     settled_timestamp = (
@@ -1173,6 +1206,7 @@ def align_wrist(
     min_timestamp,
     threshold_px,
     max_commands,
+    sent_state_tracker,
 ):
     semantic_servo_config = VisualServoConfig(
         gain=1.0,
@@ -1481,6 +1515,9 @@ def align_wrist(
                 next_state,
                 motor_names,
                 label="XY",
+                sent_state_tracker=(
+                    sent_state_tracker
+                ),
             )
         )
 
@@ -2147,6 +2184,12 @@ def main():
             )
         )
 
+        sent_state_tracker = (
+            LatestSentXYZCommandState(
+                state
+            )
+        )
+
         controller = (
             SingleKeyPressController(
                 SingleKeyPressConfig(
@@ -2250,6 +2293,9 @@ def main():
                 max_commands=(
                     MAX_INITIAL_XY_COMMANDS
                 ),
+                sent_state_tracker=(
+                    sent_state_tracker
+                ),
             )
 
             while True:
@@ -2277,6 +2323,9 @@ def main():
                             state,
                             motor_names,
                             label="Z",
+                            sent_state_tracker=(
+                                sent_state_tracker
+                            ),
                         )
                     )
 
@@ -2341,6 +2390,9 @@ def main():
                         ),
                         max_commands=(
                             MAX_REALIGN_COMMANDS_PER_Z
+                        ),
+                        sent_state_tracker=(
+                            sent_state_tracker
                         ),
                     )
 
@@ -2436,6 +2488,9 @@ def main():
                                 f"{retract_index}/"
                                 f"{len(retract_targets)}"
                             ),
+                            sent_state_tracker=(
+                                sent_state_tracker
+                            ),
                         )
 
                         payload["events"].append(
@@ -2498,10 +2553,36 @@ def main():
             print("!" * 72)
             print(f"[SIDE EVENT] {event_details}")
 
+            # The interrupt may have escaped from inside align_wrist() after one
+            # or more local XY commands were already sent. The outer `state`
+            # assignment does not happen until align_wrist() returns, so it can
+            # legitimately be stale here. Always recover from the latest command
+            # state that actually passed send_action validation.
+            outer_state_before_event = state
+            state = sent_state_tracker.state
+
+            print(
+                "[SIDE EVENT STATE] "
+                "outer="
+                f"({outer_state_before_event.x_mm:+.2f},"
+                f"{outer_state_before_event.y_mm:+.2f},"
+                f"{outer_state_before_event.z_mm:+.2f})mm "
+                "latest_sent="
+                f"({state.x_mm:+.2f},"
+                f"{state.y_mm:+.2f},"
+                f"{state.z_mm:+.2f})mm"
+            )
+
             payload["events"].append(
                 {
                     "event": "side_press_event",
                     **event_details,
+                    "outer_xyz_mm": list(
+                        outer_state_before_event.xyz_mm
+                    ),
+                    "latest_sent_xyz_mm": list(
+                        state.xyz_mm
+                    ),
                 }
             )
 
@@ -2534,6 +2615,16 @@ def main():
                     state,
                     motor_names,
                     label=f"RELEASE {release_index}",
+                    sent_state_tracker=(
+                        sent_state_tracker
+                    ),
+                    event_capture_timestamp=(
+                        event_details.get(
+                            "capture_timestamp"
+                        )
+                        if release_index == 1
+                        else None
+                    ),
                 )
 
                 payload["events"].append(
@@ -2612,6 +2703,9 @@ def main():
                     state,
                     motor_names,
                     label=f"RETRACT {retract_index}/{len(retract_targets)}",
+                    sent_state_tracker=(
+                        sent_state_tracker
+                    ),
                 )
                 payload["events"].append(
                     {

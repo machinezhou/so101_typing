@@ -338,3 +338,27 @@ class FixedAnchorXYZCommandState:
         """Return to the handoff Z level while preserving cumulative XY."""
 
         return self.with_z_level(0.0)
+
+@dataclass(slots=True)
+class LatestSentXYZCommandState:
+    """Runtime record of the latest command state actually sent to the robot.
+
+    This is intentionally mutable while FixedAnchorXYZCommandState remains
+    immutable. It exists so asynchronous SIDE events can recover the latest
+    command-space XYZ even when an interrupt escapes from inside a nested WRIST
+    alignment call before that call returns its local state to the outer loop.
+    """
+
+    state: FixedAnchorXYZCommandState
+
+    def record_sent(
+        self,
+        state: FixedAnchorXYZCommandState,
+    ) -> None:
+        if state.anchor is not self.state.anchor:
+            raise ValueError(
+                "latest-sent command state must preserve the same FixedGoalAnchor"
+            )
+
+        self.state = state
+

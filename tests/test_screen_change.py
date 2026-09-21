@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 
 from so101_typing.perception.screen_change import (
+    FastScreenChangeConfig,
     FastScreenChangeModel,
 )
 
@@ -47,7 +48,16 @@ class TestFastScreenChange(unittest.TestCase):
             make_roi(cursor=False),
             make_roi(cursor=True),
         ]
-        return FastScreenChangeModel.from_baseline_rois(baseline)
+        # These tests exercise the ordinary 2-frame path only.
+        # Disable the strong-event fast path here so the two paths are
+        # tested independently.
+        return FastScreenChangeModel.from_baseline_rois(
+            baseline,
+            config=FastScreenChangeConfig(
+                strong_min_novel_pixels=10000,
+                strong_min_component_area_px=10000,
+            ),
+        )
 
     def test_cursor_blink_is_absorbed_by_baseline(self):
         model = self.make_model()
@@ -68,6 +78,36 @@ class TestFastScreenChange(unittest.TestCase):
         self.assertTrue(second.triggered)
         self.assertGreater(second.novel_pixels, 0)
         self.assertIsNotNone(second.bbox_xywh)
+
+
+    def test_strong_character_triggers_on_first_frame(self):
+        baseline = [
+            make_roi(cursor=False),
+            make_roi(cursor=True),
+            make_roi(cursor=False),
+            make_roi(cursor=True),
+        ]
+
+        model = FastScreenChangeModel.from_baseline_rois(
+            baseline,
+            config=FastScreenChangeConfig(
+                strong_min_novel_pixels=300,
+                strong_min_component_area_px=250,
+                required_consecutive_frames=2,
+            ),
+        )
+
+        first = model.observe(
+            make_roi(character=True)
+        )
+
+        self.assertTrue(first.changed)
+        self.assertTrue(first.strong_changed)
+        self.assertTrue(first.triggered)
+        self.assertEqual(
+            first.consecutive_frames,
+            1,
+        )
 
 
 if __name__ == "__main__":

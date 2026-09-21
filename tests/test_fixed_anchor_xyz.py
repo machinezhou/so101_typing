@@ -3,6 +3,7 @@ import unittest
 from so101_typing.control.fixed_anchor_xyz import (
     FixedAnchorXYZCommandState,
     FixedGoalAnchor,
+    LatestSentXYZCommandState,
     stepped_z_targets_to_zero,
 )
 
@@ -218,6 +219,67 @@ class TestFixedAnchorXYZ(unittest.TestCase):
                 0.0,
             ),
         )
+
+
+    def test_latest_sent_tracker_preserves_inner_xy_for_release(self):
+        state = FixedAnchorXYZCommandState.at_anchor(
+            self.make_anchor(),
+            max_xy_norm_mm=35.0,
+            max_xyz_norm_mm=80.0,
+        )
+
+        stale_outer = (
+            state
+            .with_xy_target(16.87, -4.56)
+            .with_z_level(-64.0)
+        )
+
+        tracker = LatestSentXYZCommandState(
+            stale_outer
+        )
+
+        latest_sent = stale_outer.with_xy_target(
+            18.78,
+            -7.05,
+        )
+
+        tracker.record_sent(
+            latest_sent
+        )
+
+        release = tracker.state.with_z_level(
+            -62.0
+        )
+
+        self.assertEqual(
+            release.xy_mm,
+            (18.78, -7.05),
+        )
+        self.assertEqual(
+            release.z_mm,
+            -62.0,
+        )
+        self.assertNotEqual(
+            release.xy_mm,
+            stale_outer.xy_mm,
+        )
+
+    def test_latest_sent_tracker_rejects_new_anchor(self):
+        first = FixedAnchorXYZCommandState.at_anchor(
+            self.make_anchor()
+        )
+        tracker = LatestSentXYZCommandState(
+            first
+        )
+
+        other = FixedAnchorXYZCommandState.at_anchor(
+            self.make_anchor()
+        )
+
+        with self.assertRaises(ValueError):
+            tracker.record_sent(
+                other
+            )
 
 
 if __name__ == "__main__":
