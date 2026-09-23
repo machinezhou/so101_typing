@@ -720,9 +720,10 @@ AND stable for N consecutive fresh frames
 
 This is a runtime handoff contract to be validated empirically. **Phase 6 formal
 demonstration collection must not use these conditions as operator guidance or as
-an automatic endpoint gate.** Phase 6 records the relevant measurements
-passively and establishes handoff ground truth later through full-episode replay
-plus real deterministic takeover.
+an automatic endpoint gate.** Phase 6 retains the raw WRIST observations and
+timing diagnostics needed for later analysis; handoff-related perception metrics
+may be computed offline when needed. Handoff ground truth is established later
+through full-episode replay plus real deterministic takeover.
 
 Handoff does **not** require millimetre-level ACT placement or a sub-20-pixel
 residual. Phase 3 hardware validation demonstrated successful deterministic
@@ -1566,8 +1567,9 @@ operator marks episode end
 ```
 
 The collector should trim preparation/reaction tail, store the full natural
-trajectory, and record WRIST handoff-related measurements only as passive
-metadata/diagnostics.
+trajectory, and retain raw WRIST observations plus timing diagnostics without
+running handoff perception online. Handoff-related perception metrics may be
+computed offline when needed.
 
 ### Episode-level qualification
 

@@ -726,7 +726,7 @@ def main() -> None:
         "--next",
         action="store_true",
         help=(
-            "Backward-compatible alias. v6 is batch mode, so --next means "
+            "Backward-compatible alias. v7 is batch mode, so --next means "
             "'validate all remaining QC-PASS episodes', not one episode."
         ),
     )
@@ -758,7 +758,7 @@ def main() -> None:
             max(1, int(args.required_passes)),
         )
         print("=" * 72)
-        print("PHASE 6E — BATCH VALIDATION v6")
+        print("PHASE 6E — BATCH VALIDATION v7")
         print("=" * 72)
         print("No remaining QC-PASS episode needs a first valid takeover trial.")
         print("verified manifest :", manifest_path)
