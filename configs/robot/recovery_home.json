@@ -1,0 +1,17 @@
+{
+  "schema": "so101_typing.robot_joint_pose.v1",
+  "name": "phase6_recovery_home",
+  "units": "degrees",
+  "action": {
+    "shoulder_pan.pos": -14.769230842590332,
+    "shoulder_lift.pos": -105.23076629638672,
+    "elbow_flex.pos": 95.9120864868164,
+    "wrist_flex.pos": 61.230770111083984,
+    "wrist_roll.pos": 3.2087912559509277,
+    "gripper.pos": 0.9314140677452087
+  },
+  "source": {
+    "summary_json": "artifacts/phase6_act_dataset/g_natural_v3/runs/run_20260923_103953/attempt_001_episode_001_home/summary.json",
+    "dataset_episode_index": 0
+  }
+}

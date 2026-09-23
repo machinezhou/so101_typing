@@ -60,61 +60,82 @@ on the MacBook using only physical keyboard interaction.
 
 ## Current Project Status
 
-Phases 0–5 are accepted. Phase 5 is now complete after the same deterministic
-single-key closed loop passed on three letter keys (`G`, `F`, and `H`) without
-per-key tuning. Phase 6 — Target-Conditioned ACT Dataset — is the next project
-phase.
+Phases 0–6 are accepted. The deterministic local single-key loop passed cross-key
+hardware acceptance on `G`, `F`, and `H` without per-key tuning of `p_tip`,
+`J_cmd`, SIDE thresholds, tracking, OCR, or press/release behavior. Phase 6 then
+completed the data-qualification bridge required before ACT training. **Phase 7 —
+ACT Coarse Policy — is now the active project phase.**
 
-The accepted Phase 5 physical/software loop now demonstrates:
+Phase 6 established a generic episode pipeline rather than a task-specific
+collector. Start-state coverage is an **external collection strategy/SOP**; the
+program does not contain `HOME`, `LEFT`, `RIGHT`, `FRONT`, or `RETRACT-LIKE`
+semantics and does not use those labels to alter collection, QC, or replay.
 
-- calibrated SO-101 follower/leader operation and stable teleoperation,
-- appearance-based WRIST target acquisition,
-- one immutable `Goal_Position` command-space anchor per deterministic attempt,
-- WRIST visual servoing with guarded semantic/geometry tracking through glyph
-  occlusion,
-- iterative cumulative Z descent with fresh WRIST observation and same-Z XY
-  correction,
-- independent SIDE screen rectification and conservative semantic verification,
-- a high-priority SIDE watcher with two event paths:
-  - a strong continuation-region glyph may latch on the first qualifying frame,
-  - ordinary smaller changes still require two consecutive frames,
-- immutable event ownership once latched: no later observation may authorize
-  more Z-down or XY chase in that attempt,
-- release from the latest actually-sent XYZ command state, preventing stale
-  outer-state XY rollback,
-- one upward `+20 commanded-mm` release escape before character classification,
-- released-character OCR after release,
-- segmented retract back to command-space `Z=0`,
-- successful end-to-end hardware runs on `G`, `F`, and `H`.
-
-Cross-key acceptance evidence:
+The completed Phase 6 funnel is:
 
 ``` text
-G  -> SUCCEEDED / SUCCESS
-F  -> SUCCEEDED / SUCCESS
-H  -> SUCCEEDED / SUCCESS
+natural human teleoperation episode
+        ↓
+generic collector
+        ↓
+automatic offline episode QC
+        ↓
+QC-PASS candidate episode
+        ↓
+full-rate physical replay of recorded actual sent actions
+        ↓
+seamless handoff at the recorded episode end
+        ↓
+real deterministic WRIST-servo takeover
+        ├── fail → exclude episode
+        └── pass → verified ACT episode
+        ↓
+verified episode manifest for Phase 7
 ```
 
-No per-key `p_tip`, `J_cmd`, tracking, OCR, SIDE-event, or press/release tuning
-was introduced for the F/H acceptance runs.
+The final Phase 6 contracts are:
 
-The F run latched a strong screen event at `Z=-28 commanded-mm`, preserved the
-latest-sent XY, released once to `Z=-8`, and classified `F` in 5/5 released-char
-frames. The H run also completed `SUCCEEDED / SUCCESS`; its released-character
-vote reached `CONFIRMED_SUCCESS` while preserving the same shared controller
-parameters.
+- the **whole episode** is the unit of collection, QC, replay validation, and
+  acceptance;
+- formal collection uses natural expert trajectories with no `d_tip` gate,
+  proximity radar, visual coaching, or automatic endpoint decision;
+- the operator marks the natural end of the coarse-approach demonstration;
+- ACT training samples are stored at 15 Hz, while a separate approximately 60 Hz
+  actual-sent-action trace preserves command history for physical replay;
+- observations are TOP RGB + WRIST RGB + six Present joint positions + 28D target
+  one-hot; SIDE/SCREEN pixels are excluded from the initial ACT observation;
+- the action stored for ACT is the actual absolute joint-position goal returned by
+  `robot.send_action(...)`, not merely the requested action;
+- offline QC removes clear data/trajectory defects but does not claim servo
+  readiness;
+- takeover ground truth is **full episode replay followed by the real deterministic
+  WRIST servo**, not a visual-distance threshold or a final-pose teleport;
+- Phase 6 acceptance stops after stable WRIST XY convergence. Z descent, SIDE
+  press detection, release, OCR, and retract remain Phase 5/Phase 8 concerns and
+  are intentionally excluded from per-episode Phase 6 acceptance;
+- replay validation runs candidate episodes as a batch: there is no HOME reset
+  between episodes, and the robot returns once at the end to the explicit recovery
+  pose in `configs/robot/recovery_home.json`;
+- safe transport may initialize from `Present_Position`, but deterministic WRIST
+  control still preserves the existing `Goal_Position` as its fixed command-space
+  anchor after takeover;
+- only replay/takeover-verified episode indices are eligible for Phase 7 training.
 
-Hardware diagnostics continue to confirm the Phase 3 command-space lesson under
-contact load: requested Cartesian millimetres are control-space units, not a
-claim of millimetre-level physical TCP positioning accuracy. Goal/Present
-under-tracking, load-dependent servo response, backlash/compliance, and improved
-motion-completion/contact sensing are deferred low-level optimization topics and
-are not blockers for the accepted Phase 5 architecture.
+Current verified Phase 6 evidence for target `G` includes dataset episodes
+`0`, `1`, `2`, `3`, and `5`. Raw episode `4` remains in the source dataset but was
+excluded after offline QC flagged a possible hesitation pause. The final
+replacement episode (`dataset_ep=5`) passed QC and physical replay/takeover:
+192 full-rate replay commands were sent with zero requested-to-sent difference,
+the WRIST takeover started at approximately `27.29 px` residual error and reached
+stable `2/2` acceptance at approximately `2.77 px`, and the batch then returned to
+the explicit recovery HOME with a final Goal difference of approximately
+`0.044 deg`.
 
-Phase 3 remains the deterministic motion foundation, Phase 4 remains the
-independent screen-verification foundation, and Phase 5 closes the local
-single-key interaction primitive. The project can now move to Phase 6 data
-collection for target-conditioned ACT coarse approach.
+Phase 3 remains the deterministic command-space foundation, Phase 4 remains the
+independent screen semantic verifier, and Phase 5 remains the accepted local
+press primitive. Phase 7 now trains the learned coarse-motion policy on the
+verified Phase 6 episodes before Phase 8 integrates learned approach with the
+already-validated deterministic handoff and press loop.
 
 ## Research Questions
 
@@ -344,7 +365,6 @@ TOP raw
 
 This enables a later leakage/ablation experiment without changing the
 physical setup.
-
 ## WRIST — local perception and precision control
 
 The WRIST camera is the primary precision sensor.
@@ -686,7 +706,8 @@ TargetObservation(
 )
 ```
 
-A first `servo_ready` rule can require:
+For the future Phase 8 runtime, a `servo_ready` rule may combine conditions such
+as:
 
 ``` text
 correct target label
@@ -696,6 +717,12 @@ AND complete usable target observation
 AND enough image-boundary margin for correction
 AND stable for N consecutive fresh frames
 ```
+
+This is a runtime handoff contract to be validated empirically. **Phase 6 formal
+demonstration collection must not use these conditions as operator guidance or as
+an automatic endpoint gate.** Phase 6 records the relevant measurements
+passively and establishes handoff ground truth later through full-episode replay
+plus real deterministic takeover.
 
 Handoff does **not** require millimetre-level ACT placement or a sub-20-pixel
 residual. Phase 3 hardware validation demonstrated successful deterministic
@@ -1491,8 +1518,8 @@ recording whenever possible.
 
 ## ACT typing dataset
 
-After the local deterministic loop is reliable, collect
-target-conditioned demonstrations.
+After the local deterministic loop is reliable, collect target-conditioned
+**natural coarse-approach episodes**.
 
 Recommended policy observations:
 
@@ -1506,32 +1533,114 @@ target-key condition
 Recommended action:
 
 ``` text
-SO-101 joint command
+SO-101 joint-position command actually sent to the follower
 ```
 
 Do not include the SIDE/SCREEN camera in the initial policy input.
 
-### Demonstration endpoint
+The initial V0 target vocabulary is:
 
-Teleoperation demonstrations should end at a **servo-ready viewpoint**,
-not at an arbitrary pose and not necessarily at physical contact.
+``` text
+A-Z + SPACE + BACKSPACE
+```
 
-Good endpoints have:
+and the target condition must be explicitly stored in every episode.
 
-- target visible,
-- target recognizable,
-- useful target pixel size,
-- limited tool occlusion,
-- safe press clearance.
+### Natural demonstration endpoint
 
-This teaches ACT to hand the problem to classical perception rather than
-to solve the entire contact task itself.
+The formal collector must not force the operator to chase a hard-coded image
+metric such as `d_tip <= 65 px`. Such a threshold may be useful during handoff
+experiments, but using it as a collection constraint changes the human trajectory
+and can contaminate the policy distribution.
+
+Instead, one demonstration is:
+
+``` text
+valid NOT_READY start
+        ↓
+natural continuous leader teleoperation
+        ↓
+operator completes the intended coarse approach
+        ↓
+operator marks episode end
+```
+
+The collector should trim preparation/reaction tail, store the full natural
+trajectory, and record WRIST handoff-related measurements only as passive
+metadata/diagnostics.
+
+### Episode-level qualification
+
+A raw collected episode is **not yet a training episode**. Qualification has two
+stages.
+
+First, offline episode QC rejects recordings with clear data or demonstration
+problems, for example:
+
+- missing/corrupt camera or robot data,
+- invalid target conditioning,
+- large unintended pauses or severe hesitation,
+- repeated strong reversals,
+- abnormal duration,
+- significant requested-to-sent action clamp,
+- unsafe or obviously pathological start/end states.
+
+Offline QC may use WRIST metrics to describe the endpoint, but those metrics are
+not ground truth for takeover success.
+
+Second, every remaining candidate episode is validated physically:
+
+``` text
+restore/reconstruct the episode start
+        ↓
+replay the recorded actual sent-action sequence in order
+        ↓
+reach the recorded episode endpoint with its command history
+        ↓
+without resetting to Present_Position or teleporting to the final pose
+        ↓
+seamlessly transfer command ownership to the deterministic WRIST servo
+        ↓
+run the real takeover
+        ├── FAIL    → reject the whole episode
+        └── SUCCESS → accept the whole episode
+```
+
+Full-sequence replay is preferred over commanding only the final joint vector
+because SO-101 backlash, dead zone, compliance, Goal/Present lag, and preload can
+make endpoint behavior history-dependent.
+
+### Final training-set contract
+
+The Phase 6 training set is therefore:
+
+``` text
+natural episode
++ offline QC passed
++ full replay passed
++ deterministic WRIST-servo takeover passed
+= verified ACT training episode
+```
+
+The **episode** is the acceptance unit. Individual frames remain necessary for
+ACT observation/action training and later analysis, but Phase 6 does not define a
+training example by searching each trajectory for an arbitrary “candidate
+handoff frame.” The recorded episode endpoint is the intended handoff boundary;
+physical replay/takeover validation decides whether that endpoint is acceptable.
+
+For robustness, a later acceptance policy may require repeated replay/takeover
+success for an episode (for example multiple successful trials). The exact repeat
+criterion should be frozen only after empirical replay stability is measured.
 
 ------------------------------------------------------------------------
 
 <!-- IMPLEMENTATION_PROGRESS:START -->
 
 # Implementation Progress and Current Checkpoint
+
+This section tracks the actual implementation and integration status of
+the project. The Development Roadmap below is updated when hardware evidence
+changes a phase boundary, command contract, or acceptance criterion.
 
 ## Overall Progress
 
@@ -1542,21 +1651,24 @@ to solve the entire contact task itself.
 | Phase 2  | Wrist Keycap Detection and Glyph Recognition        | **Completed** |
 | Phase 3  | Tool Reference and Visual Servo                     | **Completed** |
 | Phase 4  | Screen Rectification and Verification               | **Completed** |
-| Phase 5  | Deterministic Local Single-Key Closed Loop          | **Completed** |
-| Phase 6  | Target-Conditioned ACT Dataset                      | **IN PROGRESS — CURRENT** |
-| Phase 7  | ACT Coarse Policy                                   | Not Started |
+| Phase 5  | Deterministic Local Single-Key Closed Loop          | **Completed — G/F/H cross-key acceptance** |
+| Phase 6  | Target-Conditioned ACT Dataset                      | **Completed — generic collection + QC + physical replay/takeover verification** |
+| Phase 7  | ACT Coarse Policy                                   | **IN PROGRESS — verified-dataset training/inference** |
 | Phase 8  | ACT + Visual Servo Handoff                          | Not Started |
 | Phase 9  | Multi-Key Typing                                    | Not Started |
 | Phase 10 | Automatic Recovery                                  | Not Started |
 | Phase 11 | Controlled Generalization and Ablations             | Not Started |
 
+A phase is complete only after its acceptance criteria have been validated on
+the intended system.
+
 ## Current Phase
 
 ``` text
-Phase 6 — Target-Conditioned ACT Dataset
+Phase 7 — ACT Coarse Policy
 ```
 
-Accepted deterministic foundation:
+Current checkpoint:
 
 ``` text
 Phase 1 camera/software foundation                 ✓ COMPLETED
@@ -1565,43 +1677,49 @@ Phase 2 wrist perception                           ✓ COMPLETED
         ↓
 Phase 3 fixed Goal anchor + WRIST visual servo     ✓ COMPLETED
         ↓
-Phase 4 line OCR + four-state verifier             ✓ COMPLETED
+Phase 4 screen verification                        ✓ COMPLETED
         ↓
-Phase 5 fixed-anchor press supervisor              ✓
+Phase 5 deterministic G/F/H single-key loop        ✓ COMPLETED
         ↓
-iterative Z / fresh-WRIST / same-Z XY correction  ✓
+Phase 6 generic natural episode collector          ✓ COMPLETED
         ↓
-SIDE strong/confirmed event latch                  ✓
+Phase 6 automatic offline QC                       ✓ COMPLETED
         ↓
-latest-sent command-state ownership                ✓
+Phase 6 full-rate physical replay                  ✓ COMPLETED
         ↓
-one +20 commanded-mm upward release                ✓
+Phase 6 deterministic WRIST takeover validation    ✓ COMPLETED
         ↓
-released single-character OCR                      ✓
+verified episode manifest                          ✓ COMPLETED
         ↓
-segmented retract to command-space Z=0             ✓
+Phase 7 ACT training dataset construction          ← CURRENT
         ↓
-G  SUCCEEDED / SUCCESS                             ✓
-F  SUCCEEDED / SUCCESS                             ✓
-H  SUCCEEDED / SUCCESS                             ✓
-        ↓
-PHASE 5 ACCEPTED                                   ✓
-        ↓
-Target-conditioned ACT dataset                     ← CURRENT
+ACT training / inference characterization          ← NEXT
 ```
 
-Phase 5 acceptance is specifically cross-key: the same `p_tip`, `J_cmd`,
-tracking logic, SIDE event detector, OCR configuration, and press/release
-parameters were retained across `G`, `F`, and `H`.
+The accepted Phase 6 implementation is deliberately task-neutral at the tooling
+layer. Collection strategy is external to the collector: an operator or future
+experiment scheduler decides which initial-state distribution to cover, while
+the collector simply records generic target-conditioned episodes. QC evaluates
+data and trajectory quality, not start-class labels. Replay validation evaluates
+an episode by physically replaying its actual sent-action history and asking
+whether the deterministic WRIST servo can take over and converge.
 
-Low-level SO-101 Goal/Present tracking under load remains a deferred performance
-optimization. The accepted controller depends on WRIST for local XY authority
-and SIDE for physical press outcome, rather than assuming millimetre-level TCP
-execution from command-space millimetres.
+The Phase 6 source dataset retains raw episodes for auditability. Training uses a
+verified-episode manifest so rejected/review episodes can remain available for
+debugging without silently entering policy training.
 
-Temporary patch installers, generated debug images, cross-key logs, telemetry
-files, and backup directories under `artifacts/` are not runtime source and
-should not be committed.
+The accepted Phase 6 runtime-support tools are:
+
+``` text
+scripts/phase6_act_dataset_collector.py
+scripts/phase6_episode_qc.py
+scripts/phase6_replay_takeover_validate.py
+scripts/export_episode_start_pose.py
+configs/robot/recovery_home.json
+```
+
+Earlier guided-boundary, assisted-collector, and fixed start-class pilot scripts
+were development experiments and are not part of the retained Phase 6 interface.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
@@ -1800,7 +1918,7 @@ Phase 5 physical press loop.
 
 ------------------------------------------------------------------------
 
-## Phase 5 — Deterministic Local Single-Key Closed Loop — **Completed**
+## Phase 5 — Deterministic Local Single-Key Closed Loop — **Completed — G/F/H cross-key acceptance**
 
 Goal:
 
@@ -1809,12 +1927,12 @@ Goal:
 > screen-change evidence with independent SIDE vision, release immediately,
 > verify the released character, and retract safely.
 
-Accepted loop:
+Current implemented loop:
 
 ``` text
-requested key
+target=G
    ↓
-WRIST recognizes target and latches semantic identity
+WRIST recognizes G and latches semantic identity
    ↓
 p_key -> p_tip visual alignment
    ↓
@@ -1824,16 +1942,16 @@ stop + fresh WRIST / same-Z XY realignment as needed
    ↓
 SIDE watcher continuously checks continuation-region change
    ├── no event + stable NO_CHANGE → one more Z step
-   ├── strong new glyph → latch on first qualifying frame
+   ├── strong new glyph → latch on first changed frame
    └── ordinary smaller change → latch after 2 consecutive frames
            ↓
        PRESS_EVENT_LATCHED
            ↓
        permanently forbid more Z-down / XY chase
            ↓
-       recover latest actually-sent XYZ command state
+       use latest actually-sent XYZ command state
            ↓
-       one +20 commanded-mm upward release escape
+       one +20 commanded-mm upward release
            ↓
        single-character OCR on released new component
            ↓
@@ -1842,78 +1960,253 @@ SIDE watcher continuously checks continuation-region change
        segmented retract (<=10 commanded-mm Z per segment)
 ```
 
-### Hardware acceptance
+### Current hardware checkpoint
 
-The same deterministic loop passed on three letter keys without per-key tuning:
+The current G run passed cleanly:
 
-``` text
-G  -> SUCCEEDED / SUCCESS
-F  -> SUCCEEDED / SUCCESS
-H  -> SUCCEEDED / SUCCESS
-```
+- strong SIDE event detected on the first changed frame;
+- event evidence was approximately `765` novel pixels with a largest connected
+  component of approximately `765 px`;
+- event-to-release-command latency was approximately `17.6 ms`;
+- release preserved the latest actually-sent XY command state;
+- release changed command-space Z from `-42` to `-22` in one upward escape;
+- released-character OCR produced `G / Q / G / G / Q`, resulting in
+  `CONFIRMED_SUCCESS`;
+- segmented retract returned command-space Z to `0`;
+- final controller state was `SUCCEEDED`, outcome `SUCCESS`.
 
-Shared across all three runs:
+The earlier event-interrupt stale-state bug is fixed. The release path no longer
+uses the stale outer control state when an event arrives during an inner WRIST
+motion; it uses the latest command that was actually sent to the robot.
 
-- direct WRIST `p_tip`,
-- canonical `J_cmd`,
-- semantic/geometry tracking,
-- SIDE event thresholds,
-- OCR configuration,
-- iterative press policy,
-- latest-sent command-state ownership,
-- one `+20 commanded-mm` release escape,
-- segmented retract.
-
-The F acceptance run produced a strong SIDE event with approximately `579`
-novel pixels / `579 px` largest component, preserved the latest-sent XY, released
-from `Z=-28` to `Z=-8`, and classified `F` in 5/5 released-character frames.
-
-The H acceptance run also reached `CONFIRMED_SUCCESS` and final
-`SUCCEEDED / SUCCESS` using the same shared parameters.
-
-The earlier event-interrupt stale-state bug is fixed: if SIDE interrupts while
-an inner WRIST command is in flight, release uses the latest command state that
-actually passed `send_action` validation instead of stale outer-loop XY.
-
-### Deferred low-level optimization
+### Low-level tracking note
 
 Phase 5 does not require millimetre-level physical TCP tracking from the SO-101.
-As established in Phase 3, command-space millimetres are control units, not a
-guarantee of equal measured TCP displacement.
+As already established in Phase 3, command-space millimetres are control units,
+not a guarantee of equal measured TCP displacement.
 
-Servo telemetry showed that release can cross the physical keyboard release
-point even when `Present_Position` does not fully converge to `Goal_Position`
-before motion becomes stable. Load-dependent tracking, backlash/compliance,
-better goal-reached semantics, and optional contact/load sensing are deferred
-performance optimizations.
+Servo telemetry from the latest G checkpoint showed that the upward release
+produced enough physical motion to cross the keyboard release point, while the
+arm became motion-stable before `Present_Position` fully converged to
+`Goal_Position`. Load-dependent Goal/Present tracking, backlash/compliance,
+motion-completion semantics, and possible contact/load sensing are therefore
+deferred performance optimizations, not blockers for the deterministic typing
+architecture.
 
-### Phase 5 acceptance result
+### Cross-key acceptance
 
-Phase 5 is accepted.
+Phase 5 acceptance is complete. The same deterministic loop passed on `G`, `F`,
+and `H` without per-key tuning of `p_tip`, `J_cmd`, OCR, tracking, SIDE-event, or
+press/release parameters. This freezes the deterministic local controller as the
+downstream takeover target for Phase 6 replay validation.
 
-The deterministic local single-key primitive is now frozen as the foundation
-for Phase 6. Future changes to this primitive should be regression-tested against
-the accepted `G/F/H` behavior before being used by ACT handoff experiments.
+Keep `scripts/validate_phase3_xyz.py` as the Phase 3 hardware regression validator
+and `scripts/validate_phase5_single_key.py` as the Phase 5 hardware
+acceptance/regression runner.
 
-## Phase 6 — Target-Conditioned ACT Dataset
+Current supervised validation intentionally has no arbitrary cumulative-Z
+software cap (`max_descent_mm=None`); the operator remains the absolute-depth
+safety authority. A future autonomous version must add a physically meaningful
+safety bound without requiring ACT to start at a fixed distance from the
+keyboard.
+
+### Phase 5 code organization
+
+The following modules are intended implementation code:
+
+- `fixed_anchor_xyz.py`
+- `fixed_anchor_planner.py`
+- `semantic_target_lock.py`
+- `screen_change.py`
+- `press_controller.py`
+- `validate_phase5_single_key.py`
+- their focused unit/regression tests.
+
+Temporary patch installers, generated telemetry/debug outputs, and backup
+directories under `artifacts/` are transition/debug artifacts and should not be
+committed.
+
+## Phase 6 — Target-Conditioned ACT Dataset — **Completed**
 
 Goal:
 
-> Collect demonstrations that move the arm from valid starts to
-> perception-aware handoff poses.
+> Build a target-conditioned ACT dataset whose demonstrations are natural human
+> coarse-approach trajectories **and whose episode endpoints are physically
+> verified to support deterministic WRIST-servo takeover**.
 
-Record:
+Phase 6 is complete as an episode-level collection, qualification, and physical
+validation pipeline.
 
-- TOP RGB,
-- WRIST RGB,
-- joint state,
-- target key,
-- action,
-- timestamps.
+### 6A — Generic natural episode collection
 
-The target condition must be part of every episode’s data schema.
+The retained collector is intentionally neutral with respect to collection
+strategy. It does not know or enforce semantic start classes such as HOME, LEFT,
+RIGHT, FRONT, or RETRACT-LIKE. Coverage of the initial-state distribution belongs
+to an external experiment SOP or future scheduler.
 
-Do not include screen-camera pixels in the ACT observation.
+The collector owns only generic episode mechanics:
+
+- target-conditioned episode recording;
+- automatic arm/countdown timing;
+- true-motion start detection after arming;
+- TOP + WRIST + robot state + target condition capture;
+- actual `robot.send_action(...)` result stored as the action;
+- operator-controlled natural episode end with `s`/SPACE;
+- discard/retry support with `q`;
+- preparation/reaction tail exclusion from the saved demonstration;
+- 15 Hz ACT samples plus a separate approximately 60 Hz actual-sent-action trace
+  for physical replay;
+- audit/performance diagnostics stored separately from policy observations.
+
+No SIDE pixels, press actions, OCR results, proximity cue, fixed `d_tip` endpoint,
+or autonomous motion belong in the formal ACT demonstration stream.
+
+### 6B — Automatic offline episode QC
+
+Offline QC evaluates the episode itself, not the collection strategy that
+produced its start state. Example checks include:
+
+``` text
+schema / image / state / action completeness
+valid target encoding
+actual sent-action continuity
+unintended long pauses / hesitation
+strong repeated reversals
+abnormal duration
+significant requested-to-sent clamp
+control-loop timing / sample misses
+```
+
+A QC PASS produces a replay candidate. REVIEW/FAIL episodes remain in the raw
+source dataset for audit/debugging but are excluded from the verified training
+manifest unless later replaced or explicitly requalified.
+
+### 6C — Full-rate physical replay and deterministic takeover
+
+Each QC-PASS candidate is validated on hardware:
+
+``` text
+restore recorded episode start
+        ↓
+replay the recorded actual sent-action sequence with original timing
+        ↓
+reach the recorded episode endpoint with its command history
+        ↓
+transfer ownership directly to deterministic WRIST servo
+        ↓
+run real local XY takeover
+        ├── FAIL    → exclude episode
+        └── SUCCESS → verified episode
+```
+
+The validator does not teleport to the final joint vector. Full replay is needed
+because SO-101 dead zone, backlash, compliance, preload, and Goal/Present lag make
+endpoint behavior history-dependent.
+
+Phase 6 takeover acceptance deliberately stops at **stable WRIST XY alignment**.
+It does not descend Z, press the key, run SIDE event detection, release, OCR, or
+retract. Those mechanics are already validated in Phase 5 and are integrated
+with the learned policy later in Phase 8.
+
+For deterministic takeover, the existing servo `Goal_Position` remains the fixed
+command-space anchor. `Present_Position` may be used before an experiment for
+safe transport initialization and diagnostics, but is not repeatedly promoted to
+a new precision-control origin.
+
+### 6D — Batch validation and recovery contract
+
+Physical validation is batch-oriented:
+
+``` text
+explicit recovery HOME
+        ↓
+episode A start -> replay -> WRIST takeover
+        ↓
+current physical pose -> episode B start
+        ↓
+episode B replay -> WRIST takeover
+        ↓
+...
+        ↓
+final explicit recovery HOME
+        ↓
+safe disconnect
+```
+
+There is no HOME reset between candidate episodes. The final recovery pose is
+robot configuration, not dataset semantics, and is stored explicitly at:
+
+``` text
+configs/robot/recovery_home.json
+```
+
+`scripts/export_episode_start_pose.py` is a generic pose-export utility used to
+create such robot pose configuration from a deliberately selected known-safe
+recorded pose. The replay validator itself never searches for a dataset episode
+whose label happens to mean HOME.
+
+### 6E — Final verified dataset contract
+
+Initial policy feature contract:
+
+``` text
+observation.images.top    : RGB
+observation.images.wrist  : RGB
+observation.state         : 6 Present joint positions + 28D target one-hot
+action                    : 6 actual sent absolute joint-position goals
+task                      : approach_key:<TARGET>
+```
+
+Initial target vocabulary:
+
+``` text
+A-Z, SPACE, BACKSPACE
+```
+
+The SIDE/SCREEN camera is excluded from ACT observations.
+
+The final acceptance unit is the whole episode:
+
+``` text
+natural human demo
++ offline QC PASS
++ full physical replay
++ deterministic WRIST-servo takeover PASS
+= verified ACT episode
+```
+
+### Phase 6 acceptance evidence
+
+The Phase 6 G dataset now contains five physically verified episodes:
+
+``` text
+dataset episodes: 0, 1, 2, 3, 5
+```
+
+Raw episode `4` was retained but excluded after offline QC reported a possible
+hesitation pause. The replacement episode `5` provided a clean final acceptance
+case:
+
+- collection: 49 saved 15 Hz samples over approximately `3.21 s`;
+- collection control: approximately `59.8 Hz`, no loop overruns, no sample misses,
+  no requested-to-sent action difference;
+- offline QC: PASS;
+- physical replay: 192 full-rate control samples, `0.000 deg` maximum sent-action
+  difference, approximately `2.0 ms` maximum schedule lateness;
+- WRIST takeover: approximately `27.29 px` initial residual;
+- stable takeover acceptance: approximately `2.91 px` then `2.77 px`, satisfying
+  the required `2/2` fresh-frame tolerance condition;
+- final batch recovery: explicit recovery HOME restored with approximately
+  `0.044 deg` Goal difference before disconnect.
+
+Earlier verified episodes exercised substantially different operator-selected
+initial poses and also completed full physical replay followed by deterministic
+WRIST convergence. Those initial-state categories were part of the experiment
+strategy only and are not program semantics.
+
+Phase 6 is therefore frozen as **Completed**. Phase 7 consumes only the verified
+episode manifest and begins ACT training/inference work; the rejected/review raw
+episodes remain available for debugging but must not silently enter training.
 
 ------------------------------------------------------------------------
 
@@ -2072,10 +2365,13 @@ occlusion rate
 Measure:
 
 ``` text
-coarse approach success rate
-servo-ready handoff rate
+raw episode collection acceptance rate
+offline-QC pass rate
+full-replay success rate
+WRIST-servo takeover success rate
+verified-episode yield
+coarse approach success rate after training
 target visibility after ACT
-target pixel size after ACT
 approach time
 failure / timeout rate
 ```
@@ -2179,6 +2475,7 @@ so101_typing/
 │   │   ├── wrist.yaml
 │   │   └── screen.yaml
 │   ├── robot/
+│   │   └── recovery_home.json
 │   ├── perception/
 │   ├── visual_servo/
 │   ├── press/
@@ -2245,7 +2542,10 @@ so101_typing/
 │   ├── validate_phase3_xyz.py
 │   ├── validate_phase4_screen_verification.py
 │   ├── validate_phase5_single_key.py
-│   ├── collect_act_data.py
+│   ├── phase6_act_dataset_collector.py
+│   ├── phase6_episode_qc.py
+│   ├── phase6_replay_takeover_validate.py
+│   ├── export_episode_start_pose.py
 │   ├── train_act.py
 │   └── run_typing_demo.py
 │
@@ -2272,9 +2572,10 @@ so101_typing/
 
 # First End-to-End Milestone
 
-The deterministic local portion of the first milestone has now been accepted
-across `G`, `F`, and `H` from safe manually positioned local poses. The **full hybrid
-ACT+deterministic milestone** remains future work.
+The deterministic local portion of the first milestone has been demonstrated, and
+Phase 6 has now established a physically verified ACT demonstration pipeline for
+target `G`. The **full hybrid ACT+deterministic milestone** still requires Phase 7
+policy training and Phase 8 runtime handoff integration.
 
 Current achieved deterministic behavior:
 
@@ -2305,11 +2606,15 @@ controller SUCCEEDED
 Remaining work before the complete first hybrid milestone:
 
 ``` text
+train Phase 7 ACT on Phase 6 verified episodes
+        ↓
+characterize inference latency / action-chunk execution
+        ↓
 ACT uses TOP + WRIST + state + target=G
         ↓
-ACT creates the same kind of servo-ready local viewpoint
+ACT creates a servo-takeover-compatible local viewpoint
         ↓
-perception-triggered handoff preserves existing Goal_Position
+Phase 8 clears stale ACT ownership and preserves existing Goal_Position
         ↓
 run the already-validated deterministic local loop
 ```
