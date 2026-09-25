@@ -1200,7 +1200,6 @@ def main() -> None:
                 batch_records.append(record)
                 manifest_path = _refresh_verified_manifest(
                     run_dir,
-                    target,
                     max(1, int(args.required_passes)),
                 )
                 print("validation record :", validation_path)
@@ -1335,7 +1334,6 @@ def main() -> None:
 
     manifest_path = _refresh_verified_manifest(
         run_dir,
-        target,
         max(1, int(args.required_passes)),
     )
     print("verified manifest:", manifest_path)
