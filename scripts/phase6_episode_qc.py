@@ -11,14 +11,30 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 
 ARTIFACT_ROOT = Path("artifacts/phase6_act_dataset")
+FORMAL_DATASET_BASE = ARTIFACT_ROOT / "keyboard_v1"
+FORMAL_RUNS_ROOT = FORMAL_DATASET_BASE / "runs"
+
 TARGET_VOCAB = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + ("SPACE", "BACKSPACE")
 
 
 def _latest_run(target: str) -> Path:
-    root = ARTIFACT_ROOT / f"{target.lower()}_natural_v3" / "runs"
-    runs = sorted(p for p in root.glob("run_*") if p.is_dir())
+    target = str(target).strip().upper()
+
+    root = FORMAL_RUNS_ROOT
+    runs = sorted(
+        p
+        for p in root.glob(
+            f"run_*_{target.lower()}"
+        )
+        if p.is_dir()
+    )
+
     if not runs:
-        raise FileNotFoundError(f"No Phase 6 v3 runs found under {root}")
+        raise FileNotFoundError(
+            f"No formal Phase 6 runs for target={target} "
+            f"found under {root}"
+        )
+
     return runs[-1]
 
 
@@ -250,21 +266,90 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Phase 6D generic episode-level QC. Start-state strategy is outside this tool; no Rerun/manual viewing is required for PASS episodes."
     )
-    parser.add_argument("--target", default="G")
-    parser.add_argument("--run-dir", type=Path, default=None)
+    parser.add_argument(
+        "--target",
+        default=None,
+        help=(
+            "A-Z target used only to locate the latest formal run "
+            "when --run-dir is omitted. The authoritative target "
+            "is read from run_summary.json."
+        ),
+    )
+
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+    )
+
     args = parser.parse_args()
 
-    target = str(args.target).strip().upper()
-    if target not in TARGET_VOCAB[:26]:
-        raise ValueError("Current Phase 6 QC expects a single A-Z target")
+    requested_target = None
 
-    run_dir = args.run_dir or _latest_run(target)
-    run_summary_path = run_dir / "run_summary.json"
+    if args.target is not None:
+        requested_target = (
+            str(args.target)
+            .strip()
+            .upper()
+        )
+
+        if requested_target not in TARGET_VOCAB[:26]:
+            raise ValueError(
+                "Formal V1 QC currently supports A-Z targets"
+            )
+
+    if args.run_dir is not None:
+        run_dir = args.run_dir
+    else:
+        if requested_target is None:
+            raise RuntimeError(
+                "Provide --target A-Z or an explicit --run-dir"
+            )
+
+        run_dir = _latest_run(
+            requested_target
+        )
+
+    run_summary_path = (
+        run_dir / "run_summary.json"
+    )
+
     if not run_summary_path.exists():
-        raise FileNotFoundError(run_summary_path)
-    run_summary = _read_json(run_summary_path)
-    repo_id = str(run_summary["repo_id"])
-    dataset_root = Path(run_summary["dataset_root"])
+        raise FileNotFoundError(
+            run_summary_path
+        )
+
+    run_summary = _read_json(
+        run_summary_path
+    )
+
+    target = (
+        str(run_summary["target"])
+        .strip()
+        .upper()
+    )
+
+    if target not in TARGET_VOCAB[:26]:
+        raise ValueError(
+            f"Run target is not supported by formal V1: {target}"
+        )
+
+    if (
+        requested_target is not None
+        and requested_target != target
+    ):
+        raise RuntimeError(
+            "--target does not match run_summary.json: "
+            f"requested={requested_target}, run={target}"
+        )
+
+    repo_id = str(
+        run_summary["repo_id"]
+    )
+
+    dataset_root = Path(
+        run_summary["dataset_root"]
+    )
 
     summaries = sorted(run_dir.glob("attempt_*/summary.json"))
     results: list[dict] = []

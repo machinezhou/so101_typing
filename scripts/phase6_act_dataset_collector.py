@@ -36,6 +36,15 @@ TOP_CAMERA_CONFIG = Path("configs/cameras/top.yaml")
 WRIST_CAMERA_CONFIG = Path("configs/cameras/wrist.yaml")
 ARTIFACT_ROOT = Path("artifacts/phase6_act_dataset")
 
+# Formal multi-target dataset.
+#
+# All A-Z demonstrations append to ONE LeRobot dataset.  Target identity
+# remains encoded only in observation.state/task; collection source zones
+# remain external SOP and are never dataset labels.
+FORMAL_DATASET_BASE = ARTIFACT_ROOT / "keyboard_v1"
+FORMAL_DATASET_ROOT = FORMAL_DATASET_BASE / "lerobot_dataset"
+FORMAL_REPO_ID = "local/so101_typing_act_raw_keyboard_v1"
+
 # Formal natural collection performs no online visual analysis.
 # WRIST images are stored raw and any perception diagnostics run offline.
 
@@ -1192,6 +1201,15 @@ def main() -> None:
     parser.add_argument("--leader-port", default=LEADER_PORT)
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--repo-id", default=None)
+    parser.add_argument(
+        "--runs-root",
+        type=Path,
+        default=None,
+        help=(
+            "Audit/run-summary root. Defaults to <dataset-root-parent>/runs, "
+            "so all targets belonging to one shared dataset have one run history."
+        ),
+    )
     parser.add_argument("--task", default=None, help="LeRobot task string stored with each episode; defaults to target_key:<TARGET>.")
     parser.add_argument("--no-sound", action="store_true")
     parser.add_argument(
@@ -1226,7 +1244,11 @@ def main() -> None:
 
     target = str(args.target).strip().upper()
     if target not in TARGET_VOCAB[:26]:
-        raise ValueError("Current Phase 6 target-conditioned collector supports single A-Z targets")
+        raise ValueError(
+            "Formal V1 collection currently supports A-Z targets. "
+            "SPACE/BACKSPACE remain reserved in the 28D target schema "
+            "until deterministic WRIST takeover support is validated."
+        )
     if args.episodes < 1:
         raise ValueError("--episodes must be >= 1")
     if not math.isfinite(args.arm_countdown_s) or args.arm_countdown_s <= 0.0:
@@ -1239,10 +1261,24 @@ def main() -> None:
     dataset_root = (
         args.dataset_root
         if args.dataset_root is not None
-        else ARTIFACT_ROOT / f"{target.lower()}_natural_v3" / "lerobot_dataset"
+        else FORMAL_DATASET_ROOT
     )
-    repo_id = args.repo_id or f"local/so101_typing_act_raw_{target.lower()}_natural_v3"
-    sounds = SoundGuide(ARTIFACT_ROOT / "sounds", enabled=not args.no_sound)
+
+    repo_id = (
+        args.repo_id
+        or FORMAL_REPO_ID
+    )
+
+    runs_root = (
+        args.runs_root
+        if args.runs_root is not None
+        else dataset_root.parent / "runs"
+    )
+
+    sounds = SoundGuide(
+        ARTIFACT_ROOT / "sounds",
+        enabled=not args.no_sound,
+    )
 
     _print_config(
         target,
@@ -1300,8 +1336,16 @@ def main() -> None:
     committer = DatasetCommitter(dataset)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = ARTIFACT_ROOT / f"{target.lower()}_natural_v3" / "runs" / f"run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+
+    run_dir = (
+        runs_root
+        / f"run_{timestamp}_{target.lower()}"
+    )
+
+    run_dir.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
 
     top = ThreadedOpenCVCamera(top_spec)
     wrist = ThreadedOpenCVCamera(wrist_spec)

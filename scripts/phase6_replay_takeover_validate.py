@@ -43,6 +43,9 @@ ROBOT_PORT = "/dev/ttyACM0"
 ROBOT_ID = "lawson_follower_arm"
 MAX_RELATIVE_TARGET_DEG = 10.0
 ARTIFACT_ROOT = Path("artifacts/phase6_act_dataset")
+FORMAL_DATASET_BASE = ARTIFACT_ROOT / "keyboard_v1"
+FORMAL_RUNS_ROOT = FORMAL_DATASET_BASE / "runs"
+
 WRIST_CAMERA_CONFIG = Path("configs/cameras/wrist.yaml")
 GLYPH_MODEL = Path("artifacts/models/glyph_hog_svm")
 TOOL_REFERENCE = Path("calibration/tool_reference.json")
@@ -52,10 +55,23 @@ RECOVERY_HOME_CONFIG = Path("configs/robot/recovery_home.json")
 
 
 def _latest_run(target: str) -> Path:
-    root = ARTIFACT_ROOT / f"{target.lower()}_natural_v3" / "runs"
-    runs = sorted(p for p in root.glob("run_*") if p.is_dir())
+    target = str(target).strip().upper()
+
+    root = FORMAL_RUNS_ROOT
+    runs = sorted(
+        p
+        for p in root.glob(
+            f"run_*_{target.lower()}"
+        )
+        if p.is_dir()
+    )
+
     if not runs:
-        raise FileNotFoundError(f"No Phase 6 v3 runs found under {root}")
+        raise FileNotFoundError(
+            f"No formal Phase 6 runs for target={target} "
+            f"found under {root}"
+        )
+
     return runs[-1]
 
 
@@ -533,75 +549,233 @@ def _append_validation(episode_dir: Path, record: dict) -> Path:
     return path
 
 
-def _refresh_verified_manifest(run_dir: Path, target: str, required_passes: int) -> Path:
-    """Build a dataset-level verified manifest across every collection run.
+def _refresh_verified_manifest(
+    run_dir: Path,
+    required_passes: int,
+) -> Path:
+    """Build one verified manifest for the shared formal dataset.
 
-    Collection runs are only audit/session boundaries. The LeRobot dataset is appendable,
-    so training eligibility is keyed by global dataset_episode_index and must be aggregated
-    across runs. No start-state strategy metadata participates in this decision.
+    Collection runs remain per-target audit/session boundaries, but every
+    accepted episode belongs to the same appendable LeRobot dataset.
+    Eligibility is therefore keyed by global dataset_episode_index.
+
+    The manifest aggregates all completed takeover validations under the
+    shared keyboard_v1/runs directory and preserves each episode's target.
     """
-    runs_root = run_dir.parent if run_dir.parent.name == "runs" else run_dir
-    run_dirs = sorted(p for p in runs_root.glob("run_*") if p.is_dir())
-    if not run_dirs and run_dir.is_dir():
-        run_dirs = [run_dir]
 
+    runs_root = (
+        run_dir.parent
+        if run_dir.parent.name == "runs"
+        else FORMAL_RUNS_ROOT
+    )
+
+    run_dirs = sorted(
+        p
+        for p in runs_root.glob("run_*")
+        if p.is_dir()
+    )
+
+    if not run_dirs:
+        raise RuntimeError(
+            f"No formal collection runs found under {runs_root}"
+        )
+
+    locations: set[tuple[str, str]] = set()
     by_index: dict[int, dict] = {}
+
     for source_run in run_dirs:
-        for summary_path in sorted(source_run.glob("attempt_*/summary.json")):
-            summary = _read_json(summary_path)
-            if not summary.get("accepted") or "dataset_episode_index" not in summary:
+        run_summary_path = (
+            source_run / "run_summary.json"
+        )
+
+        if not run_summary_path.exists():
+            continue
+
+        run_summary = _read_json(
+            run_summary_path
+        )
+
+        source_target = (
+            str(run_summary["target"])
+            .strip()
+            .upper()
+        )
+
+        locations.add(
+            (
+                str(run_summary["repo_id"]),
+                str(run_summary["dataset_root"]),
+            )
+        )
+
+        for summary_path in sorted(
+            source_run.glob(
+                "attempt_*/summary.json"
+            )
+        ):
+            summary = _read_json(
+                summary_path
+            )
+
+            if (
+                not summary.get("accepted")
+                or "dataset_episode_index"
+                not in summary
+            ):
                 continue
-            validation_path = summary_path.parent / "takeover_validation.json"
+
+            validation_path = (
+                summary_path.parent
+                / "takeover_validation.json"
+            )
+
             if not validation_path.exists():
                 continue
-            validation = _read_json(validation_path)
-            idx = int(summary["dataset_episode_index"])
-            entry = by_index.setdefault(
-                idx,
-                {
+
+            validation = _read_json(
+                validation_path
+            )
+
+            episode_target = (
+                str(
+                    validation.get(
+                        "target",
+                        source_target,
+                    )
+                )
+                .strip()
+                .upper()
+            )
+
+            if episode_target != source_target:
+                raise RuntimeError(
+                    "Validation target does not match collection run: "
+                    f"run={source_target}, validation={episode_target}, "
+                    f"path={validation_path}"
+                )
+
+            idx = int(
+                summary[
+                    "dataset_episode_index"
+                ]
+            )
+
+            entry = by_index.get(idx)
+
+            if entry is None:
+                entry = {
                     "dataset_episode_index": idx,
+                    "target": episode_target,
                     "pass_trials": 0,
                     "fail_trials": 0,
                     "invalid_trials": 0,
                     "sources": [],
-                },
+                }
+
+                by_index[idx] = entry
+
+            elif entry["target"] != episode_target:
+                raise RuntimeError(
+                    "One dataset_episode_index is associated with "
+                    "multiple targets: "
+                    f"episode={idx}, "
+                    f"{entry['target']} vs {episode_target}"
+                )
+
+            entry["pass_trials"] += int(
+                validation.get(
+                    "pass_trials",
+                    0,
+                )
             )
-            entry["pass_trials"] += int(validation.get("pass_trials", 0))
-            entry["fail_trials"] += int(validation.get("fail_trials", 0))
-            entry["invalid_trials"] += int(validation.get("invalid_trials", 0))
+
+            entry["fail_trials"] += int(
+                validation.get(
+                    "fail_trials",
+                    0,
+                )
+            )
+
+            entry["invalid_trials"] += int(
+                validation.get(
+                    "invalid_trials",
+                    0,
+                )
+            )
+
             entry["sources"].append(
                 {
-                    "run_dir": str(source_run),
-                    "summary_json": str(summary_path),
-                    "validation_json": str(validation_path),
+                    "run_dir": str(
+                        source_run
+                    ),
+                    "summary_json": str(
+                        summary_path
+                    ),
+                    "validation_json": str(
+                        validation_path
+                    ),
                 }
             )
 
+    if len(locations) != 1:
+        raise RuntimeError(
+            "Formal runs do not resolve to exactly one "
+            f"shared LeRobot dataset: {sorted(locations)}"
+        )
+
+    repo_id, dataset_root = next(
+        iter(locations)
+    )
+
     details: list[dict] = []
     verified: list[int] = []
+
     for idx in sorted(by_index):
         entry = by_index[idx]
+
         ok = (
-            int(entry["pass_trials"]) >= required_passes
-            and int(entry["fail_trials"]) == 0
+            int(entry["pass_trials"])
+            >= required_passes
+            and int(entry["fail_trials"])
+            == 0
         )
+
         item = dict(entry)
         item["verified"] = bool(ok)
+
         details.append(item)
+
         if ok:
             verified.append(idx)
 
-    dataset_scope_root = runs_root.parent if runs_root.name == "runs" else runs_root
-    path = dataset_scope_root / "verified_episodes.json"
+    verified_targets = sorted(
+        {
+            item["target"]
+            for item in details
+            if item["verified"]
+        }
+    )
+
+    path = (
+        runs_root.parent
+        / "verified_episodes.json"
+    )
+
     path.write_text(
         json.dumps(
             {
-                "schema": "phase6.verified_episode_manifest.v3",
-                "target": target,
+                "schema": (
+                    "phase6.verified_episode_manifest.v4"
+                ),
+                "dataset_repo_id": repo_id,
+                "dataset_root": dataset_root,
+                "targets": verified_targets,
                 "required_pass_trials": required_passes,
                 "policy": (
-                    "episode-level QC PASS + physical full replay + seamless WRIST stable XY "
-                    "alignment; press/SIDE/OCR excluded; aggregated across collection runs"
+                    "episode-level QC PASS + physical full replay + "
+                    "seamless WRIST stable XY alignment; "
+                    "press/SIDE/OCR excluded; aggregated across all "
+                    "formal A-Z collection runs"
                 ),
                 "dataset_episode_indices": verified,
                 "episodes": details,
@@ -612,8 +786,8 @@ def _refresh_verified_manifest(run_dir: Path, target: str, required_passes: int)
         + "\n",
         encoding="utf-8",
     )
-    return path
 
+    return path
 
 def _qc_candidate_indices(run_dir: Path) -> list[int]:
     candidates_path = run_dir / "qc_candidates.json"
@@ -711,7 +885,15 @@ def main() -> None:
             "between episodes. Canonical HOME recovery happens exactly once after the batch."
         )
     )
-    parser.add_argument("--target", default="G")
+    parser.add_argument(
+        "--target",
+        default=None,
+        help=(
+            "A-Z target used only to locate the latest formal run "
+            "when --run-dir is omitted. The authoritative target "
+            "is read from run_summary.json."
+        ),
+    )
     parser.add_argument(
         "--episode",
         type=int,
@@ -739,8 +921,69 @@ def main() -> None:
     parser.add_argument("--allow-unchecked", action="store_true")
     args = parser.parse_args()
 
-    target = str(args.target).strip().upper()
-    run_dir = args.run_dir or _latest_run(target)
+    requested_target = None
+
+    if args.target is not None:
+        requested_target = (
+            str(args.target)
+            .strip()
+            .upper()
+        )
+
+        if requested_target not in tuple(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        ):
+            raise ValueError(
+                "Formal V1 replay validation currently "
+                "supports A-Z targets"
+            )
+
+    if args.run_dir is not None:
+        run_dir = args.run_dir
+    else:
+        if requested_target is None:
+            raise RuntimeError(
+                "Provide --target A-Z or an explicit --run-dir"
+            )
+
+        run_dir = _latest_run(
+            requested_target
+        )
+
+    run_summary_path = (
+        run_dir / "run_summary.json"
+    )
+
+    if not run_summary_path.exists():
+        raise FileNotFoundError(
+            run_summary_path
+        )
+
+    run_summary = _read_json(
+        run_summary_path
+    )
+
+    target = (
+        str(run_summary["target"])
+        .strip()
+        .upper()
+    )
+
+    if target not in tuple(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    ):
+        raise ValueError(
+            f"Run target is not supported by formal V1: {target}"
+        )
+
+    if (
+        requested_target is not None
+        and requested_target != target
+    ):
+        raise RuntimeError(
+            "--target does not match run_summary.json: "
+            f"requested={requested_target}, run={target}"
+        )
 
     if args.episode is not None and args.all:
         raise RuntimeError("--episode and --all are mutually exclusive")
@@ -754,8 +997,10 @@ def main() -> None:
     if not candidates:
         manifest_path = _refresh_verified_manifest(
             run_dir,
-            target,
-            max(1, int(args.required_passes)),
+            max(
+                1,
+                int(args.required_passes),
+            ),
         )
         print("=" * 72)
         print("PHASE 6E — BATCH VALIDATION v7")

@@ -121,21 +121,42 @@ The final Phase 6 contracts are:
   anchor after takeover;
 - only replay/takeover-verified episode indices are eligible for Phase 7 training.
 
-Current verified Phase 6 evidence for target `G` includes dataset episodes
-`0`, `1`, `2`, `3`, and `5`. Raw episode `4` remains in the source dataset but was
-excluded after offline QC flagged a possible hesitation pause. The final
-replacement episode (`dataset_ep=5`) passed QC and physical replay/takeover:
-192 full-rate replay commands were sent with zero requested-to-sent difference,
-the WRIST takeover started at approximately `27.29 px` residual error and reached
-stable `2/2` acceptance at approximately `2.77 px`, and the batch then returned to
-the explicit recovery HOME with a final Goal difference of approximately
-`0.044 deg`.
+A temporary `G` pilot dataset was used to validate the complete Phase 6 → Phase 7
+pipeline, including offline QC, full physical replay, deterministic WRIST takeover,
+verified-only normalization, ACT forward/backward/optimizer execution, and
+checkpoint serialization. That pilot dataset and its derived training artifacts
+were intentionally deleted after validation so the formal dataset can be collected
+from a clean, unified SOP. Its conclusions remain valid as engineering evidence,
+but it is no longer a current training input.
 
 Phase 3 remains the deterministic command-space foundation, Phase 4 remains the
 independent screen semantic verifier, and Phase 5 remains the accepted local
-press primitive. Phase 7 now trains the learned coarse-motion policy on the
-verified Phase 6 episodes before Phase 8 integrates learned approach with the
-already-validated deterministic handoff and press loop.
+press primitive. Phase 7 has validated the ACT training-input, temporal, and
+single-GPU training path. The current work is therefore no longer basic ACT
+plumbing: it is the **formal target-conditioned keyboard dataset collection stage**
+that precedes the first full policy training.
+
+The accepted Phase 7 infrastructure contract is:
+
+- formal A-Z demonstrations append to one shared LeRobot dataset under
+  `artifacts/phase6_act_dataset/keyboard_v1`;
+- training samples are selected only by the dataset-level verified-episode
+  manifest (`phase6.verified_episode_manifest.v4`);
+- rejected/review raw episodes may remain in the raw dataset for audit/debugging,
+  but only verified episode indices are eligible for training;
+- normalization statistics are recomputed from exactly the verified subset rather
+  than reusing repository-wide `meta.stats`;
+- verified episode count and verified frame count are dynamic contract outputs,
+  not hard-coded pilot constants;
+- ACT runs at 15 Hz with `chunk_size=20`, corresponding to a `1.267 s`
+  first-to-last action span and `1.333 s` worth of 20 commanded actions;
+- `n_action_steps` is intentionally **not frozen yet** and will be selected after
+  trained-policy inference-latency/runtime characterization;
+- the training entry point uses the official LeRobot 0.6.1 ACT model,
+  preprocessors, optimizer preset, ResNet18 backbone, and ImageNet initialization,
+  while the project-specific wrapper injects verified-only normalization stats;
+- batch size `8` completed forward/backward/optimizer/checkpoint smoke validation
+  on the current RTX 5070 Ti with approximately `3.19 GiB` peak CUDA allocation.
 
 ## Research Questions
 
@@ -1655,7 +1676,7 @@ changes a phase boundary, command contract, or acceptance criterion.
 | Phase 4  | Screen Rectification and Verification               | **Completed** |
 | Phase 5  | Deterministic Local Single-Key Closed Loop          | **Completed — G/F/H cross-key acceptance** |
 | Phase 6  | Target-Conditioned ACT Dataset                      | **Completed — generic collection + QC + physical replay/takeover verification** |
-| Phase 7  | ACT Coarse Policy                                   | **IN PROGRESS — verified-dataset training/inference** |
+| Phase 7  | ACT Coarse Policy                                   | **IN PROGRESS — training path validated; formal keyboard dataset collection current** |
 | Phase 8  | ACT + Visual Servo Handoff                          | Not Started |
 | Phase 9  | Multi-Key Typing                                    | Not Started |
 | Phase 10 | Automatic Recovery                                  | Not Started |
@@ -1673,55 +1694,153 @@ Phase 7 — ACT Coarse Policy
 Current checkpoint:
 
 ``` text
-Phase 1 camera/software foundation                 ✓ COMPLETED
+Phase 1 camera/software foundation                   ✓ COMPLETED
         ↓
-Phase 2 wrist perception                           ✓ COMPLETED
+Phase 2 wrist perception                             ✓ COMPLETED
         ↓
-Phase 3 fixed Goal anchor + WRIST visual servo     ✓ COMPLETED
+Phase 3 fixed Goal anchor + WRIST visual servo       ✓ COMPLETED
         ↓
-Phase 4 screen verification                        ✓ COMPLETED
+Phase 4 screen verification                          ✓ COMPLETED
         ↓
-Phase 5 deterministic G/F/H single-key loop        ✓ COMPLETED
+Phase 5 deterministic G/F/H single-key loop          ✓ COMPLETED
         ↓
-Phase 6 generic natural episode collector          ✓ COMPLETED
+Phase 6 generic collection + QC + replay/takeover    ✓ COMPLETED
         ↓
-Phase 6 automatic offline QC                       ✓ COMPLETED
+Phase 7A verified-only training input                ✓ COMPLETED
         ↓
-Phase 6 full-rate physical replay                  ✓ COMPLETED
+Phase 7B temporal contract: 15 Hz / chunk_size=20    ✓ COMPLETED
         ↓
-Phase 6 deterministic WRIST takeover validation    ✓ COMPLETED
+Phase 7C ACT forward/backward/checkpoint integration ✓ COMPLETED
         ↓
-verified episode manifest                          ✓ COMPLETED
+Phase 7D formal keyboard dataset collection          ← CURRENT
         ↓
-Phase 7 ACT training dataset construction          ← CURRENT
+freeze formal verified dataset                       ← NEXT
         ↓
-ACT training / inference characterization          ← NEXT
+ACT training / inference / n_action_steps study      FUTURE
+        ↓
+Phase 8 learned-to-deterministic runtime handoff      FUTURE
 ```
 
-The accepted Phase 6 implementation is deliberately task-neutral at the tooling
-layer. Collection strategy is external to the collector: an operator or future
-experiment scheduler decides which initial-state distribution to cover, while
-the collector simply records generic target-conditioned episodes. QC evaluates
-data and trajectory quality, not start-class labels. Replay validation evaluates
-an episode by physically replaying its actual sent-action history and asking
-whether the deterministic WRIST servo can take over and converge.
+Phase 7A established the verified-only training-input contract using the temporary
+`G` pilot. The important retained result is structural rather than pilot-specific:
+LeRobot episode filtering does not recompute repository-level `meta.stats`, so
+Phase 7 must recompute and persist normalization statistics from exactly the same
+verified episode subset used for training. The temporary pilot dataset used to
+prove this behavior has since been deleted.
 
-The Phase 6 source dataset retains raw episodes for auditability. Training uses a
-verified-episode manifest so rejected/review episodes can remain available for
-debugging without silently entering policy training.
-
-The accepted Phase 6 runtime-support tools are:
+Phase 7B froze the training-side temporal contract at:
 
 ``` text
-scripts/phase6_act_dataset_collector.py
-scripts/phase6_episode_qc.py
-scripts/phase6_replay_takeover_validate.py
-scripts/export_episode_start_pose.py
-configs/robot/recovery_home.json
+fps                         = 15 Hz
+n_obs_steps                 = 1
+chunk_size                  = 20
+action delta indices        = 0..19
+first-to-last action span   = 1.267 s
+20-command duration         = 1.333 s
+verified frame count        = dynamic from formal manifest/dataset
+padding / full-window stats = recomputed from the formal verified subset
+n_action_steps              = NOT FROZEN
 ```
 
-Earlier guided-boundary, assisted-collector, and fixed start-class pilot scripts
-were development experiments and are not part of the retained Phase 6 interface.
+The default ACT `chunk_size=100` was rejected during the pilot temporal audit; the
+formal tooling retains `chunk_size=20` and recomputes padding/full-window coverage
+from the actual verified formal dataset rather than carrying forward pilot counts.
+
+Phase 7C then validated the real LeRobot ACT path end to end. The retained
+training wrapper calls official LeRobot 0.6.1 components (`LeRobotDataset`,
+`ACTConfig`, `ACTPolicy`, official pre/post processors, optimizer preset, and
+checkpoint serialization). Project code owns only the typing-specific training
+selection/contracts, especially verified-only normalization injection. The
+current single-GPU validation uses the official ResNet18 ImageNet initialization;
+`batch_size=8` completed one real forward/backward/optimizer step and checkpoint
+save with approximately `3.19 GiB` peak CUDA allocation on the RTX 5070 Ti.
+
+The retained Phase 7 tools are:
+
+``` text
+scripts/phase7_act_training_input.py
+scripts/phase7_act_temporal_contract.py
+scripts/phase7_train_act.py
+tests/test_phase7_act_training_input.py
+tests/test_phase7_act_temporal_contract.py
+```
+
+The one-off `phase7_act_smoke_test.py` forward-only integration probe is superseded
+by `phase7_train_act.py --steps 1` and is not part of the retained interface.
+
+### Formal keyboard collection strategy — V1
+
+The initial production-scale dataset is a **single shared target-conditioned ACT
+dataset**, not one independent dataset/policy per key. The observation schema
+retains the 28D target vocabulary:
+
+``` text
+A-Z, SPACE, BACKSPACE
+```
+
+Formal V1 collection currently covers **A-Z only**. `SPACE` and `BACKSPACE` remain
+reserved target dimensions until their deterministic WRIST takeover support has
+been validated to the same standard as the letter keys.
+
+The V1 base quota is:
+
+``` text
+26 letter targets × 6 representative source zones × 1 verified episode
+= 156 verified episodes
+```
+
+Each target is demonstrated once from each representative source zone:
+
+| Zone | External SOP meaning | Representative keyboard neighborhood |
+|------|----------------------|--------------------------------------|
+| `S0` | HOME / safe start | explicit normal startup state |
+| `S1` | upper-left source region | around `Q/W/E` |
+| `S2` | upper-right source region | around `I/O/P/BACKSPACE` |
+| `S3` | center source region | around `F/G/H/J` |
+| `S4` | lower-left source region | around `Z/X/C` |
+| `S5` | lower-right source region | around `B/N/M/SPACE` |
+
+These are **collection SOP regions, not dataset labels or collector semantics**.
+They must not be hard-coded into the generic collector, QC tool, replay validator,
+or ACT observation. A zone describes a region rather than one fixed six-joint
+pose; natural position, joint-configuration, and height variation are expected.
+Height is therefore not an independent low/medium/high quota and does not multiply
+the dataset size.
+
+For every target, the base collection plan is:
+
+| Target | S0 | S1 | S2 | S3 | S4 | S5 | Verified total |
+|--------|---:|---:|---:|---:|---:|---:|---------------:|
+| each of `A-Z` | 1 | 1 | 1 | 1 | 1 | 1 | 6 |
+| **all 26 V1 targets** | **26** | **26** | **26** | **26** | **26** | **26** | **156** |
+
+Collection rules:
+
+- demonstrations remain natural, continuous human coarse-approach trajectories;
+- do not manufacture pauses, detours, or repeated micro-corrections merely to add
+  apparent diversity;
+- start height should resemble realistic HOME/retract operating states and may
+  vary naturally, but height is not a separate combinatorial dimension;
+- demonstration end means a viewpoint/state from which the deterministic WRIST
+  servo can take over; ACT is not trained to perform the final key press;
+- the formal acceptance unit remains the whole episode: offline QC PASS + full
+  actual-sent-action replay + real deterministic WRIST stable-takeover PASS;
+- rejected/review episodes remain in the immutable raw source dataset but do not
+  count toward the 156 verified quota;
+- after the first full policy is trained and tested, additional demonstrations are
+  added **only where rollout failures show a coverage gap**, rather than repeating
+  every source-target combination uniformly.
+
+The deleted temporary `G` pilot remains historical Phase 7 pipeline evidence only.
+No pilot episode is carried into the formal quota. Formal V1 starts from a clean
+shared `keyboard_v1` dataset and follows the same source-zone SOP for every A-Z
+target.
+
+The accepted Phase 6 implementation remains deliberately task-neutral at the
+tooling layer. Collection strategy is external to the collector, QC evaluates
+data/trajectory quality rather than source-zone labels, and replay validation
+asks only whether the recorded whole episode physically supports deterministic
+WRIST takeover.
 
 <!-- IMPLEMENTATION_PROGRESS:END -->
 
@@ -2217,19 +2336,153 @@ episodes remain available for debugging but must not silently enter training.
 Goal:
 
 > Given TOP + WRIST + robot state + requested key, move to a servo-ready
-> local viewpoint.
+> local viewpoint using one shared target-conditioned ACT policy.
+
+ACT does not need to press the key. Deterministic WRIST visual servoing remains
+responsible for final local XY alignment, and the Phase 5 press/SIDE/OCR/retract
+loop remains outside ACT.
+
+### 7A — Verified-only training input — **Completed**
+
+The Phase 6 source dataset is immutable. A verified manifest selects eligible
+training episodes, and Phase 7 computes normalization statistics from exactly that
+same subset rather than from raw repository-wide metadata.
+
+Current formal contract:
+
+``` text
+source dataset         = artifacts/phase6_act_dataset/keyboard_v1
+verified manifest      = phase6.verified_episode_manifest.v4
+verified episodes      = dynamic from manifest
+verified frames        = dynamic from selected episodes
+LeRobot                = 0.6.1
+```
+
+Retained implementation:
+
+``` text
+scripts/phase7_act_training_input.py
+tests/test_phase7_act_training_input.py
+```
+
+### 7B — ACT temporal contract — **Completed**
+
+The training-side temporal horizon is frozen at:
+
+``` text
+fps                         = 15 Hz
+chunk_size                  = 20
+first-to-last action span   = 1.267 s
+20-command duration         = 1.333 s
+episode-tail padding        = recomputed from formal verified subset
+full-window coverage        = recomputed from formal verified subset
+```
+
+`n_action_steps` is a separate runtime replanning/execution-horizon decision and
+is intentionally not frozen during dataset construction/training-input work.
+
+Retained implementation:
+
+``` text
+scripts/phase7_act_temporal_contract.py
+tests/test_phase7_act_temporal_contract.py
+```
+
+### 7C — ACT training-path integration — **Completed**
+
+The project uses official LeRobot ACT internals rather than a reimplementation of
+ACT. `scripts/phase7_train_act.py` supplies the project-specific verified subset,
+verified-only normalization, and frozen temporal contract, then calls the official
+LeRobot dataset/model/processor/optimizer/checkpoint APIs.
+
+Validated configuration includes:
+
+``` text
+ACT backbone             = ResNet18
+backbone initialization  = ResNet18_Weights.IMAGENET1K_V1
+batch_size               = 8
+chunk_size               = 20
+verified normalization   = exact formal verified subset only
+```
+
+A real one-step forward/backward/optimizer/checkpoint run passed on the RTX 5070
+Ti with approximately `3.19 GiB` peak CUDA allocation. The earlier standalone
+forward-only smoke script is no longer retained because the training entry point
+now subsumes that test.
+
+### 7D — Formal target-conditioned keyboard dataset — **Current**
+
+The V1 dataset is designed as one shared target-conditioned policy dataset with a
+28D target schema but an A-Z-only first collection pass:
+
+``` text
+schema targets = A-Z + SPACE + BACKSPACE (28D reserved vocabulary)
+V1 collected targets = A-Z (26 targets)
+6 representative source zones per collected target
+1 verified episode per source-target pair
+---------------------------------------------------
+156 verified base episodes
+```
+
+`SPACE` and `BACKSPACE` are not part of the V1 quota. They can be appended later
+to the same schema/dataset family after deterministic WRIST takeover support is
+validated for those keys.
+
+Representative source zones:
+
+``` text
+S0  HOME / safe startup
+S1  upper-left keyboard region     (~Q/W/E)
+S2  upper-right keyboard region    (~I/O/P/BACKSPACE)
+S3  center keyboard region         (~F/G/H/J)
+S4  lower-left keyboard region     (~Z/X/C)
+S5  lower-right keyboard region    (~B/N/M/SPACE)
+```
+
+The source zones are external SOP regions only. They are not labels in the ACT
+dataset and are not program semantics in the collector/QC/replay tools. Each zone
+allows natural position, height, and joint-configuration variation. Height is not
+a separate combinatorial quota.
+
+Each episode remains subject to the existing Phase 6 acceptance funnel:
+
+``` text
+natural demonstration
+        ↓
+offline QC PASS
+        ↓
+full physical replay of actual sent actions
+        ↓
+real deterministic WRIST takeover PASS
+        ↓
+verified formal training episode
+```
+
+After the 156-episode base dataset is trained and evaluated, additional data is
+collected only for source-target regions that show actual rollout failures.
+
+### Phase 7 remaining acceptance work
+
+After formal data collection:
+
+- freeze the final verified multi-target manifest and matching normalization stats;
+- train the first full target-conditioned ACT policy;
+- characterize offline loss/checkpoints only as needed to support model selection;
+- measure policy inference latency and observation-to-action age;
+- choose `n_action_steps`/replanning cadence from measured runtime behavior;
+- evaluate target-neighborhood arrival, target visibility, and deterministic
+  WRIST-takeover success before Phase 8 integration.
 
 Evaluate:
 
 - target-neighborhood arrival rate,
 - target acquisition rate after ACT,
-- servo-ready rate,
+- servo-ready / WRIST-takeover rate,
 - target visibility,
 - target pixel size,
 - occlusion rate,
-- time to handoff.
-
-ACT does not need to press the key.
+- time to handoff,
+- inference latency and observation-to-action age.
 
 ------------------------------------------------------------------------
 
@@ -2548,7 +2801,9 @@ so101_typing/
 │   ├── phase6_episode_qc.py
 │   ├── phase6_replay_takeover_validate.py
 │   ├── export_episode_start_pose.py
-│   ├── train_act.py
+│   ├── phase7_act_training_input.py
+│   ├── phase7_act_temporal_contract.py
+│   ├── phase7_train_act.py
 │   └── run_typing_demo.py
 │
 ├── tests/
@@ -2558,7 +2813,9 @@ so101_typing/
 │   ├── test_state_machine.py
 │   ├── test_recovery.py
 │   ├── test_target_encoding.py
-│   └── test_controller_ownership.py
+│   ├── test_controller_ownership.py
+│   ├── test_phase7_act_training_input.py
+│   └── test_phase7_act_temporal_contract.py
 │
 ├── docs/
 │   ├── architecture.md
@@ -2574,10 +2831,11 @@ so101_typing/
 
 # First End-to-End Milestone
 
-The deterministic local portion of the first milestone has been demonstrated, and
-Phase 6 has now established a physically verified ACT demonstration pipeline for
-target `G`. The **full hybrid ACT+deterministic milestone** still requires Phase 7
-policy training and Phase 8 runtime handoff integration.
+The deterministic local portion of the first milestone has been demonstrated,
+Phase 6 established a physically verified ACT demonstration pipeline, and Phase 7
+has now validated the verified-only ACT training path on the `G` seed set. The
+**full hybrid ACT+deterministic milestone** still requires the formal
+multi-target dataset, trained ACT policy, and Phase 8 runtime handoff integration.
 
 Current achieved deterministic behavior:
 
@@ -2608,11 +2866,13 @@ controller SUCCEEDED
 Remaining work before the complete first hybrid milestone:
 
 ``` text
-train Phase 7 ACT on Phase 6 verified episodes
+collect / QC / replay-verify the formal 28-target base dataset
         ↓
-characterize inference latency / action-chunk execution
+freeze verified manifest + matching verified-only normalization stats
         ↓
-ACT uses TOP + WRIST + state + target=G
+train target-conditioned ACT with 15 Hz / chunk_size=20
+        ↓
+characterize inference latency and choose n_action_steps
         ↓
 ACT creates a servo-takeover-compatible local viewpoint
         ↓
