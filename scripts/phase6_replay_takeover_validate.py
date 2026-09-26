@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import sys
 import time
 from pathlib import Path
 import numpy as np
@@ -52,6 +54,28 @@ TOOL_REFERENCE = Path("calibration/tool_reference.json")
 IMAGE_JACOBIAN = Path("calibration/image_jacobian.json")
 URDF = Path.home() / ".cache/huggingface/lerobot/robot-urdfs/so101/so101_new_calib.urdf"
 RECOVERY_HOME_CONFIG = Path("configs/robot/recovery_home.json")
+
+
+def _ansi(text: str, code: str) -> str:
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _green(text: str) -> str:
+    return _ansi(text, "1;32")
+
+
+def _yellow(text: str) -> str:
+    return _ansi(text, "1;33")
+
+
+def _red(text: str) -> str:
+    return _ansi(text, "1;31")
+
+
+def _bold(text: str) -> str:
+    return _ansi(text, "1")
 
 
 def _latest_run(target: str) -> Path:
@@ -1319,26 +1343,93 @@ def main() -> None:
         if robot.is_connected and recovery_ok:
             robot.disconnect()
 
-    print()
-    print("=" * 72)
-    print("BATCH VALIDATION SUMMARY")
-    print("=" * 72)
-    counts: dict[str, int] = {}
-    for record in batch_records:
-        counts[record["status"]] = counts.get(record["status"], 0) + 1
-        print(
-            f"dataset_ep={record['dataset_episode_index']:03d} "
-            f"status={record['status']}"
-        )
-    print("counts:", counts)
-
     manifest_path = _refresh_verified_manifest(
         run_dir,
         max(1, int(args.required_passes)),
     )
     print("verified manifest:", manifest_path)
 
-    if aborted or any(r["status"] != "PASS" for r in batch_records):
+    # Human-oriented result block is intentionally the final terminal output.
+    print()
+    print("=" * 72)
+    print("BATCH VALIDATION SUMMARY")
+    print("=" * 72)
+
+    counts: dict[str, int] = {}
+    for record in batch_records:
+        status = str(record["status"])
+        counts[status] = counts.get(status, 0) + 1
+
+        marker = "✓" if status == "PASS" else "✗"
+        line = (
+            f"{marker} dataset_ep={int(record['dataset_episode_index']):03d}   "
+            f"{status}"
+        )
+
+        if status == "PASS":
+            print(_green(line))
+        else:
+            print(_red(line))
+            error = record.get("error")
+            if error:
+                print(_red(f"  reason: {error}"))
+
+    print("-" * 72)
+
+    ordered_statuses = (
+        "PASS",
+        "FAIL",
+        "INVALID_REPLAY",
+        "ABORTED",
+    )
+    count_line = "    ".join(
+        f"{status}: {counts[status]}"
+        for status in ordered_statuses
+        if status in counts
+    )
+    if not count_line:
+        count_line = "NO RESULTS"
+
+    needs_action = (
+        aborted
+        or any(
+            record["status"] != "PASS"
+            for record in batch_records
+        )
+    )
+
+    if needs_action:
+        print(_red(count_line))
+        failed_indices = [
+            int(record["dataset_episode_index"])
+            for record in batch_records
+            if record["status"] != "PASS"
+        ]
+
+        print()
+        print("!" * 72)
+        print(_red("ACTION REQUIRED"))
+        if failed_indices:
+            print(
+                _red(
+                    "FAILED EPISODES: "
+                    + ", ".join(
+                        f"{idx:03d}"
+                        for idx in failed_indices
+                    )
+                )
+            )
+        if aborted:
+            print(_red("BATCH ABORTED"))
+        print("!" * 72)
+    else:
+        print(_green(count_line))
+        print()
+        print("=" * 72)
+        print(_green("ALL EPISODES PASS"))
+        print("=" * 72)
+
+    if needs_action:
         raise SystemExit(2)
 
 

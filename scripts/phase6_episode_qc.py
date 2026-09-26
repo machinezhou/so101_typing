@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +17,28 @@ FORMAL_DATASET_BASE = ARTIFACT_ROOT / "keyboard_v1"
 FORMAL_RUNS_ROOT = FORMAL_DATASET_BASE / "runs"
 
 TARGET_VOCAB = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + ("SPACE", "BACKSPACE")
+
+
+def _ansi(text: str, code: str) -> str:
+    if not sys.stdout.isatty() or "NO_COLOR" in os.environ:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _green(text: str) -> str:
+    return _ansi(text, "1;32")
+
+
+def _yellow(text: str) -> str:
+    return _ansi(text, "1;33")
+
+
+def _red(text: str) -> str:
+    return _ansi(text, "1;31")
+
+
+def _bold(text: str) -> str:
+    return _ansi(text, "1")
 
 
 def _latest_run(target: str) -> Path:
@@ -414,10 +438,16 @@ def main() -> None:
         results.append(item)
         reasons = fail or review
         suffix = "" if not reasons else " | " + "; ".join(reasons)
-        print(
+        line = (
             f"[{status:6}] dataset_ep={episode_index:03d} "
             f"episode={item['episode_number']:02d}{suffix}"
         )
+        if status == "PASS":
+            print(_green(line))
+        elif status == "REVIEW":
+            print(_yellow(line))
+        else:
+            print(_red(line))
 
     report = {
         "schema": "phase6.episode_qc.v2",
@@ -456,6 +486,67 @@ def main() -> None:
     print("replay candidates:", candidates)
     print("report        :", report_path)
     print("candidate list:", candidates_path)
+
+    # Human-oriented summary is intentionally last so it remains visible
+    # after long diagnostic output.
+    print()
+    print("=" * 72)
+    print("QC SUMMARY")
+    print("=" * 72)
+
+    for item in results:
+        status = str(item["status"])
+        marker = "✓" if status == "PASS" else "!"
+        reasons = item["fail_reasons"] or item["review_reasons"]
+        suffix = "" if not reasons else " — " + "; ".join(reasons)
+        line = (
+            f"{marker} dataset_ep={int(item['dataset_episode_index']):03d}   "
+            f"{status}{suffix}"
+        )
+
+        if status == "PASS":
+            print(_green(line))
+        elif status == "REVIEW":
+            print(_yellow(line))
+        else:
+            print(_red(line))
+
+    print("-" * 72)
+    counts = report["counts"]
+    count_line = (
+        f"PASS: {counts['pass']}    "
+        f"REVIEW: {counts['review']}    "
+        f"FAIL: {counts['fail']}"
+    )
+
+    attention = [
+        item for item in results
+        if item["status"] != "PASS"
+    ]
+
+    if counts["fail"]:
+        print(_red(count_line))
+    elif counts["review"]:
+        print(_yellow(count_line))
+    else:
+        print(_green(count_line))
+
+    if attention:
+        banner_color = _red if counts["fail"] else _yellow
+        details = "  ".join(
+            f"{int(item['dataset_episode_index']):03d}({item['status']})"
+            for item in attention
+        )
+        print()
+        print("!" * 72)
+        print(banner_color("ACTION REQUIRED"))
+        print(banner_color(f"NON-PASS EPISODES: {details}"))
+        print("!" * 72)
+    else:
+        print()
+        print("=" * 72)
+        print(_green("ALL QC EPISODES PASS"))
+        print("=" * 72)
 
 
 if __name__ == "__main__":
