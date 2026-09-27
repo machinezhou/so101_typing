@@ -16,6 +16,7 @@ if str(SCRIPTS) not in sys.path:
 from phase6_target_scope import (  # noqa: E402
     collect_target_episode_sources,
     has_completed_validation,
+    should_auto_retry_validation,
     target_qc_dir,
 )
 
@@ -209,12 +210,84 @@ class Phase6TargetScopeTest(unittest.TestCase):
                     has_completed_validation(summary)
                 )
 
-    def test_invalid_or_aborted_remains_retryable(self) -> None:
+    def test_invalid_is_not_completed_ground_truth(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            episode_dir = Path(td) / "INVALID_REPLAY"
+            summary = episode_dir / "summary.json"
+
+            write_json(
+                summary,
+                {
+                    "accepted": True,
+                    "dataset_episode_index": 1,
+                },
+            )
+            write_json(
+                episode_dir / "takeover_validation.json",
+                {
+                    "trials": [
+                        {"status": "INVALID_REPLAY"}
+                    ]
+                },
+            )
+
+            self.assertFalse(
+                has_completed_validation(summary)
+            )
+
+    def test_pass_fail_invalid_are_not_auto_retried(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
 
             for status in (
+                "PASS",
+                "FAIL",
                 "INVALID_REPLAY",
+            ):
+                episode_dir = root / status
+                summary = episode_dir / "summary.json"
+
+                write_json(
+                    summary,
+                    {
+                        "accepted": True,
+                        "dataset_episode_index": 1,
+                    },
+                )
+                write_json(
+                    episode_dir / "takeover_validation.json",
+                    {
+                        "trials": [
+                            {"status": status}
+                        ]
+                    },
+                )
+
+                self.assertFalse(
+                    should_auto_retry_validation(
+                        summary
+                    )
+                )
+
+    def test_aborted_unknown_or_missing_are_auto_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+
+            missing_summary = root / "MISSING" / "summary.json"
+            write_json(
+                missing_summary,
+                {
+                    "accepted": True,
+                    "dataset_episode_index": 1,
+                },
+            )
+            self.assertTrue(
+                should_auto_retry_validation(
+                    missing_summary
+                )
+            )
+
+            for status in (
                 "ABORTED",
                 "UNKNOWN",
             ):
@@ -237,9 +310,39 @@ class Phase6TargetScopeTest(unittest.TestCase):
                     },
                 )
 
-                self.assertFalse(
-                    has_completed_validation(summary)
+                self.assertTrue(
+                    should_auto_retry_validation(
+                        summary
+                    )
                 )
+
+    def test_later_aborted_does_not_reopen_prior_invalid_for_auto_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            episode_dir = Path(td) / "episode"
+            summary = episode_dir / "summary.json"
+
+            write_json(
+                summary,
+                {
+                    "accepted": True,
+                    "dataset_episode_index": 1,
+                },
+            )
+            write_json(
+                episode_dir / "takeover_validation.json",
+                {
+                    "trials": [
+                        {"status": "INVALID_REPLAY"},
+                        {"status": "ABORTED"},
+                    ]
+                },
+            )
+
+            self.assertFalse(
+                should_auto_retry_validation(
+                    summary
+                )
+            )
 
     def test_target_qc_directory_is_target_scoped(self) -> None:
         base = Path(

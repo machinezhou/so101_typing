@@ -407,6 +407,23 @@ def main() -> None:
         )
         output_dir = run_dir
 
+    # Logging-only snapshot: used only to de-emphasize statuses that were
+    # already reported unchanged by the previous QC run.
+    previous_status_by_index: dict[int, str] = {}
+    previous_report_path = output_dir / "qc_report.json"
+
+    if previous_report_path.exists():
+        try:
+            previous_report = _read_json(previous_report_path)
+            previous_status_by_index = {
+                int(item["dataset_episode_index"]): str(item["status"])
+                for item in previous_report.get("episodes", [])
+                if "dataset_episode_index" in item and "status" in item
+            }
+        except Exception:
+            # Display history is optional. Never let it affect QC itself.
+            previous_status_by_index = {}
+
     results: list[dict] = []
     candidates: list[int] = []
 
@@ -517,7 +534,14 @@ def main() -> None:
             f"episode={item['episode_number']:02d}{suffix}"
         )
 
-        if status == "PASS":
+        historical_same_status = (
+            previous_status_by_index.get(episode_index)
+            == status
+        )
+
+        if historical_same_status:
+            print(line)
+        elif status == "PASS":
             print(_green(line))
         elif status == "REVIEW":
             print(_yellow(line))
@@ -615,7 +639,17 @@ def main() -> None:
             f"{status}{suffix}"
         )
 
-        if status == "PASS":
+        episode_index = int(
+            item["dataset_episode_index"]
+        )
+        historical_same_status = (
+            previous_status_by_index.get(episode_index)
+            == status
+        )
+
+        if historical_same_status:
+            print(line)
+        elif status == "PASS":
             print(_green(line))
         elif status == "REVIEW":
             print(_yellow(line))
@@ -630,38 +664,95 @@ def main() -> None:
         f"FAIL: {counts['fail']}"
     )
 
-    attention = [
+    new_attention = [
         item
         for item in results
-        if item["status"] != "PASS"
+        if (
+            item["status"] != "PASS"
+            and previous_status_by_index.get(
+                int(item["dataset_episode_index"])
+            )
+            != item["status"]
+        )
+    ]
+    historical_attention = [
+        item
+        for item in results
+        if (
+            item["status"] != "PASS"
+            and previous_status_by_index.get(
+                int(item["dataset_episode_index"])
+            )
+            == item["status"]
+        )
     ]
 
-    if counts["fail"]:
+    if any(
+        item["status"] == "FAIL"
+        for item in new_attention
+    ):
         print(_red(count_line))
-    elif counts["review"]:
+    elif any(
+        item["status"] == "REVIEW"
+        for item in new_attention
+    ):
         print(_yellow(count_line))
     else:
-        print(_green(count_line))
+        print(count_line)
 
-    if attention:
-        banner_color = _red if counts["fail"] else _yellow
+    if new_attention:
+        banner_color = (
+            _red
+            if any(
+                item["status"] == "FAIL"
+                for item in new_attention
+            )
+            else _yellow
+        )
         details = "  ".join(
             f"{int(item['dataset_episode_index']):03d}({item['status']})"
-            for item in attention
+            for item in new_attention
         )
         print()
         print("!" * 72)
         print(banner_color("ACTION REQUIRED"))
         print(
             banner_color(
-                f"NON-PASS EPISODES: {details}"
+                f"NEW NON-PASS EPISODES: {details}"
             )
         )
         print("!" * 72)
-    else:
+
+    if historical_attention:
+        details = "  ".join(
+            f"{int(item['dataset_episode_index']):03d}({item['status']})"
+            for item in historical_attention
+        )
+        print()
+        print(
+            "historical non-pass raw episodes:",
+            details,
+        )
+        print(
+            "status unchanged; excluded from replay candidates. "
+            "No new QC action is implied by this rerun."
+        )
+
+    if not new_attention and not historical_attention:
         print()
         print("=" * 72)
-        print(_green("ALL QC EPISODES PASS"))
+        new_pass_exists = any(
+            item["status"] == "PASS"
+            and previous_status_by_index.get(
+                int(item["dataset_episode_index"])
+            )
+            != "PASS"
+            for item in results
+        )
+        if new_pass_exists:
+            print(_green("ALL QC EPISODES PASS"))
+        else:
+            print("ALL QC EPISODES PASS")
         print("=" * 72)
 
 if __name__ == "__main__":

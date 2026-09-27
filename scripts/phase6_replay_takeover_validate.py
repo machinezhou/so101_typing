@@ -10,8 +10,8 @@ from pathlib import Path
 
 from phase6_target_scope import (
     collect_target_episode_sources,
-    has_completed_validation,
     load_target_qc_candidate_entries,
+    should_auto_retry_validation,
     target_qc_dir,
 )
 import numpy as np
@@ -836,20 +836,18 @@ def _qc_candidate_indices(run_dir: Path) -> list[int]:
     return candidates
 
 
-def _has_completed_ground_truth(run_dir: Path, dataset_episode_index: int) -> bool:
-    """PASS/FAIL completes the first ground-truth trial; INVALID/ABORTED does not."""
-    summary_path, _ = _find_episode_summary(run_dir, dataset_episode_index)
-    validation_path = summary_path.parent / "takeover_validation.json"
-    if not validation_path.exists():
-        return False
-    payload = _read_json(validation_path)
-    for trial in reversed(payload.get("trials", [])):
-        status = str(trial.get("status", "UNKNOWN"))
-        if status in {"PASS", "FAIL"}:
-            return True
-        if status in {"INVALID_REPLAY", "ABORTED", "UNKNOWN"}:
-            continue
-    return False
+def _should_auto_retry_single_run(
+    run_dir: Path,
+    dataset_episode_index: int,
+) -> bool:
+    """Apply the same default scheduler used by target-level validation."""
+    summary_path, _ = _find_episode_summary(
+        run_dir,
+        dataset_episode_index,
+    )
+    return should_auto_retry_validation(
+        summary_path
+    )
 
 
 def _batch_candidates(
@@ -873,7 +871,10 @@ def _batch_candidates(
     return [
         idx
         for idx in candidates
-        if not _has_completed_ground_truth(run_dir, idx)
+        if _should_auto_retry_single_run(
+            run_dir,
+            idx,
+        )
     ]
 
 
@@ -957,7 +958,7 @@ def _target_batch_candidate_entries(
     return [
         item
         for item in entries
-        if not has_completed_validation(
+        if should_auto_retry_validation(
             Path(item["summary_json"])
         )
     ]
@@ -1013,12 +1014,18 @@ def main() -> None:
     parser.add_argument(
         "--episode",
         type=int,
-        help="Debug/repeat exactly one QC-PASS dataset_episode_index.",
+        help=(
+            "Explicitly repeat exactly one QC-PASS dataset_episode_index, "
+            "including PASS/FAIL/INVALID_REPLAY terminal scheduler states."
+        ),
     )
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Re-run all QC-PASS episodes, including episodes that already have PASS/FAIL trials.",
+        help=(
+            "Explicit debug override: re-run every QC-PASS episode, including "
+            "PASS/FAIL/INVALID_REPLAY terminal scheduler states."
+        ),
     )
     parser.add_argument(
         "--next",
@@ -1155,9 +1162,12 @@ def main() -> None:
         print("=" * 72)
         print("PHASE 6E — BATCH VALIDATION v7")
         print("=" * 72)
-        print("No remaining QC-PASS episode needs a first valid takeover trial.")
+        print("No remaining QC-PASS episode is scheduled for automatic takeover.")
         print("verified manifest :", manifest_path)
-        print("Use --all to repeat every QC-PASS episode, or --episode N for one repeat.")
+        print(
+            "Default scheduler skips PASS/FAIL/INVALID_REPLAY. "
+            "Use --episode N for one explicit repeat, or --all for a full debug repeat."
+        )
         return
 
     for item in candidate_entries:

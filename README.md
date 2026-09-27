@@ -128,7 +128,7 @@ span multiple collection runs because collection can be interrupted by hardware
 communication errors or because failed source zones are recollected later. Raw
 collection remains append-only.
 
-The normal validation command is now:
+The normal validation command is:
 
 ``` bash
 python scripts/phase6_validate_target.py --target U
@@ -141,7 +141,7 @@ all accepted U episodes across every run_*_u
         ↓
 target-level automatic QC
         ↓
-all QC-PASS episodes without completed PASS/FAIL takeover ground truth
+default-scheduled QC-PASS episodes
         ↓
 one continuous physical replay + WRIST takeover batch
         ↓
@@ -152,10 +152,42 @@ one final recovery HOME
 refresh verified_episodes.json
 ```
 
-A previously completed takeover `PASS` or `FAIL` is not repeated by default.
-New supplemental QC-PASS episodes are picked up automatically on the next
-target-level validation. `INVALID_REPLAY`, `ABORTED`, and incomplete validation
-attempts remain eligible for retry.
+Target-level aggregation and automatic replay scheduling are separate concerns.
+Aggregation always keeps the complete accepted raw history for the target.
+Automatic scheduling uses the latest meaningful validation history for each
+QC-PASS episode:
+
+| Episode validation state | Default automatic replay | Meaning |
+|---|---:|---|
+| no validation trial | yes | needs first physical validation |
+| `ABORTED` / `UNKNOWN` | yes | validation did not reach a terminal result |
+| `PASS` | no | verified ground-truth result already exists |
+| `FAIL` | no | exclude this raw episode and recollect a replacement under the external SOP |
+| `INVALID_REPLAY` | no | replay itself was invalid; keep the raw episode for audit and recollect a replacement under the external SOP |
+
+`INVALID_REPLAY` is therefore **not** a verified result and is **not** equivalent
+to `PASS` or `FAIL` ground truth. It is terminal only for the *default automatic
+scheduler*, so an old invalid replay cannot be pulled into every later
+supplemental batch forever. The verified manifest policy is unchanged: an
+episode becomes training-eligible only after the required physical takeover
+`PASS` evidence (and no recorded takeover `FAIL`).
+
+An operator may deliberately repeat one old QC-PASS episode with:
+
+``` bash
+python scripts/phase6_replay_takeover_validate.py --target U --episode <dataset_episode_index>
+```
+
+`--all` remains an explicit debug/repeat override and is not the normal
+collection workflow.
+
+The source-zone distribution remains an **external SOP**. The collector,
+target-level QC, and validator do not encode S0-S5/start-class semantics.
+Therefore dataset episode numbers, QC output order, and the final physical
+`FAILED EPISODES` list must not be used by software to infer which source zone
+still needs replacement. In particular, a QC `REVIEW`/`FAIL` episode never
+enters the physical replay batch, so the physical batch failure count is not a
+complete count of missing external-SOP source coverage.
 
 The lower-level commands remain available for debugging:
 
@@ -190,7 +222,7 @@ plus its overlay. This distinguishes “requested glyph was never recognized”
 from insufficient keycap geometry without changing any WRIST control threshold,
 the 1 mm FK safety gate, or the 35 mm cumulative XY command budget.
 
-Implementation files added by this workflow:
+Implementation files used by this workflow:
 
 ``` text
 scripts/phase6_target_scope.py

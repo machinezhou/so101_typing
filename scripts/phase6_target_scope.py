@@ -156,6 +156,40 @@ def has_completed_validation(
     return False
 
 
+def should_auto_retry_validation(
+    summary_path: Path,
+) -> bool:
+    """Return True only when default batch scheduling should auto-retry."""
+
+    validation_path = (
+        Path(summary_path).parent
+        / "takeover_validation.json"
+    )
+
+    if not validation_path.exists():
+        return True
+
+    payload = _read_json(validation_path)
+
+    for trial in reversed(payload.get("trials", [])):
+        status = str(trial.get("status", "UNKNOWN"))
+
+        if status in {
+            "PASS",
+            "FAIL",
+            "INVALID_REPLAY",
+        }:
+            return False
+
+        if status in {
+            "ABORTED",
+            "UNKNOWN",
+        }:
+            continue
+
+    return True
+
+
 def load_target_qc_candidate_entries(
     dataset_base: Path,
     target: str,
