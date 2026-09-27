@@ -449,6 +449,13 @@ def capture_initial_semantic_target(
         time.monotonic() + 5.0
     )
 
+    fresh_frames = 0
+    target_found_frames = 0
+    frames_with_4plus_keycaps = 0
+    last_frame = None
+    last_centers = []
+    last_keycaps = 0
+
     while time.monotonic() < deadline:
         frame = fresh_camera_frame(
             camera,
@@ -459,6 +466,8 @@ def capture_initial_semantic_target(
         last_frame_id = int(
             frame.frame_id
         )
+        last_frame = frame
+        fresh_frames += 1
 
         observation = observe_target(
             frame.image,
@@ -466,11 +475,13 @@ def capture_initial_semantic_target(
             recognizer,
         )
 
-        if (
-            not observation.found
-            or observation.center_px is None
-        ):
-            continue
+        semantic_found = (
+            observation.found
+            and observation.center_px is not None
+        )
+
+        if semantic_found:
+            target_found_frames += 1
 
         candidates = detect_keycaps(
             frame.image
@@ -480,6 +491,15 @@ def capture_initial_semantic_target(
             candidate.center
             for candidate in candidates
         ]
+
+        last_centers = centers
+        last_keycaps = len(centers)
+
+        if len(centers) >= 4:
+            frames_with_4plus_keycaps += 1
+
+        if not semantic_found:
+            continue
 
         if len(centers) < 4:
             continue
@@ -509,11 +529,42 @@ def capture_initial_semantic_target(
             frame,
         )
 
-    raise RuntimeError(
-        "Could not establish initial semantic G lock "
-        "from a fresh WRIST frame."
-    )
+    if last_frame is not None:
+        save_wrist_debug_image(
+            last_frame.image,
+            name="initial_semantic_lock_failure",
+            centers=last_centers,
+            note=(
+                f"FAIL target={TARGET} "
+                f"frame={last_frame.frame_id} "
+                f"keycaps={last_keycaps} "
+                f"target_found={target_found_frames}"
+            ),
+        )
 
+    if target_found_frames == 0:
+        reason = (
+            f"target {TARGET} was never recognized"
+        )
+    elif frames_with_4plus_keycaps == 0:
+        reason = (
+            "insufficient keycap geometry"
+        )
+    else:
+        reason = (
+            "target recognition and >=4-keycap geometry "
+            "never coincided on the same fresh frame"
+        )
+
+    raise RuntimeError(
+        f"Could not establish initial semantic {TARGET} lock "
+        "from a fresh WRIST frame. "
+        f"fresh_frames={fresh_frames}, "
+        f"target_found_frames={target_found_frames}, "
+        f"frames_with_4plus_keycaps={frames_with_4plus_keycaps}, "
+        f"last_keycaps={last_keycaps}, "
+        f"reason={reason}"
+    )
 
 def capture_locked_target(
     camera,
@@ -1002,7 +1053,7 @@ def capture_locked_target(
         )
 
     raise RuntimeError(
-        "Target G could not be reacquired after the "
+        f"Target {TARGET} could not be reacquired after the "
         "frozen-reference observation window. "
         f"frames={raw_frames}, "
         f"semantic={raw_semantic}, "

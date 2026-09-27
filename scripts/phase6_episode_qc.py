@@ -11,6 +11,11 @@ import numpy as np
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+from phase6_target_scope import (
+    collect_target_episode_sources,
+    target_qc_dir,
+)
+
 
 ARTIFACT_ROOT = Path("artifacts/phase6_act_dataset")
 FORMAL_DATASET_BASE = ARTIFACT_ROOT / "keyboard_v1"
@@ -288,121 +293,185 @@ def _check_dataset_episode(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Phase 6D generic episode-level QC. Start-state strategy is outside this tool; no Rerun/manual viewing is required for PASS episodes."
+        description=(
+            "Phase 6D generic episode-level QC. "
+            "--target aggregates accepted episodes across all formal runs "
+            "for that target; --run-dir retains explicit single-run debug behavior."
+        )
     )
     parser.add_argument(
         "--target",
         default=None,
         help=(
-            "A-Z target used only to locate the latest formal run "
-            "when --run-dir is omitted. The authoritative target "
-            "is read from run_summary.json."
+            "A-Z target. Without --run-dir, QC aggregates all formal runs "
+            "for this target."
         ),
     )
-
     parser.add_argument(
         "--run-dir",
         type=Path,
         default=None,
+        help="Debug exactly one collection run instead of target-level aggregation.",
     )
-
     args = parser.parse_args()
 
     requested_target = None
-
     if args.target is not None:
-        requested_target = (
-            str(args.target)
-            .strip()
-            .upper()
-        )
-
+        requested_target = str(args.target).strip().upper()
         if requested_target not in TARGET_VOCAB[:26]:
             raise ValueError(
                 "Formal V1 QC currently supports A-Z targets"
             )
 
-    if args.run_dir is not None:
-        run_dir = args.run_dir
-    else:
+    target_scope = args.run_dir is None
+
+    if target_scope:
         if requested_target is None:
             raise RuntimeError(
                 "Provide --target A-Z or an explicit --run-dir"
             )
 
-        run_dir = _latest_run(
-            requested_target
+        aggregate = collect_target_episode_sources(
+            FORMAL_RUNS_ROOT,
+            requested_target,
         )
+        target = str(aggregate["target"])
+        repo_id = str(aggregate["repo_id"])
+        dataset_root = Path(aggregate["dataset_root"])
+        source_runs = list(aggregate["run_dirs"])
+        source_entries = list(aggregate["episodes"])
 
-    run_summary_path = (
-        run_dir / "run_summary.json"
-    )
-
-    if not run_summary_path.exists():
-        raise FileNotFoundError(
-            run_summary_path
+        output_dir = target_qc_dir(
+            FORMAL_DATASET_BASE,
+            target,
         )
-
-    run_summary = _read_json(
-        run_summary_path
-    )
-
-    target = (
-        str(run_summary["target"])
-        .strip()
-        .upper()
-    )
-
-    if target not in TARGET_VOCAB[:26]:
-        raise ValueError(
-            f"Run target is not supported by formal V1: {target}"
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
         )
+        run_dir = None
 
-    if (
-        requested_target is not None
-        and requested_target != target
-    ):
-        raise RuntimeError(
-            "--target does not match run_summary.json: "
-            f"requested={requested_target}, run={target}"
+    else:
+        run_dir = args.run_dir
+        run_summary_path = run_dir / "run_summary.json"
+
+        if not run_summary_path.exists():
+            raise FileNotFoundError(run_summary_path)
+
+        run_summary = _read_json(run_summary_path)
+        target = str(run_summary["target"]).strip().upper()
+
+        if target not in TARGET_VOCAB[:26]:
+            raise ValueError(
+                f"Run target is not supported by formal V1: {target}"
+            )
+
+        if (
+            requested_target is not None
+            and requested_target != target
+        ):
+            raise RuntimeError(
+                "--target does not match run_summary.json: "
+                f"requested={requested_target}, run={target}"
+            )
+
+        repo_id = str(run_summary["repo_id"])
+        dataset_root = Path(run_summary["dataset_root"])
+        source_runs = [str(run_dir)]
+        source_entries = []
+
+        for summary_path in sorted(run_dir.glob("attempt_*/summary.json")):
+            summary = _read_json(summary_path)
+
+            if (
+                not summary.get("accepted")
+                or "dataset_episode_index" not in summary
+            ):
+                continue
+
+            source_entries.append(
+                {
+                    "dataset_episode_index": int(
+                        summary["dataset_episode_index"]
+                    ),
+                    "episode_number": int(
+                        summary.get("episode_number", -1)
+                    ),
+                    "run_dir": str(run_dir),
+                    "summary_json": str(summary_path),
+                }
+            )
+
+        source_entries.sort(
+            key=lambda item: int(item["dataset_episode_index"])
         )
+        output_dir = run_dir
 
-    repo_id = str(
-        run_summary["repo_id"]
-    )
-
-    dataset_root = Path(
-        run_summary["dataset_root"]
-    )
-
-    summaries = sorted(run_dir.glob("attempt_*/summary.json"))
     results: list[dict] = []
     candidates: list[int] = []
 
     print("=" * 72)
     print("PHASE 6D — AUTOMATIC EPISODE QC")
     print("=" * 72)
-    print("run dir     :", run_dir)
+    print(
+        "scope       :",
+        (
+            f"TARGET {target} ({len(source_runs)} runs)"
+            if target_scope
+            else f"RUN {run_dir}"
+        ),
+    )
     print("dataset root:", dataset_root)
-    print("policy      : PASS -> replay candidate; REVIEW/FAIL -> excluded until recollected or inspected")
-    print("Rerun       : NOT REQUIRED; reserve it only for optional debugging")
+    print(
+        "policy      : PASS -> replay candidate; "
+        "REVIEW/FAIL -> excluded until recollected or inspected"
+    )
+    print(
+        "Rerun       : NOT REQUIRED; reserve it only for optional debugging"
+    )
     print()
 
-    for summary_path in summaries:
+    seen_indices: set[int] = set()
+
+    for source in source_entries:
+        summary_path = Path(source["summary_json"])
+        source_run_dir = Path(source["run_dir"])
         summary = _read_json(summary_path)
-        if not summary.get("accepted") or "dataset_episode_index" not in summary:
+
+        if (
+            not summary.get("accepted")
+            or "dataset_episode_index" not in summary
+        ):
             continue
 
         episode_index = int(summary["dataset_episode_index"])
+
+        if episode_index in seen_indices:
+            raise RuntimeError(
+                f"Duplicate dataset episode in QC source set: {episode_index}"
+            )
+        seen_indices.add(episode_index)
+
         fail: list[str] = []
         review: list[str] = []
 
-        replay_path = Path(summary.get("replay_trace_jsonl") or summary_path.parent / "replay_trace.jsonl")
-        audit_path = Path(summary.get("audit_jsonl") or summary_path.parent / "sample_audit.jsonl")
+        replay_path = Path(
+            summary.get("replay_trace_jsonl")
+            or summary_path.parent / "replay_trace.jsonl"
+        )
+        audit_path = Path(
+            summary.get("audit_jsonl")
+            or summary_path.parent / "sample_audit.jsonl"
+        )
+
         f, r, trace_stats = _check_trace(summary, replay_path)
-        fail.extend(f); review.extend(r)
+        fail.extend(f)
+        review.extend(r)
+
         f, r, audit_stats = _check_audit(summary, audit_path)
-        fail.extend(f); review.extend(r)
+        fail.extend(f)
+        review.extend(r)
+
         try:
             f, r, dataset_stats = _check_dataset_episode(
                 repo_id=repo_id,
@@ -411,15 +480,18 @@ def main() -> None:
                 summary=summary,
                 target=target,
             )
-            fail.extend(f); review.extend(r)
+            fail.extend(f)
+            review.extend(r)
         except Exception as exc:
-            fail.append(f"dataset_read_error:{type(exc).__name__}:{exc}")
+            fail.append(
+                f"dataset_read_error:{type(exc).__name__}:{exc}"
+            )
             dataset_stats = {}
 
-        # Deduplicate while preserving readable order.
         fail = list(dict.fromkeys(fail))
         review = list(dict.fromkeys(review))
         status = "FAIL" if fail else ("REVIEW" if review else "PASS")
+
         if status == "PASS":
             candidates.append(episode_index)
 
@@ -432,16 +504,19 @@ def main() -> None:
             "trace": trace_stats,
             "audit": audit_stats,
             "dataset": dataset_stats,
+            "run_dir": str(source_run_dir),
             "summary_json": str(summary_path),
             "replay_trace_jsonl": str(replay_path),
         }
         results.append(item)
+
         reasons = fail or review
         suffix = "" if not reasons else " | " + "; ".join(reasons)
         line = (
             f"[{status:6}] dataset_ep={episode_index:03d} "
             f"episode={item['episode_number']:02d}{suffix}"
         )
+
         if status == "PASS":
             print(_green(line))
         elif status == "REVIEW":
@@ -449,13 +524,23 @@ def main() -> None:
         else:
             print(_red(line))
 
+    results.sort(
+        key=lambda item: int(item["dataset_episode_index"])
+    )
+    candidates = sorted(set(candidates))
+
     report = {
-        "schema": "phase6.episode_qc.v2",
+        "schema": "phase6.episode_qc.v3",
+        "scope": "target" if target_scope else "run",
         "target": target,
-        "run_dir": str(run_dir),
+        "run_dir": None if target_scope else str(run_dir),
+        "source_runs": source_runs,
         "dataset_root": str(dataset_root),
         "repo_id": repo_id,
-        "policy": "Only PASS episodes automatically enter physical replay validation; Rerun is optional debug only.",
+        "policy": (
+            "Only PASS episodes automatically enter physical replay validation; "
+            "Rerun is optional debug only."
+        ),
         "episodes": results,
         "pass_dataset_episode_indices": candidates,
         "counts": {
@@ -464,20 +549,48 @@ def main() -> None:
             "fail": sum(x["status"] == "FAIL" for x in results),
         },
     }
-    report_path = run_dir / "qc_report.json"
-    candidates_path = run_dir / "qc_candidates.json"
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    report_path = output_dir / "qc_report.json"
+    candidates_path = output_dir / "qc_candidates.json"
+
+    candidate_items = [
+        {
+            "dataset_episode_index": int(
+                item["dataset_episode_index"]
+            ),
+            "episode_number": int(item["episode_number"]),
+            "run_dir": str(item["run_dir"]),
+            "summary_json": str(item["summary_json"]),
+        }
+        for item in results
+        if item["status"] == "PASS"
+    ]
+
+    report_path.write_text(
+        json.dumps(
+            report,
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     candidates_path.write_text(
         json.dumps(
             {
-                "schema": "phase6.replay_candidates.v2",
+                "schema": "phase6.replay_candidates.v3",
+                "scope": "target" if target_scope else "run",
                 "target": target,
-                "run_dir": str(run_dir),
+                "run_dir": None if target_scope else str(run_dir),
+                "source_runs": source_runs,
                 "dataset_episode_indices": candidates,
+                "episodes": candidate_items,
             },
             indent=2,
             ensure_ascii=False,
-        ) + "\n",
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -487,8 +600,6 @@ def main() -> None:
     print("report        :", report_path)
     print("candidate list:", candidates_path)
 
-    # Human-oriented summary is intentionally last so it remains visible
-    # after long diagnostic output.
     print()
     print("=" * 72)
     print("QC SUMMARY")
@@ -520,7 +631,8 @@ def main() -> None:
     )
 
     attention = [
-        item for item in results
+        item
+        for item in results
         if item["status"] != "PASS"
     ]
 
@@ -540,14 +652,17 @@ def main() -> None:
         print()
         print("!" * 72)
         print(banner_color("ACTION REQUIRED"))
-        print(banner_color(f"NON-PASS EPISODES: {details}"))
+        print(
+            banner_color(
+                f"NON-PASS EPISODES: {details}"
+            )
+        )
         print("!" * 72)
     else:
         print()
         print("=" * 72)
         print(_green("ALL QC EPISODES PASS"))
         print("=" * 72)
-
 
 if __name__ == "__main__":
     main()

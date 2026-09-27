@@ -7,6 +7,13 @@ import os
 import sys
 import time
 from pathlib import Path
+
+from phase6_target_scope import (
+    collect_target_episode_sources,
+    has_completed_validation,
+    load_target_qc_candidate_entries,
+    target_qc_dir,
+)
 import numpy as np
 
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
@@ -870,6 +877,92 @@ def _batch_candidates(
     ]
 
 
+def _require_target_qc_pass(
+    target: str,
+    dataset_episode_index: int,
+) -> None:
+    report_path = (
+        target_qc_dir(
+            FORMAL_DATASET_BASE,
+            target,
+        )
+        / "qc_report.json"
+    )
+
+    if not report_path.exists():
+        raise RuntimeError(
+            f"Target-level QC report not found: {report_path}"
+        )
+
+    report = _read_json(report_path)
+    match = next(
+        (
+            item
+            for item in report.get("episodes", [])
+            if int(item["dataset_episode_index"])
+            == int(dataset_episode_index)
+        ),
+        None,
+    )
+
+    if match is None:
+        raise RuntimeError(
+            f"Episode {dataset_episode_index} is not present in {report_path}"
+        )
+
+    if match.get("status") != "PASS":
+        raise RuntimeError(
+            f"Episode {dataset_episode_index} target-level QC status is "
+            f"{match.get('status')}, not PASS."
+        )
+
+
+def _target_batch_candidate_entries(
+    target: str,
+    *,
+    episode: int | None,
+    include_completed: bool,
+) -> list[dict]:
+    entries = load_target_qc_candidate_entries(
+        FORMAL_DATASET_BASE,
+        target,
+    )
+
+    if episode is not None:
+        match = next(
+            (
+                item
+                for item in entries
+                if int(item["dataset_episode_index"])
+                == int(episode)
+            ),
+            None,
+        )
+
+        if match is None:
+            available = [
+                int(item["dataset_episode_index"])
+                for item in entries
+            ]
+            raise RuntimeError(
+                f"Episode {episode} is not in the target-level "
+                f"QC-PASS candidate list: {available}"
+            )
+
+        return [match]
+
+    if include_completed:
+        return entries
+
+    return [
+        item
+        for item in entries
+        if not has_completed_validation(
+            Path(item["summary_json"])
+        )
+    ]
+
+
 def _verify_home(
     *,
     robot: SO101Follower,
@@ -913,9 +1006,8 @@ def main() -> None:
         "--target",
         default=None,
         help=(
-            "A-Z target used only to locate the latest formal run "
-            "when --run-dir is omitted. The authoritative target "
-            "is read from run_summary.json."
+            "A-Z target. Without --run-dir, consume target-level QC "
+            "candidates aggregated across all formal runs."
         ),
     )
     parser.add_argument(
@@ -962,7 +1054,9 @@ def main() -> None:
                 "supports A-Z targets"
             )
 
-    if args.run_dir is not None:
+    target_scope = args.run_dir is None
+
+    if not target_scope:
         run_dir = args.run_dir
     else:
         if requested_target is None:
@@ -970,8 +1064,15 @@ def main() -> None:
                 "Provide --target A-Z or an explicit --run-dir"
             )
 
-        run_dir = _latest_run(
-            requested_target
+        # Target-level validation must not depend on the newest directory
+        # being a complete run. Use the newest usable run_summary as the
+        # anchor for the already-global verified manifest.
+        aggregate = collect_target_episode_sources(
+            FORMAL_RUNS_ROOT,
+            requested_target,
+        )
+        run_dir = Path(
+            aggregate["run_dirs"][-1]
         )
 
     run_summary_path = (
@@ -1012,11 +1113,36 @@ def main() -> None:
     if args.episode is not None and args.all:
         raise RuntimeError("--episode and --all are mutually exclusive")
 
-    candidates = _batch_candidates(
-        run_dir,
-        episode=args.episode,
-        include_completed=bool(args.all),
-    )
+    if target_scope:
+        candidate_entries = _target_batch_candidate_entries(
+            target,
+            episode=args.episode,
+            include_completed=bool(args.all),
+        )
+        candidates = [
+            int(item["dataset_episode_index"])
+            for item in candidate_entries
+        ]
+    else:
+        candidates = _batch_candidates(
+            run_dir,
+            episode=args.episode,
+            include_completed=bool(args.all),
+        )
+        candidate_entries = []
+        for idx in candidates:
+            summary_path, summary = _find_episode_summary(
+                run_dir,
+                idx,
+            )
+            candidate_entries.append(
+                {
+                    "dataset_episode_index": int(idx),
+                    "episode_number": int(summary["episode_number"]),
+                    "run_dir": str(run_dir),
+                    "summary_json": str(summary_path),
+                }
+            )
 
     if not candidates:
         manifest_path = _refresh_verified_manifest(
@@ -1034,9 +1160,19 @@ def main() -> None:
         print("Use --all to repeat every QC-PASS episode, or --episode N for one repeat.")
         return
 
-    for idx in candidates:
+    for item in candidate_entries:
+        idx = int(item["dataset_episode_index"])
         if not args.allow_unchecked:
-            _require_qc_pass(run_dir, idx)
+            if target_scope:
+                _require_target_qc_pass(
+                    target,
+                    idx,
+                )
+            else:
+                _require_qc_pass(
+                    Path(item["run_dir"]),
+                    idx,
+                )
 
     for path, label in (
         (WRIST_CAMERA_CONFIG, "WRIST camera config"),
@@ -1054,6 +1190,10 @@ def main() -> None:
     print("PHASE 6E — GENERIC BATCH REPLAY -> WRIST TAKEOVER -> FINAL AUTO HOME v7")
     print("=" * 72)
     print("target               :", target)
+    print(
+        "candidate scope      :",
+        "ALL TARGET RUNS" if target_scope else f"RUN {run_dir}",
+    )
     print("batch candidates     :", candidates)
     print("episodes this batch  :", len(candidates))
     print("between episodes     : current physical pose -> next recorded start")
@@ -1116,8 +1256,22 @@ def main() -> None:
         if wrist.latest() is None:
             raise RuntimeError("No WRIST frame arrived")
 
-        for batch_index, episode_index in enumerate(candidates, start=1):
-            summary_path, summary = _find_episode_summary(run_dir, episode_index)
+        for batch_index, source in enumerate(candidate_entries, start=1):
+            episode_index = int(source["dataset_episode_index"])
+            summary_path = Path(source["summary_json"])
+            source_run_dir = Path(source["run_dir"])
+            summary = _read_json(summary_path)
+
+            if (
+                not summary.get("accepted")
+                or int(summary.get("dataset_episode_index", -1))
+                != episode_index
+            ):
+                raise RuntimeError(
+                    "QC source does not resolve to the expected accepted episode: "
+                    f"{summary_path}"
+                )
+
             episode_dir = summary_path.parent
             replay_path = Path(
                 summary.get("replay_trace_jsonl")
@@ -1136,6 +1290,7 @@ def main() -> None:
                 f"dataset_ep={episode_index}"
             )
             print("=" * 72)
+            print("source run           :", source_run_dir)
             print("replay trace         :", replay_path)
             print("replay samples       :", len(trace))
             print("return HOME after it : NO")
@@ -1154,6 +1309,7 @@ def main() -> None:
                 "dataset_episode_index": int(episode_index),
                 "episode_number": int(summary["episode_number"]),
                 "target": target,
+                "source_run_dir": str(source_run_dir),
                 "status": "UNKNOWN",
             }
             if batch_index == 1:
@@ -1295,7 +1451,19 @@ def main() -> None:
                         "motion stable. Safe disconnect is now allowed."
                     )
 
-                    batch_summary_path = run_dir / "takeover_batch_summary.json"
+                    batch_summary_root = (
+                        target_qc_dir(FORMAL_DATASET_BASE, target)
+                        if target_scope
+                        else run_dir
+                    )
+                    batch_summary_root.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+                    batch_summary_path = (
+                        batch_summary_root
+                        / "takeover_batch_summary.json"
+                    )
                     batch_summary_path.write_text(
                         json.dumps(
                             {
@@ -1309,6 +1477,9 @@ def main() -> None:
                                             r["dataset_episode_index"]
                                         ),
                                         "episode_number": int(r["episode_number"]),
+                                        "source_run_dir": r.get(
+                                            "source_run_dir"
+                                        ),
                                         "status": r["status"],
                                         "error": r.get("error"),
                                     }

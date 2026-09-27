@@ -121,6 +121,83 @@ The final Phase 6 contracts are:
   anchor after takeover;
 - only replay/takeover-verified episode indices are eligible for Phase 7 training.
 
+### Formal Phase 6 target validation workflow
+
+Formal validation is **target-scoped**, not latest-run-scoped. One target may
+span multiple collection runs because collection can be interrupted by hardware
+communication errors or because failed source zones are recollected later. Raw
+collection remains append-only.
+
+The normal validation command is now:
+
+``` bash
+python scripts/phase6_validate_target.py --target U
+```
+
+This single command performs:
+
+``` text
+all accepted U episodes across every run_*_u
+        ↓
+target-level automatic QC
+        ↓
+all QC-PASS episodes without completed PASS/FAIL takeover ground truth
+        ↓
+one continuous physical replay + WRIST takeover batch
+        ↓
+no HOME reset between episodes
+        ↓
+one final recovery HOME
+        ↓
+refresh verified_episodes.json
+```
+
+A previously completed takeover `PASS` or `FAIL` is not repeated by default.
+New supplemental QC-PASS episodes are picked up automatically on the next
+target-level validation. `INVALID_REPLAY`, `ABORTED`, and incomplete validation
+attempts remain eligible for retry.
+
+The lower-level commands remain available for debugging:
+
+``` bash
+python scripts/phase6_episode_qc.py --target U
+python scripts/phase6_replay_takeover_validate.py --target U
+
+python scripts/phase6_episode_qc.py --run-dir <specific-run>
+python scripts/phase6_replay_takeover_validate.py --run-dir <specific-run>
+```
+
+`--target` means **all formal runs for that target**. `--run-dir` means exactly
+one collection run.
+
+Target-level QC artifacts are stored outside individual collection runs:
+
+``` text
+artifacts/phase6_act_dataset/keyboard_v1/target_qc/<target>/qc_report.json
+artifacts/phase6_act_dataset/keyboard_v1/target_qc/<target>/qc_candidates.json
+artifacts/phase6_act_dataset/keyboard_v1/target_qc/<target>/takeover_batch_summary.json
+```
+
+Initial WRIST semantic-lock diagnostics also use the actual requested target.
+For example, target `U` reports `semantic U lock`; target `P` reports
+`semantic P lock`. The error is no longer hard-coded to `G`.
+
+When initial semantic lock fails, the diagnostic reports how many fresh WRIST
+frames were checked, how many frames recognized the requested target, how many
+frames contained at least four detected keycaps, and the final keycap count. It
+also saves the last WRIST debug image as `initial_semantic_lock_failure.png`
+plus its overlay. This distinguishes “requested glyph was never recognized”
+from insufficient keycap geometry without changing any WRIST control threshold,
+the 1 mm FK safety gate, or the 35 mm cumulative XY command budget.
+
+Implementation files added by this workflow:
+
+``` text
+scripts/phase6_target_scope.py
+scripts/phase6_validate_target.py
+tests/test_phase6_target_scope.py
+```
+
 A temporary `G` pilot dataset was used to validate the complete Phase 6 → Phase 7
 pipeline, including offline QC, full physical replay, deterministic WRIST takeover,
 verified-only normalization, ACT forward/backward/optimizer execution, and
