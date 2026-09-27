@@ -214,8 +214,12 @@ def _compute_verified_stats(
 ) -> dict[str, dict[str, np.ndarray]]:
     hf = ds.hf_dataset
 
+    # Raw view for scalar/numeric columns.  Keep the transformed
+    # view for TOP/WRIST image decoding below.
+    raw_hf = hf.with_format(None)
+
     episode_indices = np.asarray(
-        hf["episode_index"],
+        raw_hf["episode_index"],
         dtype=np.int64,
     )
 
@@ -226,7 +230,16 @@ def _compute_verified_stats(
         for key in NUMERIC_KEYS
     }
 
-    for episode_index in verified:
+    for ordinal, episode_index in enumerate(
+        verified,
+        start=1,
+    ):
+        print(
+            f"[STATS] {ordinal:3d}/{len(verified)} "
+            f"episode={episode_index}",
+            flush=True,
+        )
+
         row_indices = np.flatnonzero(
             episode_indices == episode_index
         ).tolist()
@@ -238,10 +251,11 @@ def _compute_verified_stats(
             )
 
         ep_hf = hf.select(row_indices)
+        ep_raw_hf = raw_hf.select(row_indices)
 
         numeric_data = {
             key: np.asarray(
-                ep_hf[key],
+                ep_raw_hf[key],
                 dtype=np.float32,
             )
             for key in NUMERIC_KEYS
@@ -375,9 +389,13 @@ def main() -> None:
 
     hf = ds.hf_dataset
 
+    # Do not run LeRobot's image/tensor transform when reading
+    # scalar/index/numeric columns.
+    raw_hf = hf.with_format(None)
+
     loaded_episode_indices = [
         int(x)
-        for x in hf["episode_index"]
+        for x in raw_hf["episode_index"]
     ]
 
     episode_counts = Counter(
@@ -393,12 +411,12 @@ def main() -> None:
         )
 
     states = np.asarray(
-        hf["observation.state"],
+        raw_hf["observation.state"],
         dtype=np.float32,
     )
 
     actions = np.asarray(
-        hf["action"],
+        raw_hf["action"],
         dtype=np.float32,
     )
 
@@ -477,7 +495,7 @@ def main() -> None:
         )
 
     row_episode_indices = np.asarray(
-        hf["episode_index"],
+        raw_hf["episode_index"],
         dtype=np.int64,
     )
 
@@ -658,11 +676,9 @@ def main() -> None:
         },
         "target_one_hot": {
             "dimension": len(TARGET_VOCAB),
-            "expected_index": (
-                expected_target_index
-            ),
-            "actual_indices": (
-                actual_target_indices
+            "vocab": list(TARGET_VOCAB),
+            "validation": (
+                "all_verified_episode_rows_match_manifest_target"
             ),
         },
         "normalization": {
@@ -702,7 +718,14 @@ def main() -> None:
     print("=" * 72)
 
     print("lerobot          :", lerobot_version)
-    print("target           :", target)
+    print(
+        "targets          :",
+        ", ".join(verified_targets),
+    )
+    print(
+        "target count     :",
+        len(verified_targets),
+    )
     print("fps              :", ds.meta.fps)
     print("verified episodes:", verified)
     print("verified frames  :", verified_frame_count)

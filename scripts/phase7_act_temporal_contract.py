@@ -161,12 +161,26 @@ def main() -> None:
         return_uint8=True,
     )
 
+    hf = ds.hf_dataset
+
+    # Temporal validation only needs scalar/index columns here.
+    # Avoid LeRobot's expensive transformed HF access path.
+    raw_hf = hf.with_format(None)
+
     episode_indices = np.asarray(
-        ds.hf_dataset[
-            "episode_index"
-        ],
+        raw_hf["episode_index"],
         dtype=np.int64,
     )
+
+    absolute_indices = np.asarray(
+        raw_hf["index"],
+        dtype=np.int64,
+    )
+
+    if len(absolute_indices) != len(episode_indices):
+        raise RuntimeError(
+            "index/episode_index length mismatch"
+        )
 
     lengths = _episode_lengths(
         episode_indices,
@@ -200,19 +214,15 @@ def main() -> None:
 
     actual_valid_steps: list[int] = []
 
-    for row_index in range(
-        len(ds.hf_dataset)
-    ):
-        row = ds.hf_dataset[
-            row_index
-        ]
+    total_rows = len(episode_indices)
 
+    for row_index in range(total_rows):
         abs_idx = int(
-            row["index"]
+            absolute_indices[row_index]
         )
 
         ep_idx = int(
-            row["episode_index"]
+            episode_indices[row_index]
         )
 
         _, padding = (
@@ -233,6 +243,18 @@ def main() -> None:
                 .item()
             )
         )
+
+        completed = row_index + 1
+
+        if (
+            completed == 1
+            or completed % 1000 == 0
+            or completed == total_rows
+        ):
+            print(
+                f"[TEMPORAL] {completed}/{total_rows}",
+                flush=True,
+            )
 
     if (
         actual_valid_steps

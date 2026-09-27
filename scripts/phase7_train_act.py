@@ -56,6 +56,153 @@ def _normalizer_count(
     )
 
 
+def _update_last_checkpoint(
+    checkpoint_dir: Path,
+) -> None:
+    last_path = (
+        checkpoint_dir.parent
+        / "last"
+    )
+
+    if last_path.is_symlink():
+        last_path.unlink()
+    elif last_path.exists():
+        raise RuntimeError(
+            "Refusing to replace non-symlink "
+            f"checkpoint path: {last_path}"
+        )
+
+    last_path.symlink_to(
+        checkpoint_dir.name,
+        target_is_directory=True,
+    )
+
+
+def _save_training_checkpoint(
+    *,
+    checkpoint_dir: Path,
+    policy,
+    preprocessor,
+    postprocessor,
+    optimizer,
+    generator: torch.Generator,
+    completed_step: int,
+    target_steps: int,
+    device: str,
+    batch_size: int,
+    num_workers: int,
+    save_freq: int,
+    seed: int,
+    fps: int,
+    chunk_size: int,
+    verified_frame_count: int,
+    verified_episode_indices: list[int],
+    output_dir: Path,
+) -> None:
+    checkpoint_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    policy.save_pretrained(
+        checkpoint_dir
+    )
+
+    preprocessor.save_pretrained(
+        checkpoint_dir
+    )
+
+    postprocessor.save_pretrained(
+        checkpoint_dir
+    )
+
+    training_state = {
+        "schema": (
+            "phase7.act_resume_state.v1"
+        ),
+        "completed_step": int(
+            completed_step
+        ),
+        "optimizer_state_dict": (
+            optimizer.state_dict()
+        ),
+        "torch_rng_state": (
+            torch.get_rng_state()
+        ),
+        "cuda_rng_state_all": (
+            torch.cuda.get_rng_state_all()
+            if device == "cuda"
+            else None
+        ),
+        "loader_generator_state": (
+            generator.get_state()
+        ),
+    }
+
+    torch.save(
+        training_state,
+        checkpoint_dir
+        / "training_state.pt",
+    )
+
+    resume_config = {
+        "schema": (
+            "phase7.act_resume_config.v1"
+        ),
+        "completed_step": int(
+            completed_step
+        ),
+        "target_steps": int(
+            target_steps
+        ),
+        "device": device,
+        "batch_size": int(
+            batch_size
+        ),
+        "num_workers": int(
+            num_workers
+        ),
+        "save_freq": int(
+            save_freq
+        ),
+        "seed": int(
+            seed
+        ),
+        "fps": int(
+            fps
+        ),
+        "chunk_size": int(
+            chunk_size
+        ),
+        "verified_frame_count": int(
+            verified_frame_count
+        ),
+        "verified_episode_indices": (
+            verified_episode_indices
+        ),
+        "output_dir": str(
+            output_dir
+        ),
+    }
+
+    (
+        checkpoint_dir
+        / "resume_config.json"
+    ).write_text(
+        json.dumps(
+            resume_config,
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _update_last_checkpoint(
+        checkpoint_dir
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -79,7 +226,44 @@ def main() -> None:
     parser.add_argument(
         "--steps",
         type=int,
-        default=1,
+        default=None,
+        help=(
+            "Total target training step. "
+            "Fresh run defaults to 1. "
+            "Resume defaults to the target stored in the checkpoint."
+        ),
+    )
+
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help=(
+            "Resume from a Phase 7C checkpoint directory, "
+            "including checkpoints/last."
+        ),
+    )
+
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+    )
+
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+    )
+
+    parser.add_argument(
+        "--save-freq",
+        type=int,
+        default=0,
+        help=(
+            "Save an intermediate policy checkpoint every N steps; "
+            "0 disables periodic checkpoints."
+        ),
     )
 
     parser.add_argument(
@@ -105,6 +289,63 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    resume_config = None
+
+    if args.resume_from is not None:
+        resume_config_path = (
+            args.resume_from
+            / "resume_config.json"
+        )
+
+        if not resume_config_path.is_file():
+            raise RuntimeError(
+                "Resume checkpoint has no resume_config.json: "
+                f"{args.resume_from}"
+            )
+
+        resume_config = _read_json(
+            resume_config_path
+        )
+
+        if resume_config.get("schema") != (
+            "phase7.act_resume_config.v1"
+        ):
+            raise RuntimeError(
+                "Unexpected resume config schema: "
+                f"{resume_config.get('schema')!r}"
+            )
+
+        # Strict resume: training parameters come from
+        # the checkpoint rather than CLI defaults.
+        args.batch_size = int(
+            resume_config["batch_size"]
+        )
+        args.num_workers = int(
+            resume_config["num_workers"]
+        )
+        args.save_freq = int(
+            resume_config["save_freq"]
+        )
+        args.seed = int(
+            resume_config["seed"]
+        )
+        args.device = str(
+            resume_config["device"]
+        )
+        args.output_dir = Path(
+            resume_config["output_dir"]
+        )
+
+        if args.steps is None:
+            args.steps = int(
+                resume_config[
+                    "target_steps"
+                ]
+            )
+
+    elif args.steps is None:
+        args.steps = 1
+
     if args.steps <= 0:
         raise ValueError(
             "--steps must be positive"
@@ -113,6 +354,16 @@ def main() -> None:
     if args.batch_size <= 0:
         raise ValueError(
             "--batch-size must be positive"
+        )
+
+    if args.num_workers < 0:
+        raise ValueError(
+            "--num-workers must be >= 0"
+        )
+
+    if args.save_freq < 0:
+        raise ValueError(
+            "--save-freq must be >= 0"
         )
 
     _seed_everything(
@@ -299,11 +550,20 @@ def main() -> None:
         if key not in output_features
     }
 
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    if args.device == "auto":
+        device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "--device cuda requested but CUDA is unavailable"
+            )
+        device = "cuda"
+    else:
+        device = "cpu"
 
     # ------------------------------------------------------------
     # IMPORTANT:
@@ -374,9 +634,56 @@ def main() -> None:
     # ACT model.
     # ------------------------------------------------------------
 
-    policy = ACTPolicy(
-        cfg
-    ).to(device)
+    resume_state = None
+    resume_completed_step = 0
+
+    if resume_config is not None:
+        if int(
+            resume_config["fps"]
+        ) != fps:
+            raise RuntimeError(
+                "Resume fps does not match current contract"
+            )
+
+        if int(
+            resume_config["chunk_size"]
+        ) != chunk_size:
+            raise RuntimeError(
+                "Resume chunk_size does not match current contract"
+            )
+
+        if int(
+            resume_config[
+                "verified_frame_count"
+            ]
+        ) != verified_frame_count:
+            raise RuntimeError(
+                "Resume verified frame count does not "
+                "match current contract"
+            )
+
+        if [
+            int(x)
+            for x in resume_config[
+                "verified_episode_indices"
+            ]
+        ] != verified:
+            raise RuntimeError(
+                "Resume verified episodes do not "
+                "match current manifest"
+            )
+
+        policy = ACTPolicy.from_pretrained(
+            args.resume_from,
+            config=cfg,
+            local_files_only=True,
+            strict=True,
+        ).to(device)
+
+    else:
+        policy = ACTPolicy(
+            cfg
+        ).to(device)
 
     policy.train()
 
@@ -388,21 +695,87 @@ def main() -> None:
         policy.get_optim_params()
     )
 
+    if resume_config is not None:
+        state_path = (
+            args.resume_from
+            / "training_state.pt"
+        )
+
+        if not state_path.is_file():
+            raise RuntimeError(
+                "Resume checkpoint has no training_state.pt: "
+                f"{args.resume_from}"
+            )
+
+        # Training/RNG state must be loaded on CPU.
+        # In particular, torch.Generator.set_state() requires
+        # a CPU ByteTensor. Optimizer state is moved to the
+        # parameter device by optimizer.load_state_dict().
+        resume_state = torch.load(
+            state_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        if resume_state.get("schema") != (
+            "phase7.act_resume_state.v1"
+        ):
+            raise RuntimeError(
+                "Unexpected resume state schema: "
+                f"{resume_state.get('schema')!r}"
+            )
+
+        resume_completed_step = int(
+            resume_state[
+                "completed_step"
+            ]
+        )
+
+        if resume_completed_step != int(
+            resume_config[
+                "completed_step"
+            ]
+        ):
+            raise RuntimeError(
+                "Resume state/config step mismatch"
+            )
+
+        if resume_completed_step >= args.steps:
+            raise RuntimeError(
+                "Resume checkpoint already reached "
+                f"step {resume_completed_step}, "
+                f"target steps={args.steps}"
+            )
+
+        optimizer.load_state_dict(
+            resume_state[
+                "optimizer_state_dict"
+            ]
+        )
+
     # ------------------------------------------------------------
     # DataLoader.
     # ------------------------------------------------------------
 
     generator = torch.Generator()
-    generator.manual_seed(
-        args.seed
-    )
+
+    if resume_state is not None:
+        generator.set_state(
+            resume_state[
+                "loader_generator_state"
+            ]
+        )
+    else:
+        generator.manual_seed(
+            args.seed
+        )
 
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         generator=generator,
-        num_workers=0,
+        num_workers=args.num_workers,
         pin_memory=(
             device == "cuda"
         ),
@@ -418,6 +791,31 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats()
 
     iterator = iter(loader)
+
+    start_step = 1
+
+    if resume_state is not None:
+        torch.set_rng_state(
+            resume_state[
+                "torch_rng_state"
+            ].cpu()
+        )
+
+        if (
+            device == "cuda"
+            and resume_state[
+                "cuda_rng_state_all"
+            ] is not None
+        ):
+            torch.cuda.set_rng_state_all(
+                resume_state[
+                    "cuda_rng_state_all"
+                ]
+            )
+
+        start_step = (
+            resume_completed_step + 1
+        )
 
     print("=" * 78)
     print(
@@ -448,16 +846,35 @@ def main() -> None:
         cfg.pretrained_backbone_weights,
     )
     print("batch_size        :", args.batch_size)
+    print("num_workers       :", args.num_workers)
     print("steps             :", args.steps)
+    print("save_freq         :", args.save_freq)
+
+    if args.resume_from is not None:
+        print(
+            "resume_from       :",
+            args.resume_from,
+        )
+        print(
+            "resume_step       :",
+            resume_completed_step,
+        )
+        print(
+            "next_step         :",
+            start_step,
+        )
 
     print()
     print("-" * 78)
 
     last_loss = None
     last_loss_dict = None
+    last_saved_step = (
+        resume_completed_step
+    )
 
     for step in range(
-        1,
+        start_step,
         args.steps + 1,
     ):
         try:
@@ -540,6 +957,93 @@ def main() -> None:
             f"grad_norm={float(grad_norm):.6f}"
         )
 
+        if (
+            args.save_freq > 0
+            and step % args.save_freq == 0
+        ):
+            checkpoint_dir = (
+                args.output_dir
+                / "checkpoints"
+                / f"step_{step:06d}"
+            )
+
+            _save_training_checkpoint(
+                checkpoint_dir=checkpoint_dir,
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                optimizer=optimizer,
+                generator=generator,
+                completed_step=step,
+                target_steps=args.steps,
+                device=device,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                save_freq=args.save_freq,
+                seed=args.seed,
+                fps=fps,
+                chunk_size=chunk_size,
+                verified_frame_count=verified_frame_count,
+                verified_episode_indices=verified,
+                output_dir=args.output_dir,
+            )
+
+            last_saved_step = step
+
+            print(
+                "checkpoint         :",
+                checkpoint_dir,
+            )
+            print(
+                "checkpoint last    :",
+                args.output_dir
+                / "checkpoints"
+                / "last",
+            )
+
+    # Always leave the final training step as a resumable checkpoint.
+    # If save_freq already saved this exact step, do not duplicate it.
+    if last_saved_step != args.steps:
+        checkpoint_dir = (
+            args.output_dir
+            / "checkpoints"
+            / f"step_{args.steps:06d}"
+        )
+
+        _save_training_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            optimizer=optimizer,
+            generator=generator,
+            completed_step=args.steps,
+            target_steps=args.steps,
+            device=device,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            save_freq=args.save_freq,
+            seed=args.seed,
+            fps=fps,
+            chunk_size=chunk_size,
+            verified_frame_count=verified_frame_count,
+            verified_episode_indices=verified,
+            output_dir=args.output_dir,
+        )
+
+        last_saved_step = args.steps
+
+        print(
+            "checkpoint         :",
+            checkpoint_dir,
+        )
+        print(
+            "checkpoint last    :",
+            args.output_dir
+            / "checkpoints"
+            / "last",
+        )
+
     # ------------------------------------------------------------
     # Save checkpoint + processors.
     #
@@ -593,12 +1097,37 @@ def main() -> None:
         "backbone_weights": str(
             cfg.pretrained_backbone_weights
         ),
+        "device": device,
         "batch_size": (
             args.batch_size
+        ),
+        "num_workers": (
+            args.num_workers
         ),
         "steps": (
             args.steps
         ),
+        "save_freq": (
+            args.save_freq
+        ),
+        "completed_steps": (
+            args.steps
+        ),
+        "resume": {
+            "source": (
+                str(args.resume_from)
+                if args.resume_from is not None
+                else None
+            ),
+            "resumed_from_step": (
+                resume_completed_step
+            ),
+            "last_checkpoint": str(
+                args.output_dir
+                / "checkpoints"
+                / "last"
+            ),
+        },
         "seed": (
             args.seed
         ),
