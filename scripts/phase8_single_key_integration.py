@@ -29,7 +29,6 @@ from phase6_replay_takeover_validate import (
     _auto_restore_recorded_start,
     _emergency_hold_until_operator,
     _load_recovery_pose,
-    _run_takeover,
     _synchronize_goal_to_present,
     _verify_home,
 )
@@ -47,7 +46,7 @@ WRIST_CAMERA_CONFIG = Path("configs/cameras/wrist.yaml")
 DEFAULT_CHECKPOINT = Path(
     "artifacts/phase7_act_coarse/keyboard_v1/act_train_20k/checkpoints/last"
 )
-ARTIFACT_ROOT = Path("artifacts/phase7_act_coarse/keyboard_v1/rollouts")
+ARTIFACT_ROOT = Path("artifacts/phase8_single_key_integration")
 
 TARGET_VOCAB = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + ("SPACE", "BACKSPACE")
 ROLLOUT_HZ = 15.0
@@ -270,11 +269,543 @@ def _capture_settled_endpoint(
     }
 
 
+def _retract_to_z0(
+    *,
+    robot,
+    planner,
+    state,
+    motor_names,
+    sent_state_tracker,
+    events: list[dict],
+):
+    retract_targets = phase5.stepped_z_targets_to_zero(
+        state.z_mm,
+        max_step_mm=phase5.RETRACT_Z_STEP_MM,
+    )
+
+    print()
+    print(
+        "[RETRACT PLAN] "
+        f"start_z={state.z_mm:+.2f}mm "
+        f"step<={phase5.RETRACT_Z_STEP_MM:.2f}mm "
+        f"segments={len(retract_targets)}"
+    )
+
+    for retract_index, retract_z in enumerate(retract_targets, start=1):
+        state = state.with_z_level(retract_z)
+        _, plan = phase5.send_command_state(
+            robot,
+            planner,
+            state,
+            motor_names,
+            label=f"RETRACT {retract_index}/{len(retract_targets)}",
+            sent_state_tracker=sent_state_tracker,
+        )
+        events.append(
+            {
+                "event": "retract",
+                "segment": int(retract_index),
+                "segment_count": int(len(retract_targets)),
+                "xyz_mm": [float(v) for v in state.xyz_mm],
+                "predicted_delta_mm": [float(v) for v in plan.predicted_delta_mm],
+            }
+        )
+
+    if abs(float(state.z_mm)) > 1e-12:
+        raise RuntimeError("bounded retract did not finish at Z=0")
+
+    return state
+
+
+def _run_full_deterministic_press(
+    *,
+    robot,
+    wrist_camera,
+    side_camera,
+    target: str,
+    motor_names: list[str],
+    recognizer,
+    tool_reference,
+    screen_calibration,
+    screen_ocr,
+    screen_char_ocr,
+    baseline_side_frame_id: int,
+    endpoint_settled_timestamp: float,
+    endpoint_wrist_frame_id: int,
+    run_dir: Path,
+    autonomy_stop: Event,
+    phase: dict,
+) -> dict:
+    """Run the accepted Phase-5 deterministic primitive from one Goal anchor.
+
+    This is orchestration only.  Perception, visual servoing, Cartesian planning,
+    SIDE event detection, OCR, release, and retract all reuse the accepted
+    Phase-5 implementation.
+    """
+    phase5.TARGET = target
+    phase5.ARTIFACT_DIR = run_dir / "deterministic"
+    phase5.ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    phase5.SEMANTIC_REENTRY_GUARDED = False
+    phase5.ACTIVE_SCREEN_WATCHER = None
+
+    jacobian = phase5.ImageJacobianCalibration.load(phase5.IMAGE_JACOBIAN)
+    if jacobian is None:
+        raise RuntimeError("image Jacobian is missing")
+
+    semantic_lock = phase5.SemanticTargetLock(target)
+
+    present_observation = phase5.ordered_joint_observation(
+        robot.get_observation(),
+        motor_names,
+    )
+    goal_positions = robot.bus.sync_read(
+        "Goal_Position",
+        num_retry=robot.config.num_read_retries,
+    )
+    anchor = phase5.FixedGoalAnchor.from_goal_positions(
+        goal_positions,
+        motor_names,
+    )
+
+    print(
+        "[COMMAND ANCHOR] Goal-Present: "
+        + ", ".join(
+            (
+                f"{name}="
+                f"{anchor.position_deg(name) - float(present_observation[f'{name}.pos']):+.3f}deg"
+            )
+            for name in motor_names
+            if name != "gripper"
+        )
+    )
+
+    kinematics = phase5.build_so101_kinematics(
+        phase5.URDF,
+        motor_names=motor_names,
+    )
+    anchor_xyz_mm = phase5.end_effector_xyz_mm(
+        kinematics,
+        anchor.as_observation(),
+        motor_names,
+    )
+    pipeline = phase5.build_official_cartesian_pipeline(
+        phase5.URDF,
+        motor_names=motor_names,
+        end_effector_bounds={
+            "min": [-1.0, -1.0, -1.0],
+            "max": [1.0, 1.0, 1.0],
+        },
+        max_ee_step_m=0.035,
+        orientation_weight=0.01,
+        raise_on_jump=True,
+        use_latched_reference=True,
+    )
+    planner = phase5.FixedAnchorCartesianPlanner(
+        pipeline=pipeline,
+        validation_kinematics=kinematics,
+        motor_names=motor_names,
+        anchor=anchor,
+        anchor_xyz_mm=anchor_xyz_mm,
+        config=phase5.FixedAnchorPlannerConfig(
+            max_command_norm_mm=phase5.MAX_COMMAND_NORM_MM,
+            max_model_xy_error_mm=1.0,
+            max_model_z_error_mm=1.0,
+            max_relative_target_deg=MAX_RELATIVE_TARGET_DEG,
+            max_zero_joint_shift_deg=0.5,
+        ),
+    )
+    zero_shift = planner.latch_zero_delta()
+    print(f"[ANCHOR] zero-delta max joint shift={zero_shift:.3f}deg")
+
+    state = phase5.FixedAnchorXYZCommandState.at_anchor(
+        anchor,
+        max_xy_norm_mm=phase5.MAX_XY_CORRECTION_MM,
+        max_xyz_norm_mm=phase5.MAX_COMMAND_NORM_MM,
+    )
+    sent_state_tracker = phase5.LatestSentXYZCommandState(state)
+    controller = phase5.SingleKeyPressController(
+        phase5.SingleKeyPressConfig(
+            z_levels_mm=None,
+            z_step_mm=phase5.Z_STEP_MM,
+            max_descent_mm=None,
+            max_uncertain_reobservations=1,
+        )
+    )
+
+    wrist_frame_id = int(endpoint_wrist_frame_id)
+    min_wrist_timestamp = (
+        float(endpoint_settled_timestamp)
+        + float(phase5.POST_MOTION_GUARD_S)
+    )
+    side_frame_id = int(baseline_side_frame_id)
+
+    print()
+    print("=" * 78)
+    print("PHASE 8 DETERMINISTIC OWNERSHIP")
+    print("=" * 78)
+    print("ACT queue/processors : RESET; no further ACT command is allowed")
+    print("command anchor       : existing Goal_Position")
+    print("WRIST alignment      : Phase-5 accepted controller")
+    print("Z / SIDE / OCR       : Phase-5 accepted single-key primitive")
+    print("absolute Z guard     : operator Ctrl+C (unchanged Phase-5 contract)")
+    print()
+    answer = input(
+        "Type GO then ENTER to arm deterministic alignment + press: "
+    ).strip().upper()
+    if answer != "GO":
+        raise RuntimeError("Operator did not arm Phase-8 deterministic press")
+    if autonomy_stop.is_set():
+        raise OperatorStop("operator stop before deterministic press")
+
+    phase["name"] = "PRESS"
+    screen_event_watcher = None
+    events: list[dict] = []
+    screen_records: list[dict] = []
+
+    try:
+        print()
+        print("===== FAST SIDE EVENT BASELINE =====")
+        screen_event_watcher = phase5.FastSidePressEventWatcher(
+            side_camera=side_camera,
+            calibration=screen_calibration,
+            artifact_dir=(phase5.ARTIFACT_DIR / "side_event"),
+        )
+        event_baseline = screen_event_watcher.arm(
+            baseline_duration_s=phase5.SCREEN_EVENT_BASELINE_S
+        )
+        phase5.ACTIVE_SCREEN_WATCHER = screen_event_watcher
+
+        print(
+            "[SIDE EVENT] ARMED "
+            f"baseline_frames={event_baseline['baseline_frames']} "
+            f"continuation_x0={event_baseline['continuation_x0']}"
+        )
+        events.append(
+            {
+                "event": "side_event_armed",
+                **event_baseline,
+            }
+        )
+
+        (
+            state,
+            directive,
+            wrist_frame_id,
+            min_wrist_timestamp,
+        ) = phase5.align_wrist(
+            robot=robot,
+            wrist_camera=wrist_camera,
+            recognizer=recognizer,
+            semantic_lock=semantic_lock,
+            tool_reference=tool_reference,
+            jacobian=jacobian,
+            planner=planner,
+            state=state,
+            controller=controller,
+            motor_names=motor_names,
+            last_frame_id=wrist_frame_id,
+            min_timestamp=min_wrist_timestamp,
+            threshold_px=phase5.INITIAL_ALIGNMENT_THRESHOLD_PX,
+            max_commands=phase5.MAX_INITIAL_XY_COMMANDS,
+            sent_state_tracker=sent_state_tracker,
+        )
+
+        while True:
+            if autonomy_stop.is_set():
+                raise OperatorStop("operator stop during deterministic press")
+
+            print()
+            print(
+                "[SUPERVISOR] directive="
+                f"{directive.kind} reason={directive.reason!r}"
+            )
+
+            if directive.kind is phase5.PressDirectiveKind.DESCEND_TO_Z:
+                state = state.with_z_level(directive.z_target_mm)
+                settled_timestamp, plan = phase5.send_command_state(
+                    robot,
+                    planner,
+                    state,
+                    motor_names,
+                    label="Z",
+                    sent_state_tracker=sent_state_tracker,
+                )
+                events.append(
+                    {
+                        "event": "z_command",
+                        "xyz_mm": [float(v) for v in state.xyz_mm],
+                        "predicted_delta_mm": [
+                            float(v) for v in plan.predicted_delta_mm
+                        ],
+                    }
+                )
+                min_wrist_timestamp = (
+                    float(settled_timestamp)
+                    + float(phase5.POST_MOTION_GUARD_S)
+                )
+                directive = controller.on_z_motion_stable()
+                continue
+
+            if directive.kind is phase5.PressDirectiveKind.OBSERVE_WRIST:
+                (
+                    state,
+                    directive,
+                    wrist_frame_id,
+                    min_wrist_timestamp,
+                ) = phase5.align_wrist(
+                    robot=robot,
+                    wrist_camera=wrist_camera,
+                    recognizer=recognizer,
+                    semantic_lock=semantic_lock,
+                    tool_reference=tool_reference,
+                    jacobian=jacobian,
+                    planner=planner,
+                    state=state,
+                    controller=controller,
+                    motor_names=motor_names,
+                    last_frame_id=wrist_frame_id,
+                    min_timestamp=min_wrist_timestamp,
+                    threshold_px=phase5.Z_ALIGNMENT_THRESHOLD_PX,
+                    max_commands=phase5.MAX_REALIGN_COMMANDS_PER_Z,
+                    sent_state_tracker=sent_state_tracker,
+                )
+                continue
+
+            if directive.kind in {
+                phase5.PressDirectiveKind.VERIFY_SCREEN,
+                phase5.PressDirectiveKind.REOBSERVE_SCREEN,
+            }:
+                result, side_frame_id, records = (
+                    phase5.capture_screen_verification(
+                        side_camera=side_camera,
+                        calibration=screen_calibration,
+                        ocr=screen_ocr,
+                        after_frame_id=side_frame_id,
+                        min_timestamp=min_wrist_timestamp,
+                    )
+                )
+                screen_records.append(
+                    {
+                        "stage": f"z_{state.z_mm:+.1f}",
+                        "status": str(result.status),
+                        "wrong_character": result.wrong_character,
+                        "records": records,
+                    }
+                )
+                directive = controller.on_verification(result.status)
+                continue
+
+            if directive.kind is phase5.PressDirectiveKind.RETRACT_TO_Z0:
+                state = _retract_to_z0(
+                    robot=robot,
+                    planner=planner,
+                    state=state,
+                    motor_names=motor_names,
+                    sent_state_tracker=sent_state_tracker,
+                    events=events,
+                )
+                directive = controller.on_retraction_complete()
+                continue
+
+            if directive.kind is phase5.PressDirectiveKind.COMPLETE:
+                break
+
+            raise RuntimeError(
+                f"Unhandled supervisor directive: {directive.kind}"
+            )
+
+    except phase5.ScreenPressEventDetected:
+        phase5.ACTIVE_SCREEN_WATCHER = None
+        if screen_event_watcher is None:
+            raise RuntimeError("SIDE event fired without an active watcher")
+
+        screen_event_watcher.stop()
+        event_details = screen_event_watcher.snapshot()
+
+        print()
+        print("!" * 78)
+        print("SIDE PRESS EVENT LATCHED — RELEASE HAS PRIORITY")
+        print("!" * 78)
+        print(f"[SIDE EVENT] {event_details}")
+
+        outer_state_before_event = state
+        state = sent_state_tracker.state
+        print(
+            "[SIDE EVENT STATE] "
+            "outer="
+            f"({outer_state_before_event.x_mm:+.2f},"
+            f"{outer_state_before_event.y_mm:+.2f},"
+            f"{outer_state_before_event.z_mm:+.2f})mm "
+            "latest_sent="
+            f"({state.x_mm:+.2f},"
+            f"{state.y_mm:+.2f},"
+            f"{state.z_mm:+.2f})mm"
+        )
+        events.append(
+            {
+                "event": "side_press_event",
+                **event_details,
+                "outer_xyz_mm": [float(v) for v in outer_state_before_event.xyz_mm],
+                "latest_sent_xyz_mm": [float(v) for v in state.xyz_mm],
+            }
+        )
+
+        release_target_z = min(
+            0.0,
+            float(state.z_mm) + float(phase5.SCREEN_EVENT_RELEASE_MM),
+        )
+        release_directive = controller.on_screen_event(
+            release_z_target_mm=release_target_z,
+        )
+        if (
+            release_directive.kind
+            is not phase5.PressDirectiveKind.RELEASE_TO_Z
+        ):
+            raise RuntimeError("SIDE event did not enter release state")
+
+        release_index = 0
+        last_release_timestamp = time.monotonic()
+        while state.z_mm < release_target_z - 1e-12:
+            release_index += 1
+            next_z = min(
+                release_target_z,
+                state.z_mm + float(phase5.SCREEN_EVENT_RELEASE_STEP_MM),
+            )
+            state = state.with_z_level(next_z)
+            last_release_timestamp, plan = phase5.send_command_state(
+                robot,
+                planner,
+                state,
+                motor_names,
+                label=f"RELEASE {release_index}",
+                sent_state_tracker=sent_state_tracker,
+                event_capture_timestamp=(
+                    event_details.get("capture_timestamp")
+                    if release_index == 1
+                    else None
+                ),
+            )
+            events.append(
+                {
+                    "event": "release",
+                    "segment": int(release_index),
+                    "xyz_mm": [float(v) for v in state.xyz_mm],
+                    "predicted_delta_mm": [
+                        float(v) for v in plan.predicted_delta_mm
+                    ],
+                }
+            )
+
+        directive = controller.on_release_complete()
+        result, side_frame_id, records = (
+            phase5.capture_event_character_verification(
+                side_camera=side_camera,
+                calibration=screen_calibration,
+                change_model=screen_event_watcher.model,
+                char_ocr=screen_char_ocr,
+                after_frame_id=int(
+                    event_details.get("frame_id", side_frame_id)
+                ),
+                min_timestamp=last_release_timestamp,
+            )
+        )
+        screen_records.append(
+            {
+                "stage": "released_press_event",
+                "status": str(result.status),
+                "wrong_character": result.wrong_character,
+                "records": records,
+            }
+        )
+        directive = controller.on_verification(result.status)
+
+        if directive.kind is phase5.PressDirectiveKind.REOBSERVE_SCREEN:
+            result, side_frame_id, records = (
+                phase5.capture_event_character_verification(
+                    side_camera=side_camera,
+                    calibration=screen_calibration,
+                    change_model=screen_event_watcher.model,
+                    char_ocr=screen_char_ocr,
+                    after_frame_id=side_frame_id,
+                    min_timestamp=last_release_timestamp,
+                )
+            )
+            screen_records.append(
+                {
+                    "stage": "released_press_event_reobserve",
+                    "status": str(result.status),
+                    "wrong_character": result.wrong_character,
+                    "records": records,
+                }
+            )
+            directive = controller.on_verification(result.status)
+
+        if directive.kind is not phase5.PressDirectiveKind.RETRACT_TO_Z0:
+            raise RuntimeError(
+                "latched SIDE event must end in retract after released-screen verification"
+            )
+
+        state = _retract_to_z0(
+            robot=robot,
+            planner=planner,
+            state=state,
+            motor_names=motor_names,
+            sent_state_tracker=sent_state_tracker,
+            events=events,
+        )
+        directive = controller.on_retraction_complete()
+        if directive.kind is not phase5.PressDirectiveKind.COMPLETE:
+            raise RuntimeError("event retract did not complete the controller")
+
+    finally:
+        phase5.ACTIVE_SCREEN_WATCHER = None
+        if screen_event_watcher is not None:
+            screen_event_watcher.stop()
+
+    outcome = (
+        None
+        if controller.pending_outcome is None
+        else str(controller.pending_outcome)
+    )
+    success = outcome == "SUCCESS"
+
+    result = {
+        "success": bool(success),
+        "controller_state": str(controller.state),
+        "outcome": outcome,
+        "final_xyz_mm": [float(v) for v in state.xyz_mm],
+        "zero_delta_joint_shift_deg": float(zero_shift),
+        "anchor_goal_positions_deg": {
+            name: float(anchor.position_deg(name))
+            for name in motor_names
+        },
+        "events": events,
+        "screen": screen_records,
+    }
+
+    result_path = run_dir / "deterministic_result.json"
+    result_path.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
+    print()
+    print("=" * 78)
+    print("PHASE 8 DETERMINISTIC RESULT")
+    print("=" * 78)
+    print("controller state :", controller.state)
+    print("outcome          :", controller.pending_outcome)
+    print("final XYZ        :", state.xyz_mm)
+    print("saved            :", result_path)
+
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Phase 7 ACT rollout evaluation: official ACT select_action queue "
-            "semantics + settled endpoint diagnostics + deterministic WRIST takeover + canonical HOME."
+            "Phase 8 single-key integration pilot: Phase-7 ACT approach + "
+            "accepted Phase-5 deterministic align/press/SIDE/OCR/retract + canonical HOME."
         )
     )
     parser.add_argument("--target", default="G")
@@ -288,19 +819,22 @@ def main() -> None:
     )
     parser.add_argument("--robot-port", default=ROBOT_PORT)
     parser.add_argument("--recovery-home", type=Path, default=RECOVERY_HOME_CONFIG)
+    parser.add_argument("--confirmed-prefix", default=phase5.CONFIRMED_PREFIX)
     parser.add_argument("--print-config", action="store_true")
     args = parser.parse_args()
 
     target = str(args.target).strip().upper()
-    if target not in TARGET_VOCAB[:26]:
-        raise ValueError("Formal V1 rollout currently supports A-Z targets")
+    if target != "G":
+        raise ValueError(
+            "Phase-8 v1 pilot is intentionally restricted to target G"
+        )
     if not np.isfinite(args.duration) or args.duration <= 0.0:
         raise ValueError("--duration must be finite and > 0")
     if not 1 <= args.n_action_steps <= CHUNK_SIZE:
         raise ValueError(f"--n-action-steps must be in [1, {CHUNK_SIZE}]")
 
     print("=" * 78)
-    print("PHASE 7 — ACT ROLLOUT EVALUATION v6")
+    print("PHASE 8 — END-TO-END SINGLE-KEY INTEGRATION PILOT v1")
     print("=" * 78)
     print("target               :", target)
     print("checkpoint           :", args.checkpoint)
@@ -319,11 +853,14 @@ def main() -> None:
         "settled endpoint    :",
         "fresh WRIST after motion-stable + POST_MOTION_GUARD (diagnostic only)",
     )
-    print("ground truth        : deterministic WRIST takeover PASS / FAIL")
+    print("deterministic phase  : SAME Goal anchor through align + Z + release + retract")
+    print("success authority    : SIDE released-character verification")
+    print("confirmed prefix     :", args.confirmed_prefix)
+    print("Z policy             :", f"iterative -{phase5.Z_STEP_MM:g} mm command-space steps")
+    print("absolute Z guard     : OPERATOR Ctrl+C (unchanged Phase-5 contract)")
     print("joint safety limit   :", f"{MAX_RELATIVE_TARGET_DEG:.1f} deg/send")
-    print("success              : WRIST takeover PASS -> AUTO HOME")
+    print("success              : expected character -> retract -> AUTO HOME")
     print("timeout / Ctrl+C     : AUTO HOME")
-    print("Z / press / SIDE/OCR : DISABLED")
     print("HOME                 :", args.recovery_home)
     print("=" * 78)
 
@@ -334,6 +871,15 @@ def main() -> None:
         raise FileNotFoundError(args.checkpoint)
     if not GLYPH_MODEL.exists():
         raise FileNotFoundError(GLYPH_MODEL)
+    if not phase5.IMAGE_JACOBIAN.exists():
+        raise FileNotFoundError(phase5.IMAGE_JACOBIAN)
+    if not phase5.SCREEN_CALIBRATION.exists():
+        raise FileNotFoundError(phase5.SCREEN_CALIBRATION)
+
+    phase5.TARGET = target
+    phase5.CONFIRMED_PREFIX = str(args.confirmed_prefix)
+    phase5.ACTIVE_SCREEN_WATCHER = None
+    phase5.SEMANTIC_REENTRY_GUARDED = False
 
     saved_cfg = ACTConfig.from_pretrained(
         args.checkpoint,
@@ -375,6 +921,24 @@ def main() -> None:
     tool_reference.require_direct_tool_tip()
     target_vector = _target_one_hot(target)
 
+    screen_calibration = phase5.ScreenCalibration.load(
+        phase5.SCREEN_CALIBRATION
+    )
+    if screen_calibration is None:
+        raise RuntimeError("screen calibration is missing")
+    screen_ocr = phase5.TesseractScreenLineOCR(
+        language="eng",
+        scale=3.0,
+        clahe_clip_limit=2.0,
+        dark_threshold=185,
+    )
+    screen_char_ocr = phase5.TesseractSingleCharacterOCR(
+        language="eng",
+        scale=4.0,
+        clahe_clip_limit=2.0,
+        dark_threshold=185,
+    )
+
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = ARTIFACT_ROOT / f"run_{timestamp}_{target.lower()}"
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -388,6 +952,7 @@ def main() -> None:
 
     top = ThreadedOpenCVCamera(CameraSpec.from_yaml(TOP_CAMERA_CONFIG))
     wrist = ThreadedOpenCVCamera(CameraSpec.from_yaml(WRIST_CAMERA_CONFIG))
+    side = ThreadedOpenCVCamera(CameraSpec.from_yaml(phase5.SIDE_CAMERA_CONFIG))
     robot = SO101Follower(
         SO101FollowerConfig(
             port=args.robot_port,
@@ -415,7 +980,7 @@ def main() -> None:
                 home_stop.set()
                 print("\n[CTRL+C] HOME emergency stop requested; current bus operation will finish first.")
             return
-        if current in {"ACT", "TAKEOVER", "STARTUP"}:
+        if current in {"ACT", "DETERMINISTIC", "PRESS", "STARTUP"}:
             if not autonomy_stop.is_set():
                 autonomy_stop.set()
                 print("\n[CTRL+C] autonomy stop requested; current bus operation will finish first.")
@@ -423,13 +988,13 @@ def main() -> None:
 
     def guarded_raise_if_screen_event():
         original_raise_if_screen_event()
-        if phase["name"] == "TAKEOVER" and autonomy_stop.is_set():
-            raise OperatorStop("operator stop during WRIST takeover")
+        if phase["name"] in {"DETERMINISTIC", "PRESS"} and autonomy_stop.is_set():
+            raise OperatorStop("operator stop during deterministic phase")
 
     def guarded_wait_motion_stable(robot_obj, motor_names_obj):
         settled = original_wait_motion_stable(robot_obj, motor_names_obj)
-        if phase["name"] == "TAKEOVER" and autonomy_stop.is_set():
-            raise OperatorStop("operator stop during WRIST takeover")
+        if phase["name"] in {"DETERMINISTIC", "PRESS"} and autonomy_stop.is_set():
+            raise OperatorStop("operator stop during deterministic phase")
         if phase["name"] == "HOME" and home_stop.is_set():
             raise HomeStop("operator emergency stop during HOME recovery")
         return settled
@@ -444,7 +1009,9 @@ def main() -> None:
     target_trigger = None
     handoff_candidate_trigger = None
     settled_endpoint = None
-    takeover_result = None
+    deterministic_result = None
+    screen_baseline = None
+    baseline_side_frame_id = -1
     home_result = {"status": "NOT_ATTEMPTED"}
 
     rollout_start = None
@@ -468,9 +1035,52 @@ def main() -> None:
     send_timestamps: list[float] = []
 
     try:
+        print()
+        print("Before continuing, the Mac screen must contain exactly:")
+        print()
+        print(f"    {args.confirmed_prefix}")
+        print()
+        print(
+            "with the caret immediately after the final character. "
+            "Keep key-repeat delay at the previously accepted Phase-5 setting."
+        )
+        input("\nPress ENTER when the screen is ready: ")
+
         top.start()
         wrist.start()
+        side.start()
         _wait_initial_frames(top, wrist)
+        side_deadline = time.monotonic() + 5.0
+        while time.monotonic() < side_deadline:
+            if side.latest() is not None:
+                break
+            time.sleep(0.02)
+        else:
+            raise RuntimeError("SIDE did not produce an initial frame")
+
+        time.sleep(0.5)
+        print()
+        print("===== SCREEN BASELINE =====")
+        baseline, baseline_side_frame_id, baseline_records = (
+            phase5.capture_screen_verification(
+                side_camera=side,
+                calibration=screen_calibration,
+                ocr=screen_ocr,
+                after_frame_id=-1,
+                min_timestamp=None,
+            )
+        )
+        screen_baseline = {
+            "status": str(baseline.status),
+            "records": baseline_records,
+        }
+        if (
+            baseline.status
+            is not phase5.ScreenVerificationStatus.CONFIRMED_NO_CHANGE
+        ):
+            raise RuntimeError(
+                "SIDE baseline is not CONFIRMED_NO_CHANGE. Do not move the robot."
+            )
 
         robot.connect()
         motor_names = list(robot.bus.motors.keys())
@@ -825,7 +1435,7 @@ def main() -> None:
             next_tick += period_s
 
         if task_status == "HANDOFF_CANDIDATE":
-            phase["name"] = "TAKEOVER"
+            phase["name"] = "DETERMINISTIC"
             settled_timestamp = phase5.wait_motion_stable(robot, motor_names)
             if autonomy_stop.is_set():
                 raise OperatorStop("operator stop before settled endpoint measurement")
@@ -904,40 +1514,65 @@ def main() -> None:
                 )
 
             if autonomy_stop.is_set():
-                raise OperatorStop("operator stop before WRIST takeover")
+                raise OperatorStop("operator stop before deterministic ownership")
 
             print()
             print("=" * 78)
-            print("DETERMINISTIC WRIST TAKEOVER")
+            print("END-TO-END DETERMINISTIC SINGLE-KEY PHASE")
             print("=" * 78)
 
-            try:
-                takeover_result = _run_takeover(
-                    robot=robot,
-                    wrist_camera=wrist,
-                    target=target,
-                    motor_names=motor_names,
-                    endpoint_settled_timestamp=settled_timestamp,
-                    episode_dir=run_dir,
+            endpoint_wrist_frame_id = int(
+                (
+                    settled_endpoint.get("frame_id")
+                    if isinstance(settled_endpoint, dict)
+                    and settled_endpoint.get("frame_id") is not None
+                    else handoff_candidate_trigger["wrist_frame_id"]
                 )
-            except OperatorStop:
-                raise
-            except Exception as exc:
-                task_status = "FAIL_TAKEOVER"
-                task_error = f"{type(exc).__name__}: {exc}"
-                _append_jsonl(
-                    events_path,
-                    {"event": "TAKEOVER_FAIL", "error": task_error},
-                )
-                print("\n[TAKEOVER FAIL]", task_error)
-            else:
-                if autonomy_stop.is_set():
-                    raise OperatorStop("operator stop during WRIST takeover")
+            )
+
+            deterministic_result = _run_full_deterministic_press(
+                robot=robot,
+                wrist_camera=wrist,
+                side_camera=side,
+                target=target,
+                motor_names=motor_names,
+                recognizer=recognizer,
+                tool_reference=tool_reference,
+                screen_calibration=screen_calibration,
+                screen_ocr=screen_ocr,
+                screen_char_ocr=screen_char_ocr,
+                baseline_side_frame_id=baseline_side_frame_id,
+                endpoint_settled_timestamp=settled_timestamp,
+                endpoint_wrist_frame_id=endpoint_wrist_frame_id,
+                run_dir=run_dir,
+                autonomy_stop=autonomy_stop,
+                phase=phase,
+            )
+
+            _append_jsonl(
+                events_path,
+                {
+                    "event": (
+                        "END_TO_END_PASS"
+                        if deterministic_result["success"]
+                        else "END_TO_END_FAIL"
+                    ),
+                    "outcome": deterministic_result["outcome"],
+                    "controller_state": deterministic_result["controller_state"],
+                    "final_xyz_mm": deterministic_result["final_xyz_mm"],
+                },
+            )
+
+            if deterministic_result["success"]:
                 task_status = "PASS"
-                _append_jsonl(
-                    events_path,
-                    {"event": "TAKEOVER_PASS", **takeover_result},
+                print("\n[END-TO-END PASS] SIDE confirmed expected character.")
+            else:
+                task_status = "FAIL_PRESS_OUTCOME"
+                task_error = (
+                    "deterministic press completed with outcome "
+                    f"{deterministic_result['outcome']}"
                 )
+                print("\n[END-TO-END FAIL]", task_error)
 
     except OperatorStop as exc:
         task_status = "OPERATOR_ABORT"
@@ -1023,8 +1658,10 @@ def main() -> None:
                     signal_installed = False
                 _emergency_hold_until_operator(robot, home_result["error"])
 
+        phase5.ACTIVE_SCREEN_WATCHER = None
         top.stop()
         wrist.stop()
+        side.stop()
 
         phase5.raise_if_screen_event = original_raise_if_screen_event
         phase5.wait_motion_stable = original_wait_motion_stable
@@ -1059,7 +1696,7 @@ def main() -> None:
             physical_range = np.zeros(6, dtype=np.float64)
 
         summary = {
-            "schema": "phase7.act_rollout_eval.v6",
+            "schema": "phase8.single_key_integration.v1",
             "target": target,
             "checkpoint": str(args.checkpoint),
             "task_status": task_status,
@@ -1081,7 +1718,8 @@ def main() -> None:
                 "meaning": "moving_frame_candidate_only_not_servo_ready",
             },
             "settled_endpoint": settled_endpoint,
-            "takeover": takeover_result,
+            "screen_baseline": screen_baseline,
+            "deterministic_result": deterministic_result,
             "physical_motion": {
                 "joint_names": motor_names,
                 "net_deg": physical_net.tolist(),
@@ -1117,7 +1755,7 @@ def main() -> None:
 
         print()
         print("=" * 78)
-        print("PHASE 7 ROLLOUT SUMMARY")
+        print("PHASE 8 END-TO-END SUMMARY")
         print("=" * 78)
         print("task status         :", task_status)
         print("ACT duration        :", act_duration_s)
