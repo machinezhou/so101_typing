@@ -1855,15 +1855,21 @@ Phase 7 multi-target ACT coarse-policy acceptance    ✓ COMPLETED
         ↓
 Phase 8 first G full physical integration pilot      ✓ PHYSICAL LOOP CLOSED
         ↓
-released-character software verdict                  ✗ BLOCKER: actual g -> OCR Q (5/5)
+Phase 8 endpoint handoff contract                    ✓ IMPLEMENTED
         ↓
-remove validation-only runtime scaffolding           ← NEXT
+mandatory settled endpoint recheck                   ✓ IMPLEMENTED
         ↓
-add autonomous absolute-depth/workspace safety bound ← NEXT
+fixed-anchor release / retreat residual semantics    ✓ HARDENED
         ↓
-fix released-char OCR from real run regression data  ← NEXT
+moving target geometry-reference lifetime            ✗ OPEN
         ↓
-repeat G until software SUCCESS + HOME PASS           ← NEXT
+safety-aware adaptive retract segmentation           ✗ OPEN
+        ↓
+released-character OCR / semantic verification       ✗ OPEN
+        ↓
+repeat single-key runs until:
+physical result + SIDE semantic SUCCESS
++ bounded retract + HOME all agree                    ← NEXT
         ↓
 cross-key Phase 8 acceptance                         FUTURE
 ```
