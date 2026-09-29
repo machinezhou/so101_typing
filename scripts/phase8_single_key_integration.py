@@ -35,6 +35,10 @@ from phase6_replay_takeover_validate import (
     _verify_home,
 )
 from so101_typing.adapters.cameras import CameraSpec, ThreadedOpenCVCamera
+from so101_typing.control.handoff_endpoint import (
+    HandoffEndpointContract,
+    HandoffFrameConfirmation,
+)
 from so101_typing.control.tool_reference import ToolReferenceCalibration
 from so101_typing.perception.glyph_runtime import RuntimeHOGGlyphRecognizer
 from so101_typing.perception.semantic_target_lock import SemanticTargetLock
@@ -58,7 +62,16 @@ DEFAULT_N_ACTION_STEPS = CHUNK_SIZE
 STARTUP_SENT_DIFF_DEG = 0.25
 HOME_STEP_DEG = 2.0
 CAMERA_WARMUP_S = 2.0
-HANDOFF_CANDIDATE_THRESHOLD_PX = float(phase5.INITIAL_CAPTURE_THRESHOLD_PX)
+HANDOFF_ENDPOINT_CONTRACT = Path(
+    "calibration/handoff_endpoint_contract.json"
+)
+
+# Historical Phase-5 capture reference only.
+# This value MUST NOT transfer controller ownership.
+PHASE5_CAPTURE_REFERENCE_THRESHOLD_PX = float(
+    phase5.INITIAL_CAPTURE_THRESHOLD_PX
+)
+
 HANDOFF_CANDIDATE_MIN_KEYCAPS = 4
 SCREEN_NO_EVENT_CONFIRM_S = 0.35
 SCREEN_NO_EVENT_MIN_FRESH_FRAMES = 4
@@ -80,6 +93,10 @@ class OperatorStop(RuntimeError):
 
 
 class HomeStop(RuntimeError):
+    pass
+
+
+class HandoffRejected(RuntimeError):
     pass
 
 
@@ -277,26 +294,64 @@ def _capture_settled_endpoint(
     target: str,
     tool_reference,
     settled_timestamp: float,
+    semantic_lock,
+    after_frame_id: int,
 ) -> dict:
-    """Measure ACT's settled endpoint without making an acceptance decision.
+    """Measure the settled ACT endpoint using the already-locked identity.
 
-    Reuse the Phase-5 initial semantic-target capture contract so this
-    diagnostic does not invent a second target-acquisition implementation.
-    The 80 px threshold is reported only as a historical Phase-5 capture
-    reference; deterministic WRIST convergence remains the ground truth.
+    Target identity is established during ACT motion. The settled gate must
+    preserve that same physical key; it must not create a fresh empty lock and
+    require HOG to rediscover the glyph after the arm stops.
     """
     phase5.TARGET = target
-    semantic_lock = SemanticTargetLock(target)
-    min_timestamp = float(settled_timestamp) + float(phase5.POST_MOTION_GUARD_S)
 
-    target_center, error, error_norm, frame = (
-        phase5.capture_initial_semantic_target(
-            wrist_camera,
-            recognizer,
-            semantic_lock,
-            tool_reference,
-            min_timestamp=min_timestamp,
+    if (
+        semantic_lock is None
+        or not semantic_lock.locked
+    ):
+        raise RuntimeError(
+            "settled endpoint requires an already-established "
+            "moving semantic target lock"
         )
+
+    # Geometry remains authoritative across transient glyph dropout.
+    # Sporadic later semantic observations cannot silently replace the
+    # already-established physical target identity.
+    phase5.SEMANTIC_REENTRY_GUARDED = True
+
+    min_timestamp = (
+        float(settled_timestamp)
+        + float(phase5.POST_MOTION_GUARD_S)
+    )
+
+    observation, frame = phase5.capture_locked_target(
+        wrist_camera,
+        recognizer,
+        semantic_lock,
+        after_frame_id=int(after_frame_id),
+        min_timestamp=min_timestamp,
+        commit_reference=True,
+    )
+
+    if (
+        not observation.found
+        or observation.center_px is None
+    ):
+        raise RuntimeError(
+            "locked target unavailable at settled endpoint"
+        )
+
+    target_center = observation.center_px
+
+    error = np.asarray(
+        tool_reference.error_px(
+            target_center
+        ),
+        dtype=np.float64,
+    )
+
+    error_norm = float(
+        np.linalg.norm(error)
     )
 
     return {
@@ -306,17 +361,29 @@ def _capture_settled_endpoint(
         "settled_timestamp": float(settled_timestamp),
         "post_motion_guard_s": float(phase5.POST_MOTION_GUARD_S),
         "min_timestamp": min_timestamp,
-        "target_center_px": [float(target_center[0]), float(target_center[1])],
-        "tool_tip_px": [float(tool_reference.center[0]), float(tool_reference.center[1])],
-        "error_px": [float(error[0]), float(error[1])],
+        "target_center_px": [
+            float(target_center[0]),
+            float(target_center[1]),
+        ],
+        "tool_tip_px": [
+            float(tool_reference.center[0]),
+            float(tool_reference.center[1]),
+        ],
+        "error_px": [
+            float(error[0]),
+            float(error[1]),
+        ],
         "error_norm_px": float(error_norm),
-        "phase5_capture_threshold_px": HANDOFF_CANDIDATE_THRESHOLD_PX,
-        "within_phase5_capture_threshold": bool(
-            error_norm <= HANDOFF_CANDIDATE_THRESHOLD_PX
+        "tracking_source": str(observation.source),
+        "phase5_capture_threshold_px": (
+            PHASE5_CAPTURE_REFERENCE_THRESHOLD_PX
         ),
-        "acceptance_role": "diagnostic_only",
+        "within_phase5_capture_threshold": bool(
+            error_norm
+            <= PHASE5_CAPTURE_REFERENCE_THRESHOLD_PX
+        ),
+        "acceptance_role": "handoff_gate",
     }
-
 
 def _retract_to_z0(
     *,
@@ -628,6 +695,7 @@ def _run_full_deterministic_press(
     target: str,
     motor_names: list[str],
     recognizer,
+    semantic_lock,
     tool_reference,
     screen_calibration,
     screen_char_ocr,
@@ -647,14 +715,21 @@ def _run_full_deterministic_press(
     phase5.TARGET = target
     phase5.ARTIFACT_DIR = run_dir / "deterministic"
     phase5.ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    phase5.SEMANTIC_REENTRY_GUARDED = False
+    phase5.SEMANTIC_REENTRY_GUARDED = True
     phase5.ACTIVE_SCREEN_WATCHER = None
 
     jacobian = phase5.ImageJacobianCalibration.load(phase5.IMAGE_JACOBIAN)
     if jacobian is None:
         raise RuntimeError("image Jacobian is missing")
 
-    semantic_lock = phase5.SemanticTargetLock(target)
+    if (
+        semantic_lock is None
+        or not semantic_lock.locked
+    ):
+        raise RuntimeError(
+            "deterministic ownership requires the "
+            "already-established target identity lock"
+        )
 
     present_observation = phase5.ordered_joint_observation(
         robot.get_observation(),
@@ -1130,7 +1205,7 @@ def main() -> None:
         "--n-action-steps",
         type=int,
         default=DEFAULT_N_ACTION_STEPS,
-        help="ACT execution horizon before policy replans; Phase 7 runtime value is not frozen yet.",
+        help="ACT execution horizon before policy replans; Phase 7 retained baseline is 20.",
     )
     parser.add_argument("--robot-port", default=ROBOT_PORT)
     parser.add_argument("--recovery-home", type=Path, default=RECOVERY_HOME_CONFIG)
@@ -1138,16 +1213,18 @@ def main() -> None:
     args = parser.parse_args()
 
     target = str(args.target).strip().upper()
-    if target != "G":
-        raise ValueError(
-            "Phase-8 v4 hardening run is intentionally restricted to target G"
-        )
+    if target not in TARGET_VOCAB[:26]:
+        raise ValueError("Phase-8 formal single-key runtime currently supports A-Z targets")
     if not np.isfinite(args.duration) or args.duration <= 0.0:
         raise ValueError("--duration must be finite and > 0")
     if not 1 <= args.n_action_steps <= CHUNK_SIZE:
         raise ValueError(f"--n-action-steps must be in [1, {CHUNK_SIZE}]")
 
     autonomous_worst_case_norm_mm = _validate_autonomous_safety_contract()
+
+    handoff_contract = HandoffEndpointContract.load(
+        HANDOFF_ENDPOINT_CONTRACT
+    )
 
     print("=" * 78)
     print("PHASE 8 — SINGLE-KEY RUNTIME HARDENING v4")
@@ -1161,13 +1238,20 @@ def main() -> None:
     print("execution horizon    :", f"{args.n_action_steps / ROLLOUT_HZ:.3f} s")
     print("ACT queue            : OFFICIAL policy.select_action()")
     print(
-        "handoff candidate   :",
-        f"moving target + >= {HANDOFF_CANDIDATE_MIN_KEYCAPS} keycaps "
-        f"+ error <= {HANDOFF_CANDIDATE_THRESHOLD_PX:.1f} px",
+        "handoff gate        :",
+        f"verified endpoint hull + "
+        f"{handoff_contract.acceptance_margin_px:.1f}px margin; "
+        f"{handoff_contract.required_consecutive_frames} consecutive "
+        f"fresh WRIST frames; >= {HANDOFF_CANDIDATE_MIN_KEYCAPS} keycaps",
+    )
+    print(
+        "80 px legacy role   :",
+        "diagnostic reference only; NEVER transfers ownership",
     )
     print(
         "settled endpoint    :",
-        "fresh WRIST after motion-stable + POST_MOTION_GUARD (diagnostic only)",
+        "fresh WRIST after motion-stable + POST_MOTION_GUARD; "
+        "must pass same verified endpoint contract",
     )
     print("deterministic phase  : SAME Goal anchor through align + Z + release + retract")
     print("success authority    : SIDE novel-character OCR == target")
@@ -1252,9 +1336,9 @@ def main() -> None:
         raise RuntimeError("screen calibration is missing")
     screen_char_ocr = phase5.TesseractSingleCharacterOCR(
         language="eng",
-        scale=4.0,
-        clahe_clip_limit=2.0,
-        dark_threshold=185,
+        scale=2.0,
+        psm=13,
+        whitelist="abcdefghijklmnopqrstuvwxyz",
     )
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1298,7 +1382,13 @@ def main() -> None:
                 home_stop.set()
                 print("\n[CTRL+C] HOME emergency stop requested; current bus operation will finish first.")
             return
-        if current in {"ACT", "DETERMINISTIC", "PRESS", "STARTUP"}:
+        if current in {
+            "ACT",
+            "HANDOFF_SETTLE",
+            "DETERMINISTIC",
+            "PRESS",
+            "STARTUP",
+        }:
             if not autonomy_stop.is_set():
                 autonomy_stop.set()
                 print("\n[CTRL+C] autonomy stop requested; current bus operation will finish first.")
@@ -1326,6 +1416,12 @@ def main() -> None:
     task_error = None
     target_trigger = None
     handoff_candidate_trigger = None
+
+    # Endpoint handoff requires consecutive distinct WRIST frames.
+    # The pure state machine is covered by unit tests.
+    handoff_confirmation = HandoffFrameConfirmation()
+    handoff_endpoint_streak = 0
+
     settled_endpoint = None
     deterministic_result = None
     deterministic_safety_context: dict = {}
@@ -1459,6 +1555,11 @@ def main() -> None:
         print("ACT APPROACH START")
         print("=" * 78)
 
+        # Establish target identity once from semantics, then carry that same
+        # physical key through ACT motion with keyboard geometry. HOG does
+        # not need to rediscover the requested glyph on every moving frame.
+        moving_target_lock = SemanticTargetLock(target)
+
         while True:
             precise_sleep(max(0.0, next_tick - time.perf_counter()))
             cycle_start = time.perf_counter()
@@ -1518,85 +1619,393 @@ def main() -> None:
             perception_ms = (time.perf_counter() - perception_started) * 1000.0
 
             keycap_count = len(glyph_observations)
+
+            keycap_centers = [
+                observation.center_px
+                for observation in glyph_observations
+            ]
+
+            semantic_target_found = (
+                target_observation.found
+                and target_observation.center_px is not None
+            )
+
+            tracked_target_observation = None
+            moving_tracking_source = "unlocked"
+
+            if not moving_target_lock.locked:
+                if (
+                    semantic_target_found
+                    and keycap_count
+                    >= HANDOFF_CANDIDATE_MIN_KEYCAPS
+                ):
+                    tracked_target_observation = (
+                        moving_target_lock.observe_semantic(
+                            target_center_px=(
+                                target_observation.center_px
+                            ),
+                            keycap_centers=keycap_centers,
+                        )
+                    )
+
+                    moving_tracking_source = "semantic_seed"
+
+                    print(
+                        f"\n[MOVING TARGET LOCK] "
+                        f"frame={int(wrist_frame.frame_id)} "
+                        f"target={target} "
+                        f"center="
+                        f"{tracked_target_observation.center_px} "
+                        f"keycaps={keycap_count}"
+                    )
+
+            elif (
+                keycap_count
+                >= HANDOFF_CANDIDATE_MIN_KEYCAPS
+            ):
+                # Geometry preserves the identity of the already-locked
+                # physical key. A rejected geometry estimate does not mutate
+                # the lock.
+                tracked_target_observation = (
+                    moving_target_lock.propagate_geometry(
+                        keycap_centers
+                    )
+                )
+
+                if (
+                    tracked_target_observation.found
+                    and tracked_target_observation.center_px
+                    is not None
+                ):
+                    moving_tracking_source = "geometry"
+
+                elif semantic_target_found:
+                    # Geometry can temporarily be unavailable because of
+                    # partial visibility or a large inter-frame change.
+                    # Semantic recognition may then refresh the identity,
+                    # but it still names the same requested key.
+                    tracked_target_observation = (
+                        moving_target_lock.observe_semantic(
+                            target_center_px=(
+                                target_observation.center_px
+                            ),
+                            keycap_centers=keycap_centers,
+                        )
+                    )
+
+                    moving_tracking_source = "semantic_refresh"
+
             handoff_error_px = None
             handoff_error_norm_px = None
+
+            handoff_endpoint_accepted = False
+            handoff_endpoint_signed_distance_px = None
+            handoff_endpoint_clearance_px = None
             handoff_candidate_now = False
 
-            if target_observation.found and target_observation.center_px is not None:
+            current_wrist_frame_id = int(
+                wrist_frame.frame_id
+            )
+
+            if (
+                tracked_target_observation is not None
+                and tracked_target_observation.found
+                and tracked_target_observation.center_px
+                is not None
+            ):
                 handoff_error_px = np.asarray(
-                    tool_reference.error_px(target_observation.center_px),
+                    tool_reference.error_px(
+                        tracked_target_observation.center_px
+                    ),
                     dtype=np.float64,
                 )
-                handoff_error_norm_px = float(np.linalg.norm(handoff_error_px))
+                handoff_error_norm_px = float(
+                    np.linalg.norm(
+                        handoff_error_px
+                    )
+                )
 
-                # TARGET_ACQUIRED is diagnostic only.  Seeing the glyph does NOT
-                # transfer controller ownership.
-                if target_trigger is None:
+                # TARGET_ACQUIRED only means the requested glyph
+                # is visible. Visibility alone NEVER transfers
+                # controller ownership.
+                if (
+                    target_trigger is None
+                    and semantic_target_found
+                ):
                     target_trigger = {
                         "tick": tick,
                         "commands_sent": command_count,
-                        "act_elapsed_s": float(time.perf_counter() - rollout_start),
-                        "top_frame_id": int(top_frame.frame_id),
-                        "wrist_frame_id": int(wrist_frame.frame_id),
-                        "keycap_count": int(keycap_count),
-                        "tool_tip_px": list(tool_reference.center),
-                        "error_px": handoff_error_px.tolist(),
-                        "error_norm_px": handoff_error_norm_px,
-                        "observation": target_observation.to_dict(),
+                        "act_elapsed_s": float(
+                            time.perf_counter()
+                            - rollout_start
+                        ),
+                        "top_frame_id": int(
+                            top_frame.frame_id
+                        ),
+                        "wrist_frame_id": (
+                            current_wrist_frame_id
+                        ),
+                        "keycap_count": int(
+                            keycap_count
+                        ),
+                        "tool_tip_px": list(
+                            tool_reference.center
+                        ),
+                        "error_px": (
+                            handoff_error_px.tolist()
+                        ),
+                        "error_norm_px": (
+                            handoff_error_norm_px
+                        ),
+                        "observation": (
+                            target_observation.to_dict()
+                        ),
                     }
+
                     _append_jsonl(
                         events_path,
-                        {"event": "TARGET_ACQUIRED", **target_trigger},
-                    )
-                    print(
-                        f"\n[TARGET ACQUIRED] t={target_trigger['act_elapsed_s']:.3f}s "
-                        f"commands={command_count} center={target_observation.center_px} "
-                        f"error={handoff_error_norm_px:.2f}px keycaps={keycap_count}"
-                    )
-                    print(
-                        "[ACT CONTINUES] target is visible, but controller ownership stays with ACT "
-                        "until the moving-frame handoff-candidate condition is reached."
+                        {
+                            "event": "TARGET_ACQUIRED",
+                            **target_trigger,
+                        },
                     )
 
-                handoff_candidate_now = (
-                    keycap_count >= HANDOFF_CANDIDATE_MIN_KEYCAPS
-                    and handoff_error_norm_px <= HANDOFF_CANDIDATE_THRESHOLD_PX
+                    print(
+                        f"\n[TARGET ACQUIRED] "
+                        f"t={target_trigger['act_elapsed_s']:.3f}s "
+                        f"commands={command_count} "
+                        f"center="
+                        f"{target_observation.center_px} "
+                        f"error="
+                        f"{handoff_error_norm_px:.2f}px "
+                        f"keycaps={keycap_count}"
+                    )
+
+                    print(
+                        "[ACT CONTINUES] visibility is "
+                        "diagnostic only; verified endpoint "
+                        "contract controls handoff."
+                    )
+
+                endpoint_evaluation = (
+                    handoff_contract.evaluate(
+                        handoff_error_px
+                    )
                 )
 
-                if handoff_candidate_now:
-                    rollout_stop = time.perf_counter()
+                handoff_endpoint_accepted = bool(
+                    endpoint_evaluation.accepted
+                )
+
+                handoff_endpoint_signed_distance_px = (
+                    float(
+                        endpoint_evaluation
+                        .signed_distance_to_hull_px
+                    )
+                )
+
+                handoff_endpoint_clearance_px = float(
+                    endpoint_evaluation
+                    .acceptance_clearance_px
+                )
+
+                endpoint_eligible_now = (
+                    keycap_count
+                    >= HANDOFF_CANDIDATE_MIN_KEYCAPS
+                    and handoff_endpoint_accepted
+                )
+
+                previous_streak = (
+                    handoff_confirmation.streak
+                )
+
+                (
+                    handoff_confirmation,
+                    handoff_frame_is_fresh,
+                ) = handoff_confirmation.observe(
+                    current_wrist_frame_id,
+                    eligible=endpoint_eligible_now,
+                )
+
+                handoff_endpoint_streak = (
+                    handoff_confirmation.streak
+                )
+
+                if handoff_frame_is_fresh:
+                    if endpoint_eligible_now:
+                        print(
+                            f"\n[HANDOFF WINDOW] "
+                            f"frame="
+                            f"{current_wrist_frame_id} "
+                            f"streak="
+                            f"{handoff_endpoint_streak}/"
+                            f"{handoff_contract.required_consecutive_frames} "
+                            f"error=("
+                            f"{handoff_error_px[0]:+.2f},"
+                            f"{handoff_error_px[1]:+.2f})px "
+                            f"norm="
+                            f"{handoff_error_norm_px:.2f}px "
+                            f"clearance="
+                            f"{handoff_endpoint_clearance_px:+.2f}px "
+                            f"source={moving_tracking_source}"
+                        )
+
+                    elif previous_streak > 0:
+                        print(
+                            f"\n[HANDOFF RESET] "
+                            f"frame="
+                            f"{current_wrist_frame_id} "
+                            "fresh observation left the "
+                            "verified endpoint region."
+                        )
+
+                handoff_candidate_now = (
+                    handoff_confirmation.confirmed(
+                        handoff_contract
+                        .required_consecutive_frames
+                    )
+                )
+
+                if (
+                    handoff_frame_is_fresh
+                    and handoff_candidate_now
+                ):
+                    rollout_stop = (
+                        time.perf_counter()
+                    )
+
+                    # Ownership boundary:
+                    # flush every queued ACT command before
+                    # deterministic control can ever be allowed.
                     policy.reset()
                     _processor_reset(preprocessor)
                     _processor_reset(postprocessor)
+
                     handoff_candidate_trigger = {
                         "tick": tick,
                         "commands_sent": command_count,
-                        "act_elapsed_s": float(rollout_stop - rollout_start),
-                        "top_frame_id": int(top_frame.frame_id),
-                        "wrist_frame_id": int(wrist_frame.frame_id),
-                        "keycap_count": int(keycap_count),
-                        "tool_tip_px": list(tool_reference.center),
-                        "error_px": handoff_error_px.tolist(),
-                        "error_norm_px": handoff_error_norm_px,
-                        "threshold_px": HANDOFF_CANDIDATE_THRESHOLD_PX,
-                        "observation": target_observation.to_dict(),
+                        "act_elapsed_s": float(
+                            rollout_stop
+                            - rollout_start
+                        ),
+                        "top_frame_id": int(
+                            top_frame.frame_id
+                        ),
+                        "wrist_frame_id": (
+                            current_wrist_frame_id
+                        ),
+                        "keycap_count": int(
+                            keycap_count
+                        ),
+                        "tool_tip_px": list(
+                            tool_reference.center
+                        ),
+                        "error_px": (
+                            handoff_error_px.tolist()
+                        ),
+                        "error_norm_px": (
+                            handoff_error_norm_px
+                        ),
+                        "contract_path": str(
+                            HANDOFF_ENDPOINT_CONTRACT
+                        ),
+                        "contract_margin_px": float(
+                            handoff_contract
+                            .acceptance_margin_px
+                        ),
+                        "required_consecutive_frames": (
+                            int(
+                                handoff_contract
+                                .required_consecutive_frames
+                            )
+                        ),
+                        "confirmed_streak": int(
+                            handoff_endpoint_streak
+                        ),
+                        "signed_distance_to_hull_px": (
+                            handoff_endpoint_signed_distance_px
+                        ),
+                        "acceptance_clearance_px": (
+                            handoff_endpoint_clearance_px
+                        ),
+                        "moving_tracking_source": (
+                            moving_tracking_source
+                        ),
+                        "tracked_target_center_px": list(
+                            tracked_target_observation.center_px
+                        ),
+                        "observation": (
+                            target_observation.to_dict()
+                        ),
                     }
+
                     _append_jsonl(
                         events_path,
-                        {"event": "HANDOFF_CANDIDATE", **handoff_candidate_trigger},
+                        {
+                            "event": (
+                                "HANDOFF_CANDIDATE"
+                            ),
+                            **handoff_candidate_trigger,
+                        },
                     )
-                    task_status = "HANDOFF_CANDIDATE"
+
+                    task_status = (
+                        "HANDOFF_CANDIDATE"
+                    )
+
                     print(
-                        f"\n[HANDOFF CANDIDATE] "
-                        f"t={handoff_candidate_trigger['act_elapsed_s']:.3f}s "
-                        f"commands={command_count} error={handoff_error_norm_px:.2f}px "
-                        f"<= {HANDOFF_CANDIDATE_THRESHOLD_PX:.1f}px keycaps={keycap_count}"
+                        f"\n[HANDOFF CONFIRMED] "
+                        f"t="
+                        f"{handoff_candidate_trigger['act_elapsed_s']:.3f}s "
+                        f"commands={command_count} "
+                        f"streak="
+                        f"{handoff_endpoint_streak}/"
+                        f"{handoff_contract.required_consecutive_frames} "
+                        f"error=("
+                        f"{handoff_error_px[0]:+.2f},"
+                        f"{handoff_error_px[1]:+.2f})px "
+                        f"norm="
+                        f"{handoff_error_norm_px:.2f}px "
+                        f"clearance="
+                        f"{handoff_endpoint_clearance_px:+.2f}px"
                     )
+
                     print(
-                        "[ACT STOP] candidate only; settled endpoint will be measured "
-                        "before ground-truth takeover."
+                        "[ACT STOP] locked target reached the "
+                        "verified demonstration endpoint; "
+                        "settled endpoint verification remains mandatory."
                     )
+
                     break
+
+            else:
+                previous_streak = (
+                    handoff_confirmation.streak
+                )
+
+                (
+                    handoff_confirmation,
+                    handoff_frame_is_fresh,
+                ) = handoff_confirmation.observe(
+                    current_wrist_frame_id,
+                    eligible=False,
+                )
+
+                handoff_endpoint_streak = (
+                    handoff_confirmation.streak
+                )
+
+                if (
+                    handoff_frame_is_fresh
+                    and previous_streak > 0
+                ):
+                    print(
+                        f"\n[HANDOFF RESET] "
+                        f"frame="
+                        f"{current_wrist_frame_id} "
+                        "locked target unavailable in "
+                        "fresh WRIST frame."
+                    )
 
             replanned = action_index_in_chunk == 0
             if replanned:
@@ -1709,7 +2118,18 @@ def main() -> None:
                     "keycap_count": int(keycap_count),
                     "handoff_error_px": None if handoff_error_px is None else handoff_error_px.tolist(),
                     "handoff_error_norm_px": handoff_error_norm_px,
-                    "handoff_candidate": bool(handoff_candidate_now),
+                    "handoff_endpoint_accepted": bool(
+                        handoff_endpoint_accepted
+                    ),
+                    "handoff_endpoint_signed_distance_px": (
+                        handoff_endpoint_signed_distance_px
+                    ),
+                    "handoff_endpoint_clearance_px": (
+                        handoff_endpoint_clearance_px
+                    ),
+                    "handoff_endpoint_streak": int(
+                        handoff_endpoint_streak
+                    ),
                     "frame_save_queued": frame_queued,
                 },
             )
@@ -1740,14 +2160,23 @@ def main() -> None:
             next_tick += period_s
 
         if task_status == "HANDOFF_CANDIDATE":
-            phase["name"] = "DETERMINISTIC"
-            settled_timestamp = phase5.wait_motion_stable(robot, motor_names)
+            # ACT has stopped, but deterministic ownership has NOT transferred
+            # yet.  First prove that the physically settled arm still lies in
+            # the verified demonstration endpoint region.
+            phase["name"] = "HANDOFF_SETTLE"
+
+            settled_timestamp = phase5.wait_motion_stable(
+                robot,
+                motor_names,
+            )
             if autonomy_stop.is_set():
-                raise OperatorStop("operator stop before settled endpoint measurement")
+                raise OperatorStop(
+                    "operator stop before settled endpoint measurement"
+                )
 
             print()
             print("=" * 78)
-            print("SETTLED ACT ENDPOINT DIAGNOSTIC")
+            print("SETTLED ACT ENDPOINT HANDOFF GATE")
             print("=" * 78)
 
             try:
@@ -1757,6 +2186,12 @@ def main() -> None:
                     target=target,
                     tool_reference=tool_reference,
                     settled_timestamp=settled_timestamp,
+                    semantic_lock=moving_target_lock,
+                    after_frame_id=int(
+                        handoff_candidate_trigger[
+                            "wrist_frame_id"
+                        ]
+                    ),
                 )
             except OperatorStop:
                 raise
@@ -1764,62 +2199,159 @@ def main() -> None:
                 settled_endpoint = {
                     "status": "UNAVAILABLE",
                     "error": f"{type(exc).__name__}: {exc}",
-                    "settled_timestamp": float(settled_timestamp),
-                    "post_motion_guard_s": float(phase5.POST_MOTION_GUARD_S),
-                    "acceptance_role": "diagnostic_only",
+                    "settled_timestamp": float(
+                        settled_timestamp
+                    ),
+                    "post_motion_guard_s": float(
+                        phase5.POST_MOTION_GUARD_S
+                    ),
+                    "acceptance_role": "handoff_gate",
+                    "accepted": False,
                 }
-                _append_jsonl(
-                    events_path,
-                    {"event": "SETTLED_ENDPOINT_UNAVAILABLE", **settled_endpoint},
-                )
-                print(
-                    "[SETTLED ENDPOINT] measurement unavailable; "
-                    "ground-truth takeover will still run:",
-                    settled_endpoint["error"],
-                )
-            else:
-                candidate_error = np.asarray(
-                    handoff_candidate_trigger["error_px"],
-                    dtype=np.float64,
-                )
-                endpoint_error = np.asarray(
-                    settled_endpoint["error_px"],
-                    dtype=np.float64,
-                )
-                endpoint_drift = endpoint_error - candidate_error
-                settled_endpoint["moving_candidate_error_px"] = (
-                    candidate_error.tolist()
-                )
-                settled_endpoint["moving_candidate_error_norm_px"] = float(
-                    handoff_candidate_trigger["error_norm_px"]
-                )
-                settled_endpoint["error_drift_px"] = endpoint_drift.tolist()
-                settled_endpoint["error_drift_norm_px"] = float(
-                    np.linalg.norm(endpoint_drift)
-                )
-                settled_endpoint["error_norm_change_px"] = float(
-                    settled_endpoint["error_norm_px"]
-                    - handoff_candidate_trigger["error_norm_px"]
-                )
 
                 _append_jsonl(
                     events_path,
-                    {"event": "SETTLED_ENDPOINT", **settled_endpoint},
+                    {
+                        "event": "SETTLED_ENDPOINT_UNAVAILABLE",
+                        **settled_endpoint,
+                    },
                 )
+
+                raise HandoffRejected(
+                    "settled endpoint could not be measured: "
+                    f"{settled_endpoint['error']}"
+                ) from exc
+
+            candidate_error = np.asarray(
+                handoff_candidate_trigger["error_px"],
+                dtype=np.float64,
+            )
+            endpoint_error = np.asarray(
+                settled_endpoint["error_px"],
+                dtype=np.float64,
+            )
+            endpoint_drift = (
+                endpoint_error - candidate_error
+            )
+
+            endpoint_evaluation = handoff_contract.evaluate(
+                endpoint_error
+            )
+
+            settled_endpoint[
+                "moving_candidate_error_px"
+            ] = candidate_error.tolist()
+
+            settled_endpoint[
+                "moving_candidate_error_norm_px"
+            ] = float(
+                handoff_candidate_trigger["error_norm_px"]
+            )
+
+            settled_endpoint[
+                "error_drift_px"
+            ] = endpoint_drift.tolist()
+
+            settled_endpoint[
+                "error_drift_norm_px"
+            ] = float(
+                np.linalg.norm(endpoint_drift)
+            )
+
+            settled_endpoint[
+                "error_norm_change_px"
+            ] = float(
+                settled_endpoint["error_norm_px"]
+                - handoff_candidate_trigger[
+                    "error_norm_px"
+                ]
+            )
+
+            settled_endpoint[
+                "signed_distance_to_hull_px"
+            ] = float(
+                endpoint_evaluation
+                .signed_distance_to_hull_px
+            )
+
+            settled_endpoint[
+                "acceptance_clearance_px"
+            ] = float(
+                endpoint_evaluation
+                .acceptance_clearance_px
+            )
+
+            settled_endpoint[
+                "contract_margin_px"
+            ] = float(
+                handoff_contract.acceptance_margin_px
+            )
+
+            settled_endpoint[
+                "acceptance_role"
+            ] = "handoff_gate"
+
+            settled_endpoint[
+                "accepted"
+            ] = bool(
+                endpoint_evaluation.accepted
+            )
+
+            _append_jsonl(
+                events_path,
+                {
+                    "event": (
+                        "SETTLED_ENDPOINT_ACCEPTED"
+                        if endpoint_evaluation.accepted
+                        else "SETTLED_ENDPOINT_REJECTED"
+                    ),
+                    **settled_endpoint,
+                },
+            )
+
+            print(
+                f"[SETTLED ENDPOINT] "
+                f"frame={settled_endpoint['frame_id']} "
+                f"error=("
+                f"{endpoint_error[0]:+.2f},"
+                f"{endpoint_error[1]:+.2f})px "
+                f"norm="
+                f"{settled_endpoint['error_norm_px']:.2f}px "
+                f"drift="
+                f"{settled_endpoint['error_drift_norm_px']:.2f}px "
+                f"clearance="
+                f"{endpoint_evaluation.acceptance_clearance_px:+.2f}px"
+            )
+
+            if not endpoint_evaluation.accepted:
                 print(
-                    f"[SETTLED ENDPOINT] frame={settled_endpoint['frame_id']} "
-                    f"error={settled_endpoint['error_norm_px']:.2f}px "
-                    f"norm_change={settled_endpoint['error_norm_change_px']:+.2f}px "
-                    f"drift={settled_endpoint['error_drift_norm_px']:.2f}px "
-                    f"phase5<=80={settled_endpoint['within_phase5_capture_threshold']}"
+                    "[HANDOFF REJECTED] settled arm is outside "
+                    "the verified demonstration endpoint region; "
+                    "deterministic ownership is NOT transferred."
                 )
-                print(
-                    "[DIAGNOSTIC ONLY] settled residual does not gate takeover; "
-                    "deterministic convergence is the ground truth."
+
+                raise HandoffRejected(
+                    "settled ACT endpoint outside verified "
+                    "handoff region: "
+                    f"error=({endpoint_error[0]:+.2f},"
+                    f"{endpoint_error[1]:+.2f})px "
+                    f"clearance="
+                    f"{endpoint_evaluation.acceptance_clearance_px:+.2f}px"
                 )
+
+            print(
+                "[HANDOFF ACCEPTED] settled endpoint passed "
+                "the same verified endpoint contract."
+            )
 
             if autonomy_stop.is_set():
-                raise OperatorStop("operator stop before deterministic ownership")
+                raise OperatorStop(
+                    "operator stop before deterministic ownership"
+                )
+
+            # Only here does ownership actually move from ACT to
+            # the deterministic WRIST/press controller.
+            phase["name"] = "DETERMINISTIC"
 
             print()
             print("=" * 78)
@@ -1842,6 +2374,7 @@ def main() -> None:
                 target=target,
                 motor_names=motor_names,
                 recognizer=recognizer,
+                semantic_lock=moving_target_lock,
                 tool_reference=tool_reference,
                 screen_calibration=screen_calibration,
                 screen_char_ocr=screen_char_ocr,
@@ -1877,6 +2410,13 @@ def main() -> None:
                     f"{deterministic_result['outcome']}"
                 )
                 print("\n[END-TO-END FAIL]", task_error)
+
+    except HandoffRejected as exc:
+        task_status = "HANDOFF_REJECTED"
+        task_error = str(exc)
+        if rollout_start is not None and rollout_stop is None:
+            rollout_stop = time.perf_counter()
+        print("\n[HANDOFF REJECTED]", task_error)
 
     except OperatorStop as exc:
         task_status = "OPERATOR_ABORT"
@@ -2079,7 +2619,7 @@ def main() -> None:
             "target_acquisition": target_trigger,
             "handoff_candidate": handoff_candidate_trigger,
             "handoff_candidate_contract": {
-                "threshold_px": HANDOFF_CANDIDATE_THRESHOLD_PX,
+                "threshold_px": PHASE5_CAPTURE_REFERENCE_THRESHOLD_PX,
                 "min_keycaps": HANDOFF_CANDIDATE_MIN_KEYCAPS,
                 "reference": "phase5.INITIAL_CAPTURE_THRESHOLD_PX",
                 "meaning": "moving_frame_candidate_only_not_servo_ready",

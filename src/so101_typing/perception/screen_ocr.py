@@ -801,6 +801,7 @@ class TesseractSingleCharacterOCR(TesseractScreenLineOCR):
         clahe_clip_limit: float = 2.0,
         dark_threshold: int = 185,
         whitelist: str = DEFAULT_WHITELIST,
+        psm: int = 10,
     ) -> None:
         super().__init__(
             language=language,
@@ -809,6 +810,11 @@ class TesseractSingleCharacterOCR(TesseractScreenLineOCR):
             dark_threshold=dark_threshold,
             whitelist=whitelist,
         )
+
+        if isinstance(psm, bool) or not isinstance(psm, int) or psm < 0:
+            raise ValueError("psm must be an integer >= 0")
+
+        self.psm = int(psm)
 
     def _prepare_line(
         self,
@@ -854,7 +860,7 @@ class TesseractSingleCharacterOCR(TesseractScreenLineOCR):
                     "--oem",
                     "1",
                     "--psm",
-                    "10",
+                    str(self.psm),
                     "-l",
                     self.language,
                     "-c",

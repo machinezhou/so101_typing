@@ -252,8 +252,21 @@ class FixedAnchorCartesianPlanner:
         ],
         *,
         max_model_xy_error_mm: float | None = None,
+        retreat_from_z_mm: float | None = None,
     ) -> FixedAnchorPlan:
-        """Plan one anchor-relative cumulative XYZ joint target."""
+        """Plan one anchor-relative cumulative XYZ joint target.
+
+        Normal press/alignment planning uses the configured model-Z
+        magnitude gate.
+
+        Safety retreat is different: when ``retreat_from_z_mm`` is supplied,
+        the fixed 1 mm model-Z magnitude gate is not used. Instead, both the
+        requested cumulative Z target and the FK-predicted target must move
+        monotonically upward toward the fixed-anchor Z=0 level.
+
+        This is a planner-model safety check only. It is not a claim that
+        commanded millimetres equal physical TCP displacement.
+        """
 
         if not self._latched:
             raise RuntimeError(
@@ -357,8 +370,44 @@ class FixedAnchorCartesianPlanner:
                 "max_model_xy_error_mm override must be finite and positive"
             )
 
+        retreat_from_z = None
+
+        if retreat_from_z_mm is not None:
+            retreat_from_z = float(
+                retreat_from_z_mm
+            )
+
+            if not math.isfinite(
+                retreat_from_z
+            ):
+                raise ValueError(
+                    "retreat_from_z_mm must be finite"
+                )
+
+            # Keyboard safety retreat is defined only from a non-positive
+            # fixed-anchor Z state back toward Z=0.
+            if retreat_from_z > 1e-12:
+                raise ValueError(
+                    "safety retreat must start at or below "
+                    "fixed-anchor Z=0"
+                )
+
+            # The command-space target itself must advance upward toward zero.
+            if expected[2] <= retreat_from_z + 1e-12:
+                raise RuntimeError(
+                    "safety retreat command does not move cumulative "
+                    "Z upward toward zero"
+                )
+
+            if expected[2] > 1e-12:
+                raise RuntimeError(
+                    "safety retreat command must not request "
+                    "cumulative Z above zero"
+                )
+
         if (
-            model_xy_error
+            retreat_from_z is None
+            and model_xy_error
             > xy_error_limit
         ):
             raise RuntimeError(
@@ -368,26 +417,74 @@ class FixedAnchorCartesianPlanner:
                 f"{xy_error_limit:.3f} mm"
             )
 
-        if (
-            model_z_error
-            > self.config.max_model_z_error_mm
-        ):
-            raise RuntimeError(
-                "planned joint target fails Z FK "
-                "sanity check: "
-                f"{model_z_error:.3f} mm > "
-                f"{self.config.max_model_z_error_mm:.3f} mm"
+        if retreat_from_z is not None:
+            # RELEASE / RETRACT are escape motions, not precision
+            # Cartesian positioning tasks. Model XY residual magnitude
+            # is therefore diagnostic only here.
+            #
+            # Safety is still fail-closed: the PLANNED FK target must
+            # remain inside the command state's fixed-anchor XY envelope.
+            predicted_xy_norm = float(
+                np.linalg.norm(
+                    predicted_delta[:2]
+                )
             )
 
-        # Direction sanity only.  This is not a measured-motion requirement.
-        if (
-            expected[2] < 0.0
-            and predicted_delta[2] >= -1e-6
-        ):
-            raise RuntimeError(
-                "downward cumulative Z command does "
-                "not produce a downward planned FK target"
-            )
+            if (
+                predicted_xy_norm
+                > float(state.max_xy_norm_mm)
+                + 1e-9
+            ):
+                raise RuntimeError(
+                    "safety retreat planned FK XY target exceeds "
+                    "fixed-anchor XY envelope: "
+                    f"{predicted_xy_norm:.3f} mm > "
+                    f"{float(state.max_xy_norm_mm):.3f} mm"
+                )
+
+        if retreat_from_z is None:
+            # Normal ALIGN / XY / downward PRESS planning keeps the original
+            # strict model-consistency gate.
+            if (
+                model_z_error
+                > self.config.max_model_z_error_mm
+            ):
+                raise RuntimeError(
+                    "planned joint target fails Z FK "
+                    "sanity check: "
+                    f"{model_z_error:.3f} mm > "
+                    f"{self.config.max_model_z_error_mm:.3f} mm"
+                )
+
+            # Direction sanity only. This is not a measured-motion
+            # requirement.
+            if (
+                expected[2] < 0.0
+                and predicted_delta[2] >= -1e-6
+            ):
+                raise RuntimeError(
+                    "downward cumulative Z command does "
+                    "not produce a downward planned FK target"
+                )
+
+        else:
+            # RELEASE / RETRACT are safety escape motions, not precision
+            # Cartesian targeting. Do not reject them because an arbitrary
+            # model-error magnitude crossed 1 mm.
+            #
+            # Still fail closed if the planner's own FK says the new target
+            # would not move upward relative to the latest actually-sent
+            # command-space Z state.
+            if (
+                predicted_delta[2]
+                <= retreat_from_z + 1e-6
+            ):
+                raise RuntimeError(
+                    "safety retreat planned FK target does not "
+                    "move upward toward fixed-anchor Z=0: "
+                    f"from={retreat_from_z:+.3f} mm, "
+                    f"predicted={predicted_delta[2]:+.3f} mm"
+                )
 
         relative_deltas: list[
             tuple[str, float]

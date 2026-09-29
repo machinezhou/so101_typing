@@ -66,25 +66,30 @@ hardware acceptance on `G`, `F`, and `H` without per-key tuning of `p_tip`,
 completed the data-qualification bridge required before ACT training.
 
 Phase 7 is complete. The formal `keyboard_v1` ACT checkpoint was trained to
-20k steps and accepted on real hardware with the same `n_action_steps=20` runtime
-across `G`, `F`, `Q`, `P`, and `M`. Every retained PASS reached real deterministic
-WRIST takeover and automatic HOME recovery. The moving `<=80 px` condition remains
-only a **handoff candidate trigger**; deterministic WRIST convergence remains the
-takeover ground truth.
+20k steps and accepted on real hardware with the same retained
+`n_action_steps=20` runtime across `G`, `F`, `Q`, `P`, and `M`. Every retained PASS
+reached real deterministic WRIST takeover and automatic HOME recovery. The old
+moving `<=80 px` condition remains historical/diagnostic evidence only; it is not
+used by Phase 8 as an ownership-transfer rule.
 
-`Z` was exercised twice with the same retained runtime. Both runs ended in
-`TIMEOUT_NO_TAKEOVER`: saved WRIST evidence shows that the physical ACT approach
-reached the Z neighborhood, but the runtime WRIST glyph recognizer produced no
-accepted `Z` observation. This is retained as a known target-perception limitation,
-not classified as an ACT coarse-policy failure, and no Z-specific ACT tuning is
-introduced to force a pass.
+**Phase 8 — ACT + Visual Servo Handoff — is in active integration hardening.**
+The learned-to-deterministic physical chain has now repeatedly exercised ACT
+approach → endpoint handoff → deterministic WRIST control → staged Z descent →
+SIDE event → immediate release → OCR → retract/recovery on real hardware.
 
-**Phase 8 — ACT + Visual Servo Handoff — has begun.** The first full `G` integration
-pilot physically completed ACT approach → deterministic WRIST control → staged Z
-descent → SIDE event → immediate release → retract → HOME. The software did not
-accept the run as end-to-end SUCCESS because the released-character OCR classified
-the visibly correct lowercase `g` as `Q` on all 5 verification frames. Phase 8 is
-therefore in integration-hardening / acceptance work, not completed.
+Phase 8 now uses a frozen verified-endpoint contract derived from accepted replay
+endpoints instead of the Phase-7 moving-distance heuristic. The first fresh moving
+WRIST frame that satisfies the endpoint contract stops ACT immediately; after the
+arm becomes physically stable, a fresh settled WRIST observation must pass the
+**same endpoint contract again** before deterministic ownership is transferred.
+
+Recent `Q` hardware runs have physically reached and pressed the requested key,
+but Phase 8 is **not accepted yet**. The remaining work is now concentrated in
+integration contracts rather than per-key tuning: moving target geometry-reference
+lifetime can fail during long ACT motion, released-character OCR still has
+UNCERTAIN/misclassification cases, and fixed-size upward retract segments can
+violate the retained `10 deg/send` joint-slew safety gate even after successful
+contact/release.
 
 Phase 6 established a generic episode pipeline rather than a task-specific
 collector. Start-state coverage is an **external collection strategy/SOP**; the
@@ -260,9 +265,9 @@ valid as engineering evidence, but the current 20k ACT checkpoint is a later for
 
 Phase 3 remains the deterministic command-space foundation, Phase 4 remains the
 independent screen semantic verifier, and Phase 5 remains the accepted local
-press primitive. Phase 7 has completed verified-only input contracts, temporal
-validation, official ACT training/checkpoint execution, trained-policy hardware
-rollout, and multi-target ACT-to-WRIST takeover acceptance. Active work is now
+press primitive. Phase 7 has now progressed through verified-only input contracts,
+temporal validation, official ACT training/checkpoint execution, and trained-policy
+hardware rollout. The active work has moved to the Phase-7 acceptance tail and
 Phase-8 learned-to-deterministic integration hardening.
 
 The accepted Phase 7 infrastructure contract is:
@@ -1805,7 +1810,7 @@ changes a phase boundary, command contract, or acceptance criterion.
 | Phase 4  | Screen Rectification and Verification               | **Completed** |
 | Phase 5  | Deterministic Local Single-Key Closed Loop          | **Completed — G/F/H cross-key acceptance** |
 | Phase 6  | Target-Conditioned ACT Dataset                      | **Completed — generic collection + QC + physical replay/takeover verification** |
-| Phase 7  | ACT Coarse Policy                                   | **Completed — 20k keyboard_v1 checkpoint + multi-target ACT→WRIST takeover acceptance** |
+| Phase 7  | ACT Coarse Policy                                   | **IN PROGRESS — 20k keyboard_v1 checkpoint + runtime rollout baseline validated; broader acceptance tail remains** |
 | Phase 8  | ACT + Visual Servo Handoff                          | **IN PROGRESS — first G E2E pilot physically closed the loop; released-char OCR/software acceptance remains** |
 | Phase 9  | Multi-Key Typing                                    | Not Started |
 | Phase 10 | Automatic Recovery                                  | Not Started |
@@ -1818,7 +1823,7 @@ the intended system.
 
 ``` text
 Phase 8 — ACT + Visual Servo Handoff
-(integration hardening; Phase 7 accepted)
+(integration hardening, with the Phase-7 acceptance tail still open)
 ```
 
 Current checkpoint:
@@ -1844,9 +1849,7 @@ keyboard_v1 ACT 20k checkpoint                       ✓ TRAINED
         ↓
 Phase 7 rollout evaluator v6                         ✓ VALIDATED
         ↓
-n_action_steps=20 G/G/F/Q/P/M takeover evidence      ✓ PASS
-        ↓
-Phase 7 multi-target ACT coarse-policy acceptance       ✓ COMPLETED
+n_action_steps=20 G/G/F takeover evidence            ✓ PASS
         ↓
 Phase 8 first G full physical integration pilot      ✓ PHYSICAL LOOP CLOSED
         ↓
@@ -1865,13 +1868,13 @@ cross-key Phase 8 acceptance                         FUTURE
 
 ### Phase 7 runtime checkpoint
 
-The retained Phase-7 trained-policy runtime baseline is:
+The current trained-policy runtime baseline is:
 
 ``` text
 checkpoint          = artifacts/phase7_act_coarse/keyboard_v1/act_train_20k/checkpoints/last
 control rate        = 15 Hz
 chunk_size          = 20
-n_action_steps      = 20   # retained Phase-7 acceptance baseline
+n_action_steps      = 20   # current best-known baseline, not permanently frozen
 execution horizon   = 1.333 s
 Temporal Ensemble   = OFF
 ```
@@ -1891,32 +1894,19 @@ TAKEOVER PASS / FAIL = ground truth
 ```
 
 The moving `<=80 px` condition is **not** called servo-ready and is not the
-acceptance authority. It is only a candidate trigger. Final retained hardware
-evidence is:
+acceptance authority. It is only a candidate trigger. Current hardware evidence:
 
-| Target/run | Moving candidate | Settled endpoint | Result |
-|---|---:|---:|---|
-| `G` v6 run 1 | `78.47 px` | `76.92 px` | PASS |
-| `G` v6 run 2 | `78.34 px` | `72.40 px` | PASS |
-| `F` v6 | `65.68 px` | `59.28 px` | PASS |
-| `Q` v6 | `40.60 px` | `38.78 px` | PASS |
-| `P` v6 | `75.16 px` | `72.25 px` | PASS |
-| `M` v6 | `73.64 px` | `63.19 px` | PASS |
-
-All retained PASS runs used the same 20k checkpoint, 15 Hz control rate, and
-`n_action_steps=20`, with no per-target runtime tuning, and completed real
-deterministic WRIST takeover plus automatic HOME recovery.
-
-Two additional `Z` runs ended in `TIMEOUT_NO_TAKEOVER`. Saved WRIST evidence
-shows that the physical ACT approach reached the Z neighborhood, while the runtime
-glyph recognizer produced no accepted `Z` observation. The case is retained as a
-known target-perception limitation and is not worked around with Z-specific ACT
-parameters.
+| Target/run | Moving candidate | Settled endpoint | Takeover initial | Result |
+|---|---:|---:|---:|---|
+| `G` v6 run 1 | `78.47 px` | `76.92 px` | `76.83 px` | PASS |
+| `G` v6 run 2 | `78.34 px` | `72.40 px` | `72.37 px` | PASS |
+| `F` v6 run | `65.68 px` | `59.28 px` | `59.28 px` | PASS |
 
 A diagnostic `n_action_steps=10` run exposed large direction discontinuities at
 ACT chunk boundaries and eventually failed deterministic takeover. The existing
 1 mm planner/FK sanity guard must not be loosened to make such a run pass.
-`n_action_steps=20` is therefore retained as the Phase-7 acceptance baseline.
+`n_action_steps=20` therefore remains the current runtime baseline while broader
+target coverage and latency/observation-age characterization continue.
 
 ### First Phase 8 end-to-end pilot — 2026-09-29
 
@@ -2317,6 +2307,7 @@ The following modules are intended implementation code:
 
 - `fixed_anchor_xyz.py`
 - `fixed_anchor_planner.py`
+- `handoff_endpoint.py`
 - `semantic_target_lock.py`
 - `screen_change.py`
 - `press_controller.py`
@@ -2590,12 +2581,13 @@ Ti with approximately `3.19 GiB` peak CUDA allocation. The earlier standalone
 forward-only smoke script is no longer retained because the training entry point
 now subsumes that test.
 
-### 7D — Formal target-conditioned keyboard dataset — **Completed**
+### 7D — Formal target-conditioned keyboard dataset — **Contract frozen; runtime checkpoint trained**
 
 This subsection preserves the formal V1 dataset/coverage contract that produced the
-retained `keyboard_v1` training line. The final verified manifest and matching
-verified-only normalization provenance used by the retained 20k checkpoint are
-frozen in the Phase-7 acceptance evidence below.
+current `keyboard_v1` training line. The existence of the 20k checkpoint does not by
+itself prove that every planned quota cell should be considered finally accepted;
+the exact verified manifest used for the retained checkpoint must be frozen and
+reported separately during Phase-7 closeout.
 
 The V1 dataset is designed as one shared target-conditioned policy dataset with a
 28D target schema but an A-Z-only first collection pass:
@@ -2669,61 +2661,36 @@ machine:
   acceptance test;
 - the evaluator does **not** press a key and does not run SIDE/OCR.
 
-Final hardware evidence spans `G`, `F`, `Q`, `P`, and `M` with the same retained
-checkpoint and `n_action_steps=20`. The important result is not that `80 px` has
-been proven as a universal capture threshold; it has not. The moving threshold
-remains only a handoff-candidate trigger, while actual deterministic WRIST
-convergence remains the acceptance ground truth.
+Current G/F hardware evidence is summarized in the Implementation Progress
+checkpoint above. The important result is not that `80 px` has been proven as a
+universal capture threshold; it has not. The evidence only shows that current
+settled endpoints around `59–77 px` have successfully converged in these runs.
 
-The two retained `Z` timeouts are documented as a target-perception limitation:
-the physical ACT approach reached the Z neighborhood, but the runtime WRIST glyph
-recognizer produced no accepted `Z` observation. They are not counted as PASS and
-are not used to justify target-specific ACT tuning.
+### Phase 7 remaining acceptance work
 
-### Phase 7 acceptance closeout
+The first trained-policy/runtime path is operational, but Phase 7 is not marked
+fully complete yet. Remaining acceptance work is now limited to:
 
-Phase 7 is accepted.
+- freeze the final verified multi-target manifest and matching normalization stats
+  that produced the retained policy checkpoint;
+- retain the training loss/checkpoint evidence needed to reproduce model selection;
+- summarize policy inference latency and observation-to-action age under the
+  selected runtime cadence;
+- keep `n_action_steps=20` as the current baseline while broader target rollout
+  evidence is collected; do not tune by blind 20→10→5→3→1 search;
+- characterize target-neighborhood arrival, target visibility, and deterministic
+  takeover success over enough distinct targets to close the Phase-7 acceptance
+  tail.
 
-The final provenance chain is frozen:
+Evaluate:
 
-- `phase6.verified_episode_manifest.v4`;
-- 158 verified episodes / 7561 verified frames;
-- verified-only normalization from exactly the same selected episode subset;
-- official LeRobot ACT training path with ImageNet-pretrained ResNet18;
-- 20,000 completed optimization steps;
-- retained `checkpoints/last -> step_020000`;
-- offline 26-target diagnostic validation PASS;
-- runtime latency and observation-to-action age characterized from hardware
-  rollout evidence;
-- retained runtime acceptance baseline: 15 Hz, `chunk_size=20`,
-  `n_action_steps=20`, Temporal Ensemble OFF.
-
-Final retained hardware rollout evidence:
-
-| Target/run | Moving candidate | Settled endpoint | Result |
-|---|---:|---:|---|
-| `G` v6 run 1 | `78.47 px` | `76.92 px` | PASS |
-| `G` v6 run 2 | `78.34 px` | `72.40 px` | PASS |
-| `F` v6 | `65.68 px` | `59.28 px` | PASS |
-| `Q` v6 | `40.60 px` | `38.78 px` | PASS |
-| `P` v6 | `75.16 px` | `72.25 px` | PASS |
-| `M` v6 | `73.64 px` | `63.19 px` | PASS |
-
-Every PASS above used the same retained checkpoint and runtime configuration,
-reached real deterministic WRIST convergence, and completed automatic HOME
-recovery.
-
-Two `Z` runs were also retained. Both ended in `TIMEOUT_NO_TAKEOVER`; they are
-**not** recorded as PASS. Saved WRIST evidence shows that the physical ACT approach
-reached the Z neighborhood, but the runtime WRIST glyph recognizer never produced
-an accepted `Z` observation. This is frozen as a known target-perception limitation
-for later work. No Z-specific ACT parameter tuning, safety-limit relaxation, or
-blind `n_action_steps` search is introduced to make the case pass.
-
-Phase 7 therefore closes on demonstrated multi-target ACT coarse approach and
-successful deterministic-controller handoff. Z descent, physical keypress,
-SIDE-event handling, released-character OCR, and final key outcome remain
-Phase-8 acceptance concerns.
+- target-neighborhood arrival rate,
+- target acquisition rate after ACT,
+- settled endpoint residual distribution,
+- real WRIST-takeover rate,
+- target visibility / pixel size / occlusion,
+- time to handoff,
+- inference latency and observation-to-action age.
 
 ------------------------------------------------------------------------
 
@@ -2740,32 +2707,58 @@ Formal pipeline:
 ``` text
 ACT_APPROACH
      ↓
-target perception
+requested-key semantic identity becomes available
      ↓
-HANDOFF_CANDIDATE
+moving WRIST endpoint-contract evaluation
      ↓
-stop + settle + fresh endpoint diagnostic
+first fresh eligible endpoint frame
      ↓
-flush/reset ACT; deterministic ownership only
+IMMEDIATELY stop/reset ACT
      ↓
-latch existing Goal_Position once
+wait for physical motion stability
      ↓
-SERVO_ALIGN
+POST_MOTION_GUARD + fresh settled WRIST observation
      ↓
-small cumulative DESCEND_STEP
-     ↓
-STOP / REOBSERVE / SAME-Z REALIGN
-     ↓
-SIDE watcher
-     ├── no event + confirmed NO_CHANGE → next descent step
-     └── persistent screen change → EVENT LATCH → RELEASE FIRST
-                                      ↓
-                                released-char verify
-                                      ↓
-                                retract / supervisor
-                                      ↓
-                                automatic HOME
+same verified endpoint contract again
+     ├── fail → no deterministic ownership
+     └── pass → HANDOFF ACCEPTED
+                  ↓
+          deterministic ownership only
+                  ↓
+          preserve existing Goal_Position once
+                  ↓
+          SERVO_ALIGN
+                  ↓
+          cumulative DESCEND_STEP
+                  ↓
+          STOP / REOBSERVE / SAME-Z REALIGN
+                  ↓
+          SIDE watcher
+             ├── no event + confirmed NO_CHANGE
+             │      → next descent step
+             │
+             └── persistent screen change
+                    → EVENT LATCH
+                    → no more Z-down / XY chase
+                    → RELEASE FIRST
+                    → released-character verify
+                    → bounded retract
+                    → automatic HOME
 ```
+
+Ownership rules:
+
+- target visibility alone never transfers control;
+- the historical `<=80 px` value is diagnostic/candidate evidence only;
+- ACT stops on the first fresh moving frame accepted by the verified endpoint
+  contract rather than being forced to produce an unnecessary second moving
+  frame;
+- physical settle is followed by an independent fresh endpoint check using the
+  same contract;
+- deterministic ownership begins only after that settled check passes;
+- no ACT command is allowed after handoff confirmation;
+- the deterministic primitive preserves one existing `Goal_Position` anchor
+  through WRIST alignment, Z descent, release, and retract.
 
 ### First full-integration evidence
 
@@ -2793,22 +2786,150 @@ but the formal autonomous runtime still requires a meaningful absolute-depth or
 workspace safety fuse. Operator `Ctrl+C` remains an emergency stop, not the desired
 production safety policy.
 
+### Current Phase-8 hardening checkpoint
+
+The current runtime has moved beyond the original Phase-7 candidate-threshold
+handoff design.
+
+Implemented and retained:
+
+- `calibration/handoff_endpoint_contract.json` freezes the current endpoint
+  acceptance geometry and provenance;
+- `src/so101_typing/control/handoff_endpoint.py` provides the endpoint contract
+  and fresh-frame confirmation state machine;
+- the runtime endpoint contract currently requires one fresh eligible moving
+  frame to stop ACT;
+- the generic confirmation helper still supports arbitrary `N`; duplicate-frame,
+  fresh-reset, and backward-frame-ID behavior remain explicit unit-tested
+  semantics;
+- the settled endpoint is a mandatory gate, not a diagnostic-only measurement;
+- semantic target identity is carried across moving → settled → deterministic
+  stages rather than intentionally discarded at each boundary;
+- SIDE-event release uses the latest **actually sent** fixed-anchor XYZ state,
+  not a possibly stale outer-loop state;
+- the deterministic controller retains one fixed existing Goal-space anchor;
+- the formal autonomous descent fuse is `70 commanded-mm`; this is a
+  command-space safety limit, not a claim of physical TCP millimetres;
+- normal ALIGN / XY correction / downward PRESS planning keeps strict
+  model-consistency checks;
+- RELEASE / RETRACT no longer treats absolute model XY/Z residual magnitude as
+  physical positioning accuracy. Those residuals remain diagnostic during escape
+  motion while real safety gates remain active.
+
+Current open issues:
+
+**1. Moving target geometry-reference lifetime**
+
+Semantic identity and geometry-reference lifetime are not the same thing. A
+requested key can be semantically identified early while ACT is still far from
+the handoff endpoint. Carrying one local geometry reference through a large ACT
+motion can cause the geometry tracker to reject later transformations and leave
+endpoint evaluation without a usable target observation. This issue is retained
+for later repair rather than hidden with dropout tolerance, nearest-key
+substitution, target-specific tuning, or a return to the old `<=80 px` ownership
+rule.
+
+**2. Safety-aware retract segmentation**
+
+The current staged retract uses fixed maximum Z increments. Hardware evidence has
+shown a case where a nominal `+10 commanded-mm` upward segment maps to slightly
+more than the retained `10 deg/send` relative joint-slew safety limit. The correct
+fix is **not** to raise the joint-slew threshold. Retract should become adaptive:
+subdivide an infeasible upward segment and replan until the existing real safety
+gate is satisfied. Normal retract and failure-recovery retract should share that
+same behavior so recovery does not simply repeat the same infeasible plan.
+
+**3. Released-character semantic verification**
+
+Physical key contact is not equivalent to software SUCCESS. SIDE event detection
+can correctly prove that a new screen glyph appeared while released-character OCR
+still returns WRONG or UNCERTAIN. Phase-8 acceptance therefore still requires the
+independent semantic verdict, bounded retract, and HOME recovery to agree with the
+physical outcome on the same run.
+
+### Phase-8 engineering lessons
+
+The current hardening work has produced several explicit design lessons:
+
+1. **Perception opportunity and controller ownership are different events.**
+   Seeing the requested key, being near it, and transferring ownership must not
+   be collapsed into one threshold.
+
+2. **Semantic identity can be long-lived while a geometry reference is local.**
+   Geometry may propagate an already-established identity, but geometry must not
+   invent identity and one local reference must not be assumed valid across an
+   arbitrarily large learned-policy motion.
+
+3. **Command-space/model residual is not physical TCP accuracy.**
+   A project-side FK residual such as `1.026 mm` or `3.167 mm` is a model
+   consistency diagnostic. It must not silently become a claim about measured
+   physical tool error.
+
+4. **Precision gates and escape-motion safety gates have different jobs.**
+   Strict Cartesian model-consistency gates are appropriate for deterministic
+   alignment/press planning. A safety retreat is an escape motion and should be
+   governed by monotonic escape direction, workspace bounds, joint slew,
+   EE-jump/clipping protection, and fixed-anchor invariants rather than arbitrary
+   positioning-accuracy residual thresholds.
+
+5. **Do not tune a safety threshold merely to clear one observed failure.**
+   When a valid upward retreat maps to more than the retained joint-slew limit,
+   the planner should subdivide the motion instead of changing `10 deg` into
+   `11 deg`.
+
+6. **Recovery must not repeat the identical failed plan.**
+   If normal retract fails because one segment is infeasible, safety recovery
+   needs a structurally different feasible segmentation strategy rather than
+   issuing the same target again.
+
+7. **Asynchronous events require an authoritative latest-sent state.**
+   SIDE can interrupt inside nested WRIST control. Release/recovery therefore
+   uses the latest command state that actually reached `send_action(...)`.
+
+8. **Physical success and software success are intentionally separate.**
+   A visible keypress is useful hardware evidence, but Phase-8 PASS requires the
+   independent SIDE semantic verdict, safe retract, and HOME recovery to agree
+   on the same run.
+
+9. **Do not fix integration failures with per-key tuning.**
+   Handoff, tracking, press, verification, release, retract, and recovery remain
+   generic contracts unless evidence demonstrates a genuinely key-dependent
+   physical requirement.
+
 ### Formalization requirements before Phase-8 acceptance
 
-- no fixed `KEYPRESS` or other validation-only prefix in normal runtime logic;
-- no normal-path `Press ENTER` / `Type GO` operator gate between ACT and the
-  deterministic primitive;
-- `Ctrl+C` / emergency hold and recovery safety behavior remain available;
-- support or explicitly constrain the empty-screen baseline case instead of
-  silently assuming detectable pre-existing text;
-- offline regression-test released-character OCR using real saved crops from
-  hardware runs before repeating expensive physical trials;
-- do not bias OCR toward the expected target; WRONG/UNCERTAIN must remain real
-  outcomes;
-- define the autonomous Z/workspace safety fuse without relatching
+Already completed:
+
+- no fixed `KEYPRESS` or other validation-only literal is required by normal
+  runtime logic;
+- no normal-path `Press ENTER` / `Type GO` operator gate exists between ACT and
+  the deterministic primitive;
+- `Ctrl+C` / emergency hold and explicit recovery safety behavior remain
+  available;
+- the autonomous cumulative-depth/workspace fuse is explicit without relatching
   `Present_Position` or changing the fixed Goal anchor;
-- rerun `G` until the software verdict agrees with the physical result;
-- then confirm transfer on multiple keys without per-key tuning.
+- the old moving `<=80 px` condition has been removed from ownership-transfer
+  authority and replaced by the verified endpoint contract + mandatory settled
+  recheck;
+- retreat model-residual magnitude has been separated from physical/safety
+  semantics.
+
+Still required:
+
+- finish the moving semantic-identity / local-geometry-reference lifetime
+  contract;
+- implement safety-aware adaptive retract segmentation while keeping the existing
+  joint-slew limit;
+- ensure normal retract and failure-recovery retract share the same escape
+  planner;
+- support or explicitly constrain the empty-screen baseline case rather than
+  silently assuming detectable pre-existing text;
+- harden released-character OCR using retained real hardware crops without
+  biasing OCR toward the expected target;
+- keep WRONG/UNCERTAIN as real outcomes;
+- demonstrate repeated runs where physical result + SIDE semantic SUCCESS +
+  retract-to-Z0 + automatic HOME all agree;
+- then confirm a small cross-key acceptance set without per-key tuning.
 
 Acceptance must explicitly test:
 
@@ -3036,6 +3157,7 @@ so101_typing/
 │   ├── screen_homography.json
 │   ├── tool_reference.json
 │   ├── image_jacobian.json
+│   ├── handoff_endpoint_contract.json
 │   └── top_screen_mask.json
 │
 ├── src/
@@ -3058,6 +3180,7 @@ so101_typing/
 │       │   ├── image_jacobian.py
 │       │   ├── fixed_anchor_xyz.py
 │       │   ├── fixed_anchor_planner.py
+│       │   ├── handoff_endpoint.py
 │       │   ├── controller_owner.py
 │       │   └── safety.py
 │       │
@@ -3112,6 +3235,7 @@ so101_typing/
 │   ├── test_recovery.py
 │   ├── test_target_encoding.py
 │   ├── test_controller_ownership.py
+│   ├── test_handoff_endpoint_contract.py
 │   ├── test_phase7_act_training_input.py
 │   └── test_phase7_act_temporal_contract.py
 │
@@ -3176,18 +3300,36 @@ same run without validation-only manual gates or fixed text fixtures.
 Remaining closing work before that milestone:
 
 ``` text
-formalize Phase-8 runtime (no fixed KEYPRESS / no normal GO prompt)
+finish moving semantic-identity / local-geometry-reference lifetime contract
         ↓
-add autonomous absolute-depth/workspace safety fuse
+implement safety-aware adaptive retract segmentation
         ↓
-fix released-char g/Q OCR from real saved regression crops
+share the same escape planner between normal retract and failure recovery
         ↓
-rerun G: physical G + software SUCCESS + retract + HOME
+harden released-character OCR from retained real hardware crops
+        ↓
+repeat Phase-8 single-key trials until one run has:
+physical requested key
++ SIDE semantic SUCCESS
++ bounded retract to command-space Z=0
++ automatic HOME
         ↓
 repeat a small cross-key acceptance set without per-key tuning
         ↓
-freeze Phase-7/8 metrics, tests, README, and repository checkpoint
+freeze Phase-8 metrics, tests, README, and repository checkpoint
 ```
+
+Already completed since the first `G` pilot:
+
+- normal runtime no longer depends on the old moving `<=80 px` ownership rule;
+- verified endpoint-contract handoff and mandatory settled recheck are
+  implemented;
+- ACT stops on the first fresh eligible moving endpoint frame;
+- the fixed Goal-space anchor remains preserved through deterministic control;
+- autonomous Z/workspace fuse is explicit;
+- release uses latest actually-sent XYZ state;
+- model XY/Z residual magnitude is no longer misused as retreat physical-accuracy
+  acceptance.
 
 After that, Phase 9 multi-character typing becomes repeated execution of a proven
 single-key primitive plus supervisor-driven recovery rather than a new control

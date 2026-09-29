@@ -201,9 +201,19 @@ SCREEN_EVENT_CHAR_FRAMES = 5
 # LeRobot 35 mm EE-jump guard. Latest-sent XY is preserved exactly.
 SCREEN_EVENT_RELEASE_MM = 20.0
 SCREEN_EVENT_RELEASE_STEP_MM = 20.0
-# Release is an upward safety retreat. Give it the same bounded
-# planner-model XY tolerance used by segmented retract. Normal press motion
-# keeps the existing stricter default planner gate.
+# RELEASE / RETRACT are upward safety escape motions.
+#
+# XY still gets a bounded local model-consistency gate because the retreat
+# must preserve the latest actually-sent lateral state.
+#
+# Z is intentionally different:
+# - normal ALIGN / PRESS retains the strict 1.0 mm model-Z sanity gate;
+# - RELEASE / RETRACT do NOT use a fixed model-Z error magnitude;
+# - instead, requested and FK-predicted Z must both make monotonic upward
+#   progress toward the same fixed Goal-space anchor Z=0.
+#
+# This preserves the frozen project result that commanded-mm is not a
+# physical TCP positioning-accuracy claim.
 RELEASE_MAX_MODEL_XY_ERROR_MM = 3.0
 RETRACT_MAX_MODEL_XY_ERROR_MM = 3.0
 
@@ -1084,10 +1094,19 @@ def send_command_state(
         )
     )
 
-    if str(label).startswith("RELEASE"):
+    label_text = str(label)
+    retreat_from_z_mm = None
+
+    if label_text.startswith("RELEASE"):
         xy_error_limit = RELEASE_MAX_MODEL_XY_ERROR_MM
-    elif str(label).startswith("RETRACT"):
+        retreat_from_z_mm = float(
+            sent_state_tracker.state.z_mm
+        )
+    elif label_text.startswith("RETRACT"):
         xy_error_limit = RETRACT_MAX_MODEL_XY_ERROR_MM
+        retreat_from_z_mm = float(
+            sent_state_tracker.state.z_mm
+        )
     else:
         xy_error_limit = None
 
@@ -1095,6 +1114,7 @@ def send_command_state(
         state,
         observation,
         max_model_xy_error_mm=xy_error_limit,
+        retreat_from_z_mm=retreat_from_z_mm,
     )
 
     print()

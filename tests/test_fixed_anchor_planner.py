@@ -500,6 +500,177 @@ class TestFixedAnchorPlanner(
             places=6,
         )
 
+    def test_default_z_model_error_gate_remains_strict(self):
+        planner, anchor = self.make_planner(
+            FakeLatchedPipeline(
+                nonzero_offset=(0.0, 0.0, 2.0),
+            )
+        )
+        planner.latch_zero_delta()
+
+        state = (
+            FixedAnchorXYZCommandState
+            .at_anchor(anchor)
+            .with_z_level(-5.0)
+        )
+
+        with self.assertRaises(RuntimeError):
+            planner.plan(
+                state,
+                self.present(),
+            )
+
+    def test_retreat_skips_z_magnitude_gate_but_keeps_diagnostic(self):
+        planner, anchor = self.make_planner(
+            FakeLatchedPipeline(
+                nonzero_offset=(0.0, 0.0, 2.0),
+            )
+        )
+        planner.latch_zero_delta()
+
+        state = (
+            FixedAnchorXYZCommandState
+            .at_anchor(anchor)
+            .with_z_level(-5.0)
+        )
+
+        plan = planner.plan(
+            state,
+            self.present(),
+            retreat_from_z_mm=-10.0,
+        )
+
+        self.assertAlmostEqual(
+            plan.model_z_error_mm,
+            2.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            plan.predicted_delta_mm[2],
+            -3.0,
+            places=6,
+        )
+
+    def test_retreat_rejects_command_that_does_not_move_toward_zero(self):
+        planner, anchor = self.make_planner()
+        planner.latch_zero_delta()
+
+        state = (
+            FixedAnchorXYZCommandState
+            .at_anchor(anchor)
+            .with_z_level(-12.0)
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "does not move cumulative Z upward",
+        ):
+            planner.plan(
+                state,
+                self.present(),
+                retreat_from_z_mm=-10.0,
+            )
+
+    def test_retreat_rejects_fk_target_that_does_not_move_upward(self):
+        planner, anchor = self.make_planner(
+            FakeLatchedPipeline(
+                nonzero_offset=(0.0, 0.0, -10.0),
+            )
+        )
+        planner.latch_zero_delta()
+
+        state = (
+            FixedAnchorXYZCommandState
+            .at_anchor(anchor)
+            .with_z_level(-5.0)
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "planned FK target does not move upward",
+        ):
+            planner.plan(
+                state,
+                self.present(),
+                retreat_from_z_mm=-10.0,
+            )
+
+
+
+
+    def test_retreat_skips_xy_magnitude_gate_but_keeps_diagnostic(self):
+        planner, anchor = self.make_planner(
+            FakeLatchedPipeline(
+                nonzero_offset=(3.2, 0.0, 0.0),
+            )
+        )
+        planner.latch_zero_delta()
+
+        state = (
+            FixedAnchorXYZCommandState
+            .at_anchor(anchor)
+            .with_xy_target(5.0, 0.0)
+            .with_z_level(-2.0)
+        )
+
+        # Normal positioning remains strict.
+        with self.assertRaises(RuntimeError):
+            planner.plan(
+                state,
+                self.present(),
+            )
+
+        # Retreat from Z=-3 toward Z=-2 must not be blocked merely
+        # because model XY residual is > normal precision threshold.
+        plan = planner.plan(
+            state,
+            self.present(),
+            retreat_from_z_mm=-3.0,
+        )
+
+        self.assertAlmostEqual(
+            plan.model_xy_error_mm,
+            3.2,
+            places=6,
+        )
+
+        self.assertEqual(
+            plan.requested_xyz_mm,
+            (5.0, 0.0, -2.0),
+        )
+
+
+    def test_retreat_rejects_planned_fk_xy_outside_safety_envelope(self):
+        planner, anchor = self.make_planner(
+            FakeLatchedPipeline(
+                nonzero_offset=(3.2, 0.0, 0.0),
+            )
+        )
+        planner.latch_zero_delta()
+
+        state = (
+            FixedAnchorXYZCommandState
+            .at_anchor(
+                anchor,
+                max_xy_norm_mm=6.0,
+                max_xyz_norm_mm=35.0,
+            )
+            .with_xy_target(5.0, 0.0)
+            .with_z_level(-2.0)
+        )
+
+        # Requested XY=5 is legal, but planned FK XY=8.2 lies
+        # outside this state's explicit 6 mm safety envelope.
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "planned FK XY target exceeds",
+        ):
+            planner.plan(
+                state,
+                self.present(),
+                retreat_from_z_mm=-3.0,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

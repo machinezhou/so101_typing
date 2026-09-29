@@ -1,0 +1,40 @@
+{
+  "schema": "phase8.handoff_endpoint_contract.v1",
+  "coordinate_semantics": "error_px = target_center_px - tool_tip_px",
+  "source": "Phase 6 verified replay endpoint ground truth, cross-checked against exported demonstration-tail WRIST observations",
+  "verified_episode_count": 158,
+  "reliable_endpoint_count": 133,
+  "hull_vertices_error_px": [
+    [
+      30.45,
+      34.77
+    ],
+    [
+      -63.84,
+      26.19
+    ],
+    [
+      -26.59,
+      -74.39
+    ],
+    [
+      -17.79,
+      -84.7
+    ],
+    [
+      35.97,
+      -73.86
+    ],
+    [
+      42.21,
+      -48.87
+    ],
+    [
+      45.16,
+      -17.97
+    ]
+  ],
+  "measurement_repeatability_p95_px": 10.44,
+  "acceptance_margin_px": 11.0,
+  "required_consecutive_frames": 1
+}

@@ -77,6 +77,21 @@ class TestScreenLineOCR(unittest.TestCase):
         for character in "abcdefghijklmnopqrstuvwxyz":
             self.assertIn(character, whitelist)
 
+    def test_single_character_psm_is_configurable(self):
+        ocr = TesseractSingleCharacterOCR(
+            psm=13,
+            whitelist="abcdefghijklmnopqrstuvwxyz",
+        )
+        self.assertEqual(ocr.psm, 13)
+        self.assertEqual(
+            ocr.whitelist,
+            "abcdefghijklmnopqrstuvwxyz",
+        )
+
+    def test_single_character_rejects_invalid_psm(self):
+        with self.assertRaises(ValueError):
+            TesseractSingleCharacterOCR(psm=-1)
+
 
 if __name__ == "__main__":
     unittest.main()
