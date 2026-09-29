@@ -797,7 +797,7 @@ class TesseractSingleCharacterOCR(TesseractScreenLineOCR):
         self,
         *,
         language: str = "eng",
-        scale: float = 4.0,
+        scale: float = 2.0,
         clahe_clip_limit: float = 2.0,
         dark_threshold: int = 185,
         whitelist: str = DEFAULT_WHITELIST,
@@ -808,6 +808,30 @@ class TesseractSingleCharacterOCR(TesseractScreenLineOCR):
             clahe_clip_limit=clahe_clip_limit,
             dark_threshold=dark_threshold,
             whitelist=whitelist,
+        )
+
+    def _prepare_line(
+        self,
+        line_bgr: np.ndarray,
+    ) -> np.ndarray:
+        """Prepare one released-character crop for PSM 10 OCR.
+
+        Unlike the Phase-4 whole-line path, the single-glyph crop is already
+        tightly localized. Hardware evidence showed that 3x/4x enlargement
+        and CLAHE systematically push lowercase g toward q/Q. Keep this path
+        independent: grayscale + modest 2x cubic enlargement, with no CLAHE.
+        """
+        gray = cv2.cvtColor(
+            line_bgr,
+            cv2.COLOR_BGR2GRAY,
+        )
+
+        return cv2.resize(
+            gray,
+            None,
+            fx=self.scale,
+            fy=self.scale,
+            interpolation=cv2.INTER_CUBIC,
         )
 
     def _recognize_line(

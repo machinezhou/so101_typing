@@ -5,7 +5,9 @@ import json
 import queue
 import signal
 import time
-from dataclasses import replace
+from collections import Counter
+from dataclasses import dataclass, replace
+import math
 from pathlib import Path
 from threading import Event, Thread
 
@@ -58,6 +60,19 @@ HOME_STEP_DEG = 2.0
 CAMERA_WARMUP_S = 2.0
 HANDOFF_CANDIDATE_THRESHOLD_PX = float(phase5.INITIAL_CAPTURE_THRESHOLD_PX)
 HANDOFF_CANDIDATE_MIN_KEYCAPS = 4
+SCREEN_NO_EVENT_CONFIRM_S = 0.35
+SCREEN_NO_EVENT_MIN_FRESH_FRAMES = 4
+
+# Phase-8 autonomous cumulative-depth fuse.
+#
+# Hardware evidence includes successful contact as deep as -64 commanded-mm.
+# The deterministic controller uses 2 mm steps, so 70 mm preserves three
+# additional steps of margin while remaining inside the existing planner
+# cumulative XYZ envelope even at the full 35 mm XY budget:
+# hypot(35, 70) ~= 78.3 mm < 80 mm.
+#
+# Commanded millimetres remain command-space units, not physical TCP accuracy.
+AUTONOMOUS_MAX_DESCENT_MM = 70.0
 
 
 class OperatorStop(RuntimeError):
@@ -66,6 +81,40 @@ class OperatorStop(RuntimeError):
 
 class HomeStop(RuntimeError):
     pass
+
+
+def _validate_autonomous_safety_contract() -> float:
+    """Validate the Phase-8 cumulative command-space safety envelope.
+
+    The press-depth fuse and XY budget are independent bounds but share the
+    same fixed-anchor cumulative XYZ planner envelope.  Their worst-case norm
+    must therefore remain strictly inside the planner envelope.
+    """
+    maximum = float(AUTONOMOUS_MAX_DESCENT_MM)
+    z_step = float(phase5.Z_STEP_MM)
+    xy_budget = float(phase5.MAX_XY_CORRECTION_MM)
+    xyz_budget = float(phase5.MAX_COMMAND_NORM_MM)
+
+    if not math.isfinite(maximum) or maximum <= 0.0:
+        raise RuntimeError("autonomous max descent must be finite and positive")
+    if not math.isfinite(z_step) or z_step <= 0.0:
+        raise RuntimeError("Z step must be finite and positive")
+
+    steps = maximum / z_step
+    if abs(steps - round(steps)) > 1e-9:
+        raise RuntimeError(
+            "autonomous max descent must align exactly with the iterative Z step"
+        )
+
+    worst_case_norm = math.hypot(xy_budget, maximum)
+    if worst_case_norm >= xyz_budget:
+        raise RuntimeError(
+            "autonomous safety envelope conflicts with planner bound: "
+            f"hypot({xy_budget:.1f}, {maximum:.1f})={worst_case_norm:.3f} "
+            f">= {xyz_budget:.3f} mm"
+        )
+
+    return float(worst_case_norm)
 
 
 def _action_key(name: str) -> str:
@@ -317,6 +366,260 @@ def _retract_to_z0(
     return state
 
 
+
+
+@dataclass(frozen=True, slots=True)
+class ReleasedCharacterVerification:
+    status: object
+    total_frames: int
+    success_votes: int
+    wrong_votes: int
+    uncertain_votes: int
+    wrong_character: str | None
+    winning_votes: int
+    vote_fraction: float
+
+
+def _normalize_released_character(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if len(text) != 1:
+        return None
+    if not text.isascii() or not text.isalnum():
+        return None
+    return text
+
+
+def _vote_released_characters(
+    observed_characters: list[str | None],
+    *,
+    target: str,
+) -> ReleasedCharacterVerification:
+    if not observed_characters:
+        raise ValueError("at least one released-character observation is required")
+
+    expected = _normalize_released_character(target)
+    if expected is None:
+        raise ValueError(
+            "Phase-8 released-character verification currently requires "
+            "one ASCII alphanumeric target"
+        )
+
+    normalized = [
+        _normalize_released_character(value)
+        for value in observed_characters
+    ]
+    total = len(normalized)
+    required_votes = math.ceil(
+        total * float(phase5.SCREEN_MIN_VOTE_FRACTION)
+    )
+    success_votes = sum(value == expected for value in normalized)
+    wrong_counter = Counter(
+        value
+        for value in normalized
+        if value is not None and value != expected
+    )
+    if wrong_counter:
+        wrong_character, wrong_votes = wrong_counter.most_common(1)[0]
+    else:
+        wrong_character = None
+        wrong_votes = 0
+    uncertain_votes = sum(value is None for value in normalized)
+
+    if success_votes >= required_votes:
+        status = phase5.ScreenVerificationStatus.CONFIRMED_SUCCESS
+        winning_votes = success_votes
+    elif wrong_votes >= required_votes:
+        status = phase5.ScreenVerificationStatus.CONFIRMED_WRONG
+        winning_votes = wrong_votes
+    else:
+        status = phase5.ScreenVerificationStatus.UNCERTAIN
+        winning_votes = max(success_votes, wrong_votes)
+
+    return ReleasedCharacterVerification(
+        status=status,
+        total_frames=total,
+        success_votes=int(success_votes),
+        wrong_votes=int(wrong_votes),
+        uncertain_votes=int(uncertain_votes),
+        wrong_character=wrong_character,
+        winning_votes=int(winning_votes),
+        vote_fraction=float(winning_votes / total),
+    )
+
+
+def _capture_dynamic_side_snapshot(
+    *,
+    side_camera,
+    calibration,
+    run_dir: Path,
+) -> tuple[dict, int]:
+    """Prove SIDE/rectification are live without assuming any screen text."""
+    frame = phase5.fresh_camera_frame(
+        side_camera,
+        after_frame_id=-1,
+        min_timestamp=None,
+    )
+    rectified = calibration.rectify(frame.image)
+    roi = calibration.crop_text_roi(rectified)
+    if roi is None:
+        raise RuntimeError("screen text ROI is missing")
+
+    debug_dir = run_dir / "side_dynamic_baseline"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(debug_dir / "full_frame.png"), frame.image):
+        raise RuntimeError("failed to save dynamic SIDE baseline full frame")
+    if not cv2.imwrite(str(debug_dir / "text_roi.png"), roi):
+        raise RuntimeError("failed to save dynamic SIDE baseline text ROI")
+
+    record = {
+        "status": "DYNAMIC_SNAPSHOT",
+        "frame_id": int(frame.frame_id),
+        "capture_timestamp": float(frame.capture_timestamp),
+        "frame_age_ms": float(frame.frame_age_ms),
+        "roi_shape": [int(v) for v in roi.shape],
+        "content_role": "uninterpreted_dynamic_baseline",
+    }
+    print(
+        "[SIDE BASELINE] "
+        f"frame={frame.frame_id} age={frame.frame_age_ms:.1f}ms "
+        "dynamic ROI captured; no fixed text prefix is required"
+    )
+    return record, int(frame.frame_id)
+
+
+def _confirm_no_persistent_screen_event(
+    *,
+    side_camera,
+    screen_event_watcher,
+    autonomy_stop: Event,
+) -> dict:
+    """Confirm watcher health and absence of a persistent screen event.
+
+    The FastSidePressEventWatcher remains the authority for detecting new
+    foreground.  This helper only proves that fresh SIDE frames continued to
+    arrive during a short confirmation window while no event was latched.
+    """
+    deadline = time.monotonic() + SCREEN_NO_EVENT_CONFIRM_S
+    last_frame_id = -1
+    fresh_frames = 0
+
+    while time.monotonic() < deadline:
+        if autonomy_stop.is_set():
+            raise OperatorStop("operator stop during SIDE no-event confirmation")
+
+        # Raises ScreenPressEventDetected immediately if the watcher latched.
+        phase5.raise_if_screen_event()
+
+        frame = side_camera.latest(copy_image=False)
+        if frame is not None and int(frame.frame_id) > last_frame_id:
+            last_frame_id = int(frame.frame_id)
+            if frame.frame_age_ms <= screen_event_watcher.config.max_frame_age_ms:
+                fresh_frames += 1
+
+        time.sleep(screen_event_watcher.config.poll_interval_s)
+
+    # Close the small race at the end of the observation window.
+    phase5.raise_if_screen_event()
+
+    if fresh_frames < SCREEN_NO_EVENT_MIN_FRESH_FRAMES:
+        raise RuntimeError(
+            "SIDE no-event confirmation did not observe enough fresh frames: "
+            f"{fresh_frames} < {SCREEN_NO_EVENT_MIN_FRESH_FRAMES}"
+        )
+
+    print(
+        "[SIDE NO-CHANGE] "
+        f"fresh_frames={fresh_frames} window={SCREEN_NO_EVENT_CONFIRM_S:.2f}s "
+        "persistent_event=False"
+    )
+    return {
+        "status": str(phase5.ScreenVerificationStatus.CONFIRMED_NO_CHANGE),
+        "fresh_frames": int(fresh_frames),
+        "window_s": float(SCREEN_NO_EVENT_CONFIRM_S),
+    }
+
+
+def _capture_released_character_verification(
+    *,
+    side_camera,
+    calibration,
+    change_model,
+    char_ocr,
+    target: str,
+    after_frame_id: int,
+    min_timestamp: float,
+    artifact_dir: Path,
+):
+    """Classify only the newly appeared character; no fixed prefix is used."""
+    characters: list[str | None] = []
+    records: list[dict] = []
+    last_frame_id = int(after_frame_id)
+
+    print()
+    print("===== SIDE RELEASED-CHAR VERIFY =====")
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    for index in range(1, phase5.SCREEN_EVENT_CHAR_FRAMES + 1):
+        frame = phase5.fresh_camera_frame(
+            side_camera,
+            after_frame_id=last_frame_id,
+            min_timestamp=min_timestamp,
+        )
+        last_frame_id = int(frame.frame_id)
+
+        rectified = calibration.rectify(frame.image)
+        roi = calibration.crop_text_roi(rectified)
+        if roi is None:
+            raise RuntimeError("screen text ROI is missing during event verify")
+
+        crop, change = change_model.extract_novel_crop(roi)
+        raw_character = None
+        confidence = 0.0
+
+        if crop is not None:
+            cv2.imwrite(
+                str(artifact_dir / f"released_char_{index:02d}.png"),
+                crop,
+            )
+            raw_character, confidence = char_ocr.recognize_character(crop)
+
+        character = _normalize_released_character(raw_character)
+        characters.append(character)
+        records.append(
+            {
+                "frame_id": int(frame.frame_id),
+                "raw_character": raw_character,
+                "character": character,
+                "confidence": float(confidence),
+                "novel_pixels": int(change.novel_pixels),
+                "max_component_area_px": int(change.max_component_area_px),
+            }
+        )
+
+        print(
+            f"[SIDE EVENT OCR] {index}/{phase5.SCREEN_EVENT_CHAR_FRAMES} "
+            f"frame={frame.frame_id} char={character!r} "
+            f"conf={confidence:.1f} novel={change.novel_pixels}"
+        )
+
+    result = _vote_released_characters(characters, target=target)
+
+    print()
+    print(
+        "[SIDE EVENT RESULT] "
+        f"{result.status} "
+        f"success={result.success_votes}/{result.total_frames} "
+        f"wrong={result.wrong_votes}/{result.total_frames} "
+        f"uncertain={result.uncertain_votes}/{result.total_frames} "
+        f"wrong_char={result.wrong_character}"
+    )
+
+    return result, last_frame_id, records
+
+
 def _run_full_deterministic_press(
     *,
     robot,
@@ -327,14 +630,13 @@ def _run_full_deterministic_press(
     recognizer,
     tool_reference,
     screen_calibration,
-    screen_ocr,
     screen_char_ocr,
-    baseline_side_frame_id: int,
     endpoint_settled_timestamp: float,
     endpoint_wrist_frame_id: int,
     run_dir: Path,
     autonomy_stop: Event,
     phase: dict,
+    safety_context: dict,
 ) -> dict:
     """Run the accepted Phase-5 deterministic primitive from one Goal anchor.
 
@@ -427,9 +729,22 @@ def _run_full_deterministic_press(
         phase5.SingleKeyPressConfig(
             z_levels_mm=None,
             z_step_mm=phase5.Z_STEP_MM,
-            max_descent_mm=None,
+            max_descent_mm=AUTONOMOUS_MAX_DESCENT_MM,
             max_uncertain_reobservations=1,
         )
+    )
+
+    # Expose only the already-created fixed-anchor press context to the outer
+    # recovery owner.  If any exception/CTRL+C escapes this helper after a
+    # negative-Z command, main() can retract locally to Z=0 before HOME.
+    safety_context.clear()
+    safety_context.update(
+        {
+            "planner": planner,
+            "sent_state_tracker": sent_state_tracker,
+            "motor_names": motor_names,
+            "events": None,
+        }
     )
 
     wrist_frame_id = int(endpoint_wrist_frame_id)
@@ -437,7 +752,7 @@ def _run_full_deterministic_press(
         float(endpoint_settled_timestamp)
         + float(phase5.POST_MOTION_GUARD_S)
     )
-    side_frame_id = int(baseline_side_frame_id)
+    side_frame_id = -1
 
     print()
     print("=" * 78)
@@ -447,13 +762,10 @@ def _run_full_deterministic_press(
     print("command anchor       : existing Goal_Position")
     print("WRIST alignment      : Phase-5 accepted controller")
     print("Z / SIDE / OCR       : Phase-5 accepted single-key primitive")
-    print("absolute Z guard     : operator Ctrl+C (unchanged Phase-5 contract)")
+    print("autonomous Z fuse    :", f"-{AUTONOMOUS_MAX_DESCENT_MM:.1f} commanded-mm")
+    print("normal-path arming   : AUTOMATIC; no ENTER/GO prompt")
     print()
-    answer = input(
-        "Type GO then ENTER to arm deterministic alignment + press: "
-    ).strip().upper()
-    if answer != "GO":
-        raise RuntimeError("Operator did not arm Phase-8 deterministic press")
+    print("[OWNERSHIP TRANSFER] deterministic controller armed automatically")
     if autonomy_stop.is_set():
         raise OperatorStop("operator stop before deterministic press")
 
@@ -461,6 +773,7 @@ def _run_full_deterministic_press(
     screen_event_watcher = None
     events: list[dict] = []
     screen_records: list[dict] = []
+    safety_context["events"] = events
 
     try:
         print()
@@ -521,6 +834,8 @@ def _run_full_deterministic_press(
             )
 
             if directive.kind is phase5.PressDirectiveKind.DESCEND_TO_Z:
+                # Never send another downward command after a SIDE event has latched.
+                phase5.raise_if_screen_event()
                 state = state.with_z_level(directive.z_target_mm)
                 settled_timestamp, plan = phase5.send_command_state(
                     robot,
@@ -575,24 +890,20 @@ def _run_full_deterministic_press(
                 phase5.PressDirectiveKind.VERIFY_SCREEN,
                 phase5.PressDirectiveKind.REOBSERVE_SCREEN,
             }:
-                result, side_frame_id, records = (
-                    phase5.capture_screen_verification(
-                        side_camera=side_camera,
-                        calibration=screen_calibration,
-                        ocr=screen_ocr,
-                        after_frame_id=side_frame_id,
-                        min_timestamp=min_wrist_timestamp,
-                    )
+                no_change = _confirm_no_persistent_screen_event(
+                    side_camera=side_camera,
+                    screen_event_watcher=screen_event_watcher,
+                    autonomy_stop=autonomy_stop,
                 )
                 screen_records.append(
                     {
                         "stage": f"z_{state.z_mm:+.1f}",
-                        "status": str(result.status),
-                        "wrong_character": result.wrong_character,
-                        "records": records,
+                        **no_change,
                     }
                 )
-                directive = controller.on_verification(result.status)
+                directive = controller.on_verification(
+                    phase5.ScreenVerificationStatus.CONFIRMED_NO_CHANGE
+                )
                 continue
 
             if directive.kind is phase5.PressDirectiveKind.RETRACT_TO_Z0:
@@ -698,15 +1009,17 @@ def _run_full_deterministic_press(
 
         directive = controller.on_release_complete()
         result, side_frame_id, records = (
-            phase5.capture_event_character_verification(
+            _capture_released_character_verification(
                 side_camera=side_camera,
                 calibration=screen_calibration,
                 change_model=screen_event_watcher.model,
                 char_ocr=screen_char_ocr,
+                target=target,
                 after_frame_id=int(
                     event_details.get("frame_id", side_frame_id)
                 ),
                 min_timestamp=last_release_timestamp,
+                artifact_dir=(phase5.ARTIFACT_DIR / "side_event"),
             )
         )
         screen_records.append(
@@ -721,13 +1034,15 @@ def _run_full_deterministic_press(
 
         if directive.kind is phase5.PressDirectiveKind.REOBSERVE_SCREEN:
             result, side_frame_id, records = (
-                phase5.capture_event_character_verification(
+                _capture_released_character_verification(
                     side_camera=side_camera,
                     calibration=screen_calibration,
                     change_model=screen_event_watcher.model,
                     char_ocr=screen_char_ocr,
+                    target=target,
                     after_frame_id=side_frame_id,
                     min_timestamp=last_release_timestamp,
+                    artifact_dir=(phase5.ARTIFACT_DIR / "side_event"),
                 )
             )
             screen_records.append(
@@ -819,22 +1134,23 @@ def main() -> None:
     )
     parser.add_argument("--robot-port", default=ROBOT_PORT)
     parser.add_argument("--recovery-home", type=Path, default=RECOVERY_HOME_CONFIG)
-    parser.add_argument("--confirmed-prefix", default=phase5.CONFIRMED_PREFIX)
     parser.add_argument("--print-config", action="store_true")
     args = parser.parse_args()
 
     target = str(args.target).strip().upper()
     if target != "G":
         raise ValueError(
-            "Phase-8 v1 pilot is intentionally restricted to target G"
+            "Phase-8 v4 hardening run is intentionally restricted to target G"
         )
     if not np.isfinite(args.duration) or args.duration <= 0.0:
         raise ValueError("--duration must be finite and > 0")
     if not 1 <= args.n_action_steps <= CHUNK_SIZE:
         raise ValueError(f"--n-action-steps must be in [1, {CHUNK_SIZE}]")
 
+    autonomous_worst_case_norm_mm = _validate_autonomous_safety_contract()
+
     print("=" * 78)
-    print("PHASE 8 — END-TO-END SINGLE-KEY INTEGRATION PILOT v1")
+    print("PHASE 8 — SINGLE-KEY RUNTIME HARDENING v4")
     print("=" * 78)
     print("target               :", target)
     print("checkpoint           :", args.checkpoint)
@@ -854,13 +1170,22 @@ def main() -> None:
         "fresh WRIST after motion-stable + POST_MOTION_GUARD (diagnostic only)",
     )
     print("deterministic phase  : SAME Goal anchor through align + Z + release + retract")
-    print("success authority    : SIDE released-character verification")
-    print("confirmed prefix     :", args.confirmed_prefix)
+    print("success authority    : SIDE novel-character OCR == target")
+    print("screen baseline      : dynamic current SIDE ROI; no fixed text prefix")
+    print("baseline requirement : detectable current text; content arbitrary")
+    print("normal-path prompts  : NONE (no ENTER / GO)")
+    print("runtime precondition : caret/text prepared before command launch")
     print("Z policy             :", f"iterative -{phase5.Z_STEP_MM:g} mm command-space steps")
-    print("absolute Z guard     : OPERATOR Ctrl+C (unchanged Phase-5 contract)")
+    print("autonomous Z fuse    :", f"-{AUTONOMOUS_MAX_DESCENT_MM:.1f} commanded-mm")
+    print(
+        "workspace envelope   :",
+        f"hypot(XY {phase5.MAX_XY_CORRECTION_MM:.1f}, Z {AUTONOMOUS_MAX_DESCENT_MM:.1f}) "
+        f"= {autonomous_worst_case_norm_mm:.2f} < {phase5.MAX_COMMAND_NORM_MM:.1f} mm",
+    )
+    print("Ctrl+C safety        : local fixed-anchor retract -> HOME; hold if retract fails")
     print("joint safety limit   :", f"{MAX_RELATIVE_TARGET_DEG:.1f} deg/send")
     print("success              : expected character -> retract -> AUTO HOME")
-    print("timeout / Ctrl+C     : AUTO HOME")
+    print("timeout / Ctrl+C     : local fixed-anchor retract -> AUTO HOME")
     print("HOME                 :", args.recovery_home)
     print("=" * 78)
 
@@ -877,7 +1202,6 @@ def main() -> None:
         raise FileNotFoundError(phase5.SCREEN_CALIBRATION)
 
     phase5.TARGET = target
-    phase5.CONFIRMED_PREFIX = str(args.confirmed_prefix)
     phase5.ACTIVE_SCREEN_WATCHER = None
     phase5.SEMANTIC_REENTRY_GUARDED = False
 
@@ -926,12 +1250,6 @@ def main() -> None:
     )
     if screen_calibration is None:
         raise RuntimeError("screen calibration is missing")
-    screen_ocr = phase5.TesseractScreenLineOCR(
-        language="eng",
-        scale=3.0,
-        clahe_clip_limit=2.0,
-        dark_threshold=185,
-    )
     screen_char_ocr = phase5.TesseractSingleCharacterOCR(
         language="eng",
         scale=4.0,
@@ -1010,8 +1328,9 @@ def main() -> None:
     handoff_candidate_trigger = None
     settled_endpoint = None
     deterministic_result = None
+    deterministic_safety_context: dict = {}
+    local_retract_result = {"status": "NOT_NEEDED"}
     screen_baseline = None
-    baseline_side_frame_id = -1
     home_result = {"status": "NOT_ATTEMPTED"}
 
     rollout_start = None
@@ -1036,15 +1355,16 @@ def main() -> None:
 
     try:
         print()
-        print("Before continuing, the Mac screen must contain exactly:")
-        print()
-        print(f"    {args.confirmed_prefix}")
-        print()
+        print("[RUNTIME PRECONDITION] The caret must already be positioned after")
+        print("the current text before this command is launched. Existing text may")
+        print("be arbitrary; no fixed literal prefix is required.")
         print(
-            "with the caret immediately after the final character. "
-            "Keep key-repeat delay at the previously accepted Phase-5 setting."
+            "The current SIDE text ROI becomes the dynamic event baseline. "
+            "This runtime still requires detectable baseline text so the accepted "
+            "Phase-5 watcher can locate the continuation region. Keep key-repeat "
+            "delay at the previously accepted Phase-5 setting."
         )
-        input("\nPress ENTER when the screen is ready: ")
+        print("[AUTO START] camera/baseline checks begin without operator input")
 
         top.start()
         wrist.start()
@@ -1060,27 +1380,12 @@ def main() -> None:
 
         time.sleep(0.5)
         print()
-        print("===== SCREEN BASELINE =====")
-        baseline, baseline_side_frame_id, baseline_records = (
-            phase5.capture_screen_verification(
-                side_camera=side,
-                calibration=screen_calibration,
-                ocr=screen_ocr,
-                after_frame_id=-1,
-                min_timestamp=None,
-            )
+        print("===== DYNAMIC SIDE BASELINE =====")
+        screen_baseline, _ = _capture_dynamic_side_snapshot(
+            side_camera=side,
+            calibration=screen_calibration,
+            run_dir=run_dir,
         )
-        screen_baseline = {
-            "status": str(baseline.status),
-            "records": baseline_records,
-        }
-        if (
-            baseline.status
-            is not phase5.ScreenVerificationStatus.CONFIRMED_NO_CHANGE
-        ):
-            raise RuntimeError(
-                "SIDE baseline is not CONFIRMED_NO_CHANGE. Do not move the robot."
-            )
 
         robot.connect()
         motor_names = list(robot.bus.motors.keys())
@@ -1539,14 +1844,13 @@ def main() -> None:
                 recognizer=recognizer,
                 tool_reference=tool_reference,
                 screen_calibration=screen_calibration,
-                screen_ocr=screen_ocr,
                 screen_char_ocr=screen_char_ocr,
-                baseline_side_frame_id=baseline_side_frame_id,
                 endpoint_settled_timestamp=settled_timestamp,
                 endpoint_wrist_frame_id=endpoint_wrist_frame_id,
                 run_dir=run_dir,
                 autonomy_stop=autonomy_stop,
                 phase=phase,
+                safety_context=deterministic_safety_context,
             )
 
             _append_jsonl(
@@ -1609,48 +1913,62 @@ def main() -> None:
             print("=" * 78)
             print("task status :", task_status)
 
-            try:
-                home_hold = _synchronize_goal_to_present(
-                    robot=robot,
-                    motor_names=motor_names,
-                    max_sent_diff_deg=STARTUP_SENT_DIFF_DEG,
-                )
-                if home_stop.is_set():
-                    raise HomeStop("operator emergency stop during HOME recovery")
+            local_retract_safe = True
+            tracker = deterministic_safety_context.get("sent_state_tracker")
+            planner = deterministic_safety_context.get("planner")
+            recovery_motor_names = deterministic_safety_context.get("motor_names")
+            recovery_events = deterministic_safety_context.get("events")
 
-                home_restore = _auto_restore_recorded_start(
-                    robot=robot,
-                    baseline=home_baseline,
-                    motor_names=motor_names,
-                    step_deg=HOME_STEP_DEG,
-                    max_sent_diff_deg=STARTUP_SENT_DIFF_DEG,
-                    label="RECOVERY HOME",
-                )
-                home_diff = _verify_home(
-                    robot=robot,
-                    motor_names=motor_names,
-                    home_baseline=home_baseline,
-                    max_diff_deg=STARTUP_SENT_DIFF_DEG,
-                )
-                if home_stop.is_set():
-                    raise HomeStop("operator emergency stop during HOME verification")
+            if tracker is not None and planner is not None and recovery_motor_names:
+                latest_state = tracker.state
+                if latest_state.z_mm < -1e-12:
+                    print()
+                    print("===== LOCAL FIXED-ANCHOR SAFETY RETRACT =====")
+                    print(
+                        "latest sent XYZ       : "
+                        f"({latest_state.x_mm:+.2f},"
+                        f"{latest_state.y_mm:+.2f},"
+                        f"{latest_state.z_mm:+.2f}) mm"
+                    )
+                    print("policy                : retract to local Z=0 before canonical HOME")
+                    try:
+                        phase5.ACTIVE_SCREEN_WATCHER = None
+                        recovered_state = _retract_to_z0(
+                            robot=robot,
+                            planner=planner,
+                            state=latest_state,
+                            motor_names=recovery_motor_names,
+                            sent_state_tracker=tracker,
+                            events=(recovery_events if recovery_events is not None else []),
+                        )
+                        local_retract_result = {
+                            "status": "PASS",
+                            "start_z_mm": float(latest_state.z_mm),
+                            "final_z_mm": float(recovered_state.z_mm),
+                        }
+                        print("[LOCAL SAFETY RETRACT PASS] local command-space Z=0")
+                    except BaseException as exc:
+                        local_retract_safe = False
+                        local_retract_result = {
+                            "status": "FAIL",
+                            "start_z_mm": float(latest_state.z_mm),
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                        print(
+                            "[LOCAL SAFETY RETRACT FAILURE]",
+                            local_retract_result["error"],
+                        )
+
+            if not local_retract_safe:
                 home_result = {
-                    "status": "PASS",
-                    "present_hold": home_hold,
-                    "restore": home_restore,
-                    "final_goal_diff_deg": float(home_diff),
+                    "status": "SKIPPED_UNSAFE_LOCAL_RETRACT_FAILED",
+                    "error": local_retract_result.get("error"),
                 }
-                print(f"[HOME RESTORED] final Goal diff={home_diff:.3f}deg")
+                print(
+                    "[AUTO HOME SKIPPED] local fixed-anchor retract failed; "
+                    "holding torque for operator-controlled recovery."
+                )
 
-            except BaseException as exc:
-                home_result = {
-                    "status": "FAIL",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-                print("\n[HOME RECOVERY FAILURE]", home_result["error"])
-
-                # Emergency hold performs no bus I/O; restore ordinary Ctrl+C
-                # so the operator can explicitly authorize disconnect.
                 phase5.raise_if_screen_event = original_raise_if_screen_event
                 phase5.wait_motion_stable = original_wait_motion_stable
                 if signal_installed:
@@ -1658,6 +1976,55 @@ def main() -> None:
                     signal_installed = False
                 _emergency_hold_until_operator(robot, home_result["error"])
 
+            else:
+                try:
+                    home_hold = _synchronize_goal_to_present(
+                        robot=robot,
+                        motor_names=motor_names,
+                        max_sent_diff_deg=STARTUP_SENT_DIFF_DEG,
+                    )
+                    if home_stop.is_set():
+                        raise HomeStop("operator emergency stop during HOME recovery")
+
+                    home_restore = _auto_restore_recorded_start(
+                        robot=robot,
+                        baseline=home_baseline,
+                        motor_names=motor_names,
+                        step_deg=HOME_STEP_DEG,
+                        max_sent_diff_deg=STARTUP_SENT_DIFF_DEG,
+                        label="RECOVERY HOME",
+                    )
+                    home_diff = _verify_home(
+                        robot=robot,
+                        motor_names=motor_names,
+                        home_baseline=home_baseline,
+                        max_diff_deg=STARTUP_SENT_DIFF_DEG,
+                    )
+                    if home_stop.is_set():
+                        raise HomeStop("operator emergency stop during HOME verification")
+                    home_result = {
+                        "status": "PASS",
+                        "present_hold": home_hold,
+                        "restore": home_restore,
+                        "final_goal_diff_deg": float(home_diff),
+                    }
+                    print(f"[HOME RESTORED] final Goal diff={home_diff:.3f}deg")
+
+                except BaseException as exc:
+                    home_result = {
+                        "status": "FAIL",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    print("\n[HOME RECOVERY FAILURE]", home_result["error"])
+
+                    # Emergency hold performs no bus I/O; restore ordinary Ctrl+C
+                    # so the operator can explicitly authorize disconnect.
+                    phase5.raise_if_screen_event = original_raise_if_screen_event
+                    phase5.wait_motion_stable = original_wait_motion_stable
+                    if signal_installed:
+                        signal.signal(signal.SIGINT, previous_sigint)
+                        signal_installed = False
+                    _emergency_hold_until_operator(robot, home_result["error"])
         phase5.ACTIVE_SCREEN_WATCHER = None
         top.stop()
         wrist.stop()
@@ -1696,7 +2063,7 @@ def main() -> None:
             physical_range = np.zeros(6, dtype=np.float64)
 
         summary = {
-            "schema": "phase8.single_key_integration.v1",
+            "schema": "phase8.single_key_integration.v2",
             "target": target,
             "checkpoint": str(args.checkpoint),
             "task_status": task_status,
@@ -1766,6 +2133,7 @@ def main() -> None:
         print("physical range deg  :", np.round(physical_range, 3).tolist())
         print("replan ms p50/p95   :", _percentile(replan_ms_values, 50), "/", _percentile(replan_ms_values, 95))
         print("obs age ms p50/p95  :", _percentile(obs_age_ms_values, 50), "/", _percentile(obs_age_ms_values, 95))
+        print("local safety retract:", local_retract_result["status"])
         print("HOME recovery       :", home_result["status"])
         print("summary             :", summary_path)
         print("=" * 78)
