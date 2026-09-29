@@ -1810,7 +1810,7 @@ changes a phase boundary, command contract, or acceptance criterion.
 | Phase 4  | Screen Rectification and Verification               | **Completed** |
 | Phase 5  | Deterministic Local Single-Key Closed Loop          | **Completed — G/F/H cross-key acceptance** |
 | Phase 6  | Target-Conditioned ACT Dataset                      | **Completed — generic collection + QC + physical replay/takeover verification** |
-| Phase 7  | ACT Coarse Policy                                   | **IN PROGRESS — 20k keyboard_v1 checkpoint + runtime rollout baseline validated; broader acceptance tail remains** |
+| Phase 7  | ACT Coarse Policy                                   | **Completed — 20k keyboard_v1 checkpoint + multi-target ACT→WRIST takeover acceptance** |
 | Phase 8  | ACT + Visual Servo Handoff                          | **IN PROGRESS — first G E2E pilot physically closed the loop; released-char OCR/software acceptance remains** |
 | Phase 9  | Multi-Key Typing                                    | Not Started |
 | Phase 10 | Automatic Recovery                                  | Not Started |
@@ -1823,7 +1823,7 @@ the intended system.
 
 ``` text
 Phase 8 — ACT + Visual Servo Handoff
-(integration hardening, with the Phase-7 acceptance tail still open)
+(integration hardening; Phase 7 accepted)
 ```
 
 Current checkpoint:
@@ -1849,7 +1849,9 @@ keyboard_v1 ACT 20k checkpoint                       ✓ TRAINED
         ↓
 Phase 7 rollout evaluator v6                         ✓ VALIDATED
         ↓
-n_action_steps=20 G/G/F takeover evidence            ✓ PASS
+n_action_steps=20 G/G/F/Q/P/M takeover evidence      ✓ PASS
+        ↓
+Phase 7 multi-target ACT coarse-policy acceptance    ✓ COMPLETED
         ↓
 Phase 8 first G full physical integration pilot      ✓ PHYSICAL LOOP CLOSED
         ↓
@@ -1868,13 +1870,13 @@ cross-key Phase 8 acceptance                         FUTURE
 
 ### Phase 7 runtime checkpoint
 
-The current trained-policy runtime baseline is:
+The retained Phase-7 trained-policy runtime baseline is:
 
 ``` text
 checkpoint          = artifacts/phase7_act_coarse/keyboard_v1/act_train_20k/checkpoints/last
 control rate        = 15 Hz
 chunk_size          = 20
-n_action_steps      = 20   # current best-known baseline, not permanently frozen
+n_action_steps      = 20   # retained Phase-7 acceptance baseline
 execution horizon   = 1.333 s
 Temporal Ensemble   = OFF
 ```
@@ -1894,19 +1896,32 @@ TAKEOVER PASS / FAIL = ground truth
 ```
 
 The moving `<=80 px` condition is **not** called servo-ready and is not the
-acceptance authority. It is only a candidate trigger. Current hardware evidence:
+acceptance authority. It is only a candidate trigger. Final retained hardware
+evidence is:
 
-| Target/run | Moving candidate | Settled endpoint | Takeover initial | Result |
-|---|---:|---:|---:|---|
-| `G` v6 run 1 | `78.47 px` | `76.92 px` | `76.83 px` | PASS |
-| `G` v6 run 2 | `78.34 px` | `72.40 px` | `72.37 px` | PASS |
-| `F` v6 run | `65.68 px` | `59.28 px` | `59.28 px` | PASS |
+| Target/run | Moving candidate | Settled endpoint | Result |
+|---|---:|---:|---|
+| `G` v6 run 1 | `78.47 px` | `76.92 px` | PASS |
+| `G` v6 run 2 | `78.34 px` | `72.40 px` | PASS |
+| `F` v6 | `65.68 px` | `59.28 px` | PASS |
+| `Q` v6 | `40.60 px` | `38.78 px` | PASS |
+| `P` v6 | `75.16 px` | `72.25 px` | PASS |
+| `M` v6 | `73.64 px` | `63.19 px` | PASS |
+
+All retained PASS runs used the same 20k checkpoint, 15 Hz control rate, and
+`n_action_steps=20`, with no per-target runtime tuning, and completed real
+deterministic WRIST takeover plus automatic HOME recovery.
+
+Two additional `Z` runs ended in `TIMEOUT_NO_TAKEOVER`. Saved WRIST evidence
+shows that the physical ACT approach reached the Z neighborhood, while the runtime
+glyph recognizer produced no accepted `Z` observation. The case is retained as a
+known target-perception limitation and is not worked around with Z-specific ACT
+parameters.
 
 A diagnostic `n_action_steps=10` run exposed large direction discontinuities at
 ACT chunk boundaries and eventually failed deterministic takeover. The existing
 1 mm planner/FK sanity guard must not be loosened to make such a run pass.
-`n_action_steps=20` therefore remains the current runtime baseline while broader
-target coverage and latency/observation-age characterization continue.
+`n_action_steps=20` is therefore retained as the Phase-7 acceptance baseline.
 
 ### First Phase 8 end-to-end pilot — 2026-09-29
 
@@ -2581,13 +2596,12 @@ Ti with approximately `3.19 GiB` peak CUDA allocation. The earlier standalone
 forward-only smoke script is no longer retained because the training entry point
 now subsumes that test.
 
-### 7D — Formal target-conditioned keyboard dataset — **Contract frozen; runtime checkpoint trained**
+### 7D — Formal target-conditioned keyboard dataset — **Completed**
 
 This subsection preserves the formal V1 dataset/coverage contract that produced the
-current `keyboard_v1` training line. The existence of the 20k checkpoint does not by
-itself prove that every planned quota cell should be considered finally accepted;
-the exact verified manifest used for the retained checkpoint must be frozen and
-reported separately during Phase-7 closeout.
+retained `keyboard_v1` training line. The final verified manifest and matching
+verified-only normalization provenance used by the retained 20k checkpoint are
+frozen in the Phase-7 acceptance evidence below.
 
 The V1 dataset is designed as one shared target-conditioned policy dataset with a
 28D target schema but an A-Z-only first collection pass:
@@ -2661,36 +2675,61 @@ machine:
   acceptance test;
 - the evaluator does **not** press a key and does not run SIDE/OCR.
 
-Current G/F hardware evidence is summarized in the Implementation Progress
-checkpoint above. The important result is not that `80 px` has been proven as a
-universal capture threshold; it has not. The evidence only shows that current
-settled endpoints around `59–77 px` have successfully converged in these runs.
+Final hardware evidence spans `G`, `F`, `Q`, `P`, and `M` with the same retained
+checkpoint and `n_action_steps=20`. The important result is not that `80 px` has
+been proven as a universal capture threshold; it has not. The moving threshold
+remains only a handoff-candidate trigger, while actual deterministic WRIST
+convergence remains the acceptance ground truth.
 
-### Phase 7 remaining acceptance work
+The two retained `Z` timeouts are documented as a target-perception limitation:
+the physical ACT approach reached the Z neighborhood, but the runtime WRIST glyph
+recognizer produced no accepted `Z` observation. They are not counted as PASS and
+are not used to justify target-specific ACT tuning.
 
-The first trained-policy/runtime path is operational, but Phase 7 is not marked
-fully complete yet. Remaining acceptance work is now limited to:
+### Phase 7 acceptance closeout
 
-- freeze the final verified multi-target manifest and matching normalization stats
-  that produced the retained policy checkpoint;
-- retain the training loss/checkpoint evidence needed to reproduce model selection;
-- summarize policy inference latency and observation-to-action age under the
-  selected runtime cadence;
-- keep `n_action_steps=20` as the current baseline while broader target rollout
-  evidence is collected; do not tune by blind 20→10→5→3→1 search;
-- characterize target-neighborhood arrival, target visibility, and deterministic
-  takeover success over enough distinct targets to close the Phase-7 acceptance
-  tail.
+Phase 7 is accepted.
 
-Evaluate:
+The final provenance chain is frozen:
 
-- target-neighborhood arrival rate,
-- target acquisition rate after ACT,
-- settled endpoint residual distribution,
-- real WRIST-takeover rate,
-- target visibility / pixel size / occlusion,
-- time to handoff,
-- inference latency and observation-to-action age.
+- `phase6.verified_episode_manifest.v4`;
+- 158 verified episodes / 7561 verified frames;
+- verified-only normalization from exactly the same selected episode subset;
+- official LeRobot ACT training path with ImageNet-pretrained ResNet18;
+- 20,000 completed optimization steps;
+- retained `checkpoints/last -> step_020000`;
+- offline 26-target diagnostic validation PASS;
+- runtime latency and observation-to-action age characterized from hardware
+  rollout evidence;
+- retained runtime acceptance baseline: 15 Hz, `chunk_size=20`,
+  `n_action_steps=20`, Temporal Ensemble OFF.
+
+Final retained hardware rollout evidence:
+
+| Target/run | Moving candidate | Settled endpoint | Result |
+|---|---:|---:|---|
+| `G` v6 run 1 | `78.47 px` | `76.92 px` | PASS |
+| `G` v6 run 2 | `78.34 px` | `72.40 px` | PASS |
+| `F` v6 | `65.68 px` | `59.28 px` | PASS |
+| `Q` v6 | `40.60 px` | `38.78 px` | PASS |
+| `P` v6 | `75.16 px` | `72.25 px` | PASS |
+| `M` v6 | `73.64 px` | `63.19 px` | PASS |
+
+Every PASS above used the same retained checkpoint and runtime configuration,
+reached real deterministic WRIST convergence, and completed automatic HOME
+recovery.
+
+Two `Z` runs were also retained. Both ended in `TIMEOUT_NO_TAKEOVER`; they are
+**not** recorded as PASS. Saved WRIST evidence shows that the physical ACT approach
+reached the Z neighborhood, but the runtime WRIST glyph recognizer never produced
+an accepted `Z` observation. This is frozen as a known target-perception limitation
+for later work. No Z-specific ACT parameter tuning, safety-limit relaxation, or
+blind `n_action_steps` search is introduced to make the case pass.
+
+Phase 7 therefore closes on demonstrated multi-target ACT coarse approach and
+successful deterministic-controller handoff. Z descent, physical keypress,
+SIDE-event handling, released-character OCR, and final key outcome remain
+Phase-8 acceptance concerns.
 
 ------------------------------------------------------------------------
 
