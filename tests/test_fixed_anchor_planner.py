@@ -5,6 +5,7 @@ import numpy as np
 from so101_typing.control.fixed_anchor_planner import (
     FixedAnchorCartesianPlanner,
     FixedAnchorPlannerConfig,
+    RelativeJointSafetyError,
 )
 from so101_typing.control.fixed_anchor_xyz import (
     FixedAnchorXYZCommandState,
@@ -519,6 +520,40 @@ class TestFixedAnchorPlanner(
                 state,
                 self.present(),
             )
+
+    def test_relative_joint_slew_uses_typed_safety_exception(self):
+        planner, anchor = self.make_planner(
+            config=FixedAnchorPlannerConfig(
+                max_relative_target_deg=4.0,
+            )
+        )
+        planner.latch_zero_delta()
+
+        state = (
+            FixedAnchorXYZCommandState
+            .at_anchor(anchor)
+            .with_z_level(-5.0)
+        )
+
+        with self.assertRaises(RelativeJointSafetyError) as caught:
+            planner.plan(
+                state,
+                self.present(),
+            )
+
+        self.assertEqual(
+            caught.exception.violations,
+            (("j2", 5.0),),
+        )
+        self.assertEqual(
+            caught.exception.limit_deg,
+            4.0,
+        )
+        self.assertIn(
+            "relative safety gate",
+            str(caught.exception),
+        )
+
 
     def test_retreat_skips_z_magnitude_gate_but_keeps_diagnostic(self):
         planner, anchor = self.make_planner(

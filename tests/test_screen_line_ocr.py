@@ -92,6 +92,27 @@ class TestScreenLineOCR(unittest.TestCase):
         with self.assertRaises(ValueError):
             TesseractSingleCharacterOCR(psm=-1)
 
+    def test_multi_character_observation_is_preserved_without_changing_single_character_api(self):
+        ocr = TesseractSingleCharacterOCR(
+            psm=13,
+            whitelist="abcdefghijklmnopqrstuvwxyz",
+        )
+        image = np.zeros((20, 40, 3), dtype=np.uint8)
+
+        original = ocr._recognize_line
+        try:
+            ocr._recognize_line = lambda _image: ("qq", 91.5, 1)
+
+            observed, confidence = ocr.recognize_characters(image)
+            self.assertEqual(observed, "QQ")
+            self.assertAlmostEqual(confidence, 91.5)
+
+            character, confidence = ocr.recognize_character(image)
+            self.assertIsNone(character)
+            self.assertAlmostEqual(confidence, 91.5)
+        finally:
+            ocr._recognize_line = original
+
 
 if __name__ == "__main__":
     unittest.main()

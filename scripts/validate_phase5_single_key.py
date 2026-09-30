@@ -1263,6 +1263,24 @@ def send_command_state(
     )
 
 
+def _effective_xy_command_budget_mm(state):
+    """Return XY radius currently available inside the state's XYZ envelope.
+
+    max_xy_norm_mm remains an optional caller-specific lateral cap.  The total
+    fixed-anchor max_xyz_norm_mm sphere is always authoritative, so the usable
+    XY radius at a fixed Z is sqrt(max_xyz^2 - z^2).
+    """
+    max_xy = float(state.max_xy_norm_mm)
+    max_xyz = float(state.max_xyz_norm_mm)
+    z_mm = float(state.z_mm)
+
+    remaining_sq = max_xyz * max_xyz - z_mm * z_mm
+    if remaining_sq <= 0.0:
+        return 0.0
+
+    return min(max_xy, math.sqrt(remaining_sq))
+
+
 def align_wrist(
     *,
     robot,
@@ -1281,6 +1299,14 @@ def align_wrist(
     max_commands,
     sent_state_tracker,
 ):
+    effective_xy_budget_mm = _effective_xy_command_budget_mm(
+        state
+    )
+    if effective_xy_budget_mm <= 1e-9:
+        raise RuntimeError(
+            "no XY command space remains inside cumulative XYZ workspace envelope"
+        )
+
     semantic_servo_config = VisualServoConfig(
         gain=1.0,
         convergence_threshold_px=(
@@ -1290,7 +1316,7 @@ def align_wrist(
             MAX_STEP_NORM_MM
         ),
         max_total_correction_norm=(
-            MAX_XY_CORRECTION_MM
+            effective_xy_budget_mm
         ),
     )
 
@@ -1303,7 +1329,7 @@ def align_wrist(
             GEOMETRY_MAX_STEP_NORM_MM
         ),
         max_total_correction_norm=(
-            MAX_XY_CORRECTION_MM
+            effective_xy_budget_mm
         ),
     )
 

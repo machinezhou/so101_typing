@@ -1989,8 +1989,10 @@ be fixed rather than tolerated by luck.
   `Present_Position` during the local primitive.
 - `Present_Position` / FK telemetry is diagnostic. Goal/Present lag under load is
   not evidence that fixed-anchor command semantics are wrong.
-- Do not weaken the 1 mm planner/FK sanity guard or the 35 mm cumulative XY budget
-  merely to make an ACT rollout succeed.
+- Do not weaken the 1 mm planner/FK sanity guard or the 80 mm cumulative XYZ
+  workspace envelope merely to make an ACT rollout succeed. Phase 8 no longer uses
+  a separate 35 mm cumulative XY hard stop; at each fixed Z, usable XY is bounded
+  by the remaining cross-section of the same total XYZ envelope.
 - A SIDE press event has priority over all later WRIST/Z work. Once latched, no more
   downward command or XY chase is permitted for that attempt.
 - Event-time recovery must use the latest command that was **actually sent**, not a

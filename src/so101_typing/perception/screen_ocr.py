@@ -882,17 +882,35 @@ class TesseractSingleCharacterOCR(TesseractScreenLineOCR):
             min_word_confidence=0.0,
         )
 
-    def recognize_character(
+    def recognize_characters(
         self,
         crop_bgr: np.ndarray,
     ) -> tuple[str | None, float]:
+        """Return the full alphanumeric OCR observation from a released crop.
+
+        This deliberately preserves repeated/multiple characters such as "qq".
+        Phase-8 semantic verification needs to distinguish an actual repeated
+        keypress from an unreadable crop instead of collapsing both to None.
+        """
         if crop_bgr is None or crop_bgr.size == 0:
             return None, 0.0
 
         text, confidence, _ = self._recognize_line(crop_bgr)
         compact = "".join(ch for ch in normalize_ocr_text(text) if ch.isalnum())
 
-        if len(compact) != 1:
+        if not compact:
             return None, float(confidence)
 
         return compact.upper(), float(confidence)
+
+    def recognize_character(
+        self,
+        crop_bgr: np.ndarray,
+    ) -> tuple[str | None, float]:
+        """Backward-compatible exactly-one-character interface."""
+        compact, confidence = self.recognize_characters(crop_bgr)
+
+        if compact is None or len(compact) != 1:
+            return None, float(confidence)
+
+        return compact, float(confidence)

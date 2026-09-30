@@ -80,6 +80,32 @@ class FixedAnchorPlan:
     max_relative_joint_delta_deg: float
 
 
+class RelativeJointSafetyError(RuntimeError):
+    """A planned target exceeds the retained per-send joint-slew gate."""
+
+    def __init__(
+        self,
+        *,
+        violations: Sequence[tuple[str, float]],
+        limit_deg: float,
+    ) -> None:
+        self.violations = tuple(
+            (str(name), float(delta_deg))
+            for name, delta_deg in violations
+        )
+        self.limit_deg = float(limit_deg)
+
+        detail = ", ".join(
+            f"{name}={delta_deg:.2f}deg"
+            for name, delta_deg in self.violations
+        )
+
+        super().__init__(
+            "planned joint target exceeds relative safety gate: "
+            + detail
+        )
+
+
 class FixedAnchorCartesianPlanner:
     """Plan cumulative XYZ against one immutable existing Goal_Position anchor.
 
@@ -521,16 +547,9 @@ class FixedAnchorCartesianPlanner:
         ]
 
         if violations:
-            detail = ", ".join(
-                f"{name}={delta:.2f}deg"
-                for name, delta
-                in violations
-            )
-
-            raise RuntimeError(
-                "planned joint target exceeds "
-                "relative safety gate: "
-                + detail
+            raise RelativeJointSafetyError(
+                violations=violations,
+                limit_deg=self.config.max_relative_target_deg,
             )
 
         max_relative = max(

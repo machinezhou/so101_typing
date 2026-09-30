@@ -35,6 +35,9 @@ from phase6_replay_takeover_validate import (
     _verify_home,
 )
 from so101_typing.adapters.cameras import CameraSpec, ThreadedOpenCVCamera
+from so101_typing.control.fixed_anchor_planner import (
+    RelativeJointSafetyError,
+)
 from so101_typing.control.handoff_endpoint import (
     HandoffEndpointContract,
     HandoffFrameConfirmation,
@@ -80,9 +83,11 @@ SCREEN_NO_EVENT_MIN_FRESH_FRAMES = 4
 #
 # Hardware evidence includes successful contact as deep as -64 commanded-mm.
 # The deterministic controller uses 2 mm steps, so 70 mm preserves three
-# additional steps of margin while remaining inside the existing planner
-# cumulative XYZ envelope even at the full 35 mm XY budget:
-# hypot(35, 70) ~= 78.3 mm < 80 mm.
+# additional steps of margin while remaining inside the existing 80 mm total
+# cumulative XYZ planner envelope.
+#
+# Phase 8 has no separate 35 mm cumulative XY hard stop.  At every fixed Z,
+# usable XY is the cross-section that remains inside the same 80 mm XYZ sphere.
 #
 # Commanded millimetres remain command-space units, not physical TCP accuracy.
 AUTONOMOUS_MAX_DESCENT_MM = 70.0
@@ -103,13 +108,11 @@ class HandoffRejected(RuntimeError):
 def _validate_autonomous_safety_contract() -> float:
     """Validate the Phase-8 cumulative command-space safety envelope.
 
-    The press-depth fuse and XY budget are independent bounds but share the
-    same fixed-anchor cumulative XYZ planner envelope.  Their worst-case norm
-    must therefore remain strictly inside the planner envelope.
+    The existing total cumulative XYZ planner envelope is the workspace fuse.
+    Phase 8 deliberately has no independent 35 mm cumulative XY hard stop.
     """
     maximum = float(AUTONOMOUS_MAX_DESCENT_MM)
     z_step = float(phase5.Z_STEP_MM)
-    xy_budget = float(phase5.MAX_XY_CORRECTION_MM)
     xyz_budget = float(phase5.MAX_COMMAND_NORM_MM)
 
     if not math.isfinite(maximum) or maximum <= 0.0:
@@ -123,15 +126,13 @@ def _validate_autonomous_safety_contract() -> float:
             "autonomous max descent must align exactly with the iterative Z step"
         )
 
-    worst_case_norm = math.hypot(xy_budget, maximum)
-    if worst_case_norm >= xyz_budget:
+    if maximum >= xyz_budget:
         raise RuntimeError(
-            "autonomous safety envelope conflicts with planner bound: "
-            f"hypot({xy_budget:.1f}, {maximum:.1f})={worst_case_norm:.3f} "
-            f">= {xyz_budget:.3f} mm"
+            "autonomous Z fuse must remain inside total XYZ planner envelope: "
+            f"{maximum:.1f} >= {xyz_budget:.1f} commanded-mm"
         )
 
-    return float(worst_case_norm)
+    return float(xyz_budget)
 
 
 def _action_key(name: str) -> str:
@@ -393,42 +394,154 @@ def _retract_to_z0(
     motor_names,
     sent_state_tracker,
     events: list[dict],
+    label_prefix: str = "RETRACT",
+    nominal_step_mm: float | None = None,
+    event_capture_timestamp: float | None = None,
 ):
+    """Retreat to fixed-anchor Z=0 with safety-aware adaptive segmentation.
+
+    RELEASE and RETRACT share this exact safety path. The caller may choose the
+    nominal command-space Z segment size, but any segment that violates the
+    retained per-send joint-slew gate is subdivided before a command is sent.
+    All other planner/runtime failures remain fail-closed and propagate.
+    """
+    motion_label = str(label_prefix).strip().upper()
+    if motion_label not in {"RELEASE", "RETRACT"}:
+        raise ValueError("label_prefix must be RELEASE or RETRACT")
+
+    event_name = motion_label.lower()
+    step_mm = (
+        float(phase5.RETRACT_Z_STEP_MM)
+        if nominal_step_mm is None
+        else float(nominal_step_mm)
+    )
+    if step_mm <= 0.0:
+        raise ValueError("nominal_step_mm must be positive")
+
     retract_targets = phase5.stepped_z_targets_to_zero(
         state.z_mm,
-        max_step_mm=phase5.RETRACT_Z_STEP_MM,
+        max_step_mm=step_mm,
     )
 
     print()
     print(
-        "[RETRACT PLAN] "
+        f"[{motion_label} PLAN] "
         f"start_z={state.z_mm:+.2f}mm "
-        f"step<={phase5.RETRACT_Z_STEP_MM:.2f}mm "
-        f"segments={len(retract_targets)}"
+        f"nominal_step<={step_mm:.2f}mm "
+        f"nominal_segments={len(retract_targets)} "
+        "adaptive_joint_slew=ON"
     )
 
-    for retract_index, retract_z in enumerate(retract_targets, start=1):
-        state = state.with_z_level(retract_z)
-        _, plan = phase5.send_command_state(
-            robot,
-            planner,
-            state,
-            motor_names,
-            label=f"RETRACT {retract_index}/{len(retract_targets)}",
-            sent_state_tracker=sent_state_tracker,
-        )
-        events.append(
-            {
-                "event": "retract",
-                "segment": int(retract_index),
-                "segment_count": int(len(retract_targets)),
-                "xyz_mm": [float(v) for v in state.xyz_mm],
-                "predicted_delta_mm": [float(v) for v in plan.predicted_delta_mm],
-            }
-        )
+    actual_segment = 0
+    nominal_segment_count = len(retract_targets)
+
+    for nominal_index, nominal_target_z in enumerate(
+        retract_targets,
+        start=1,
+    ):
+        pending_targets = [
+            (float(nominal_target_z), 0)
+        ]
+
+        while pending_targets:
+            target_z, subdivision_depth = pending_targets.pop()
+            from_z = float(state.z_mm)
+            candidate_state = state.with_z_level(target_z)
+
+            try:
+                _, plan = phase5.send_command_state(
+                    robot,
+                    planner,
+                    candidate_state,
+                    motor_names,
+                    label=(
+                        f"{motion_label} "
+                        f"{nominal_index}/{nominal_segment_count} "
+                        f"depth={subdivision_depth}"
+                    ),
+                    sent_state_tracker=sent_state_tracker,
+                    event_capture_timestamp=(
+                        event_capture_timestamp
+                        if actual_segment == 0
+                        else None
+                    ),
+                )
+
+            except RelativeJointSafetyError as exc:
+                midpoint_z = 0.5 * (from_z + float(target_z))
+
+                if not (
+                    from_z + 1e-12
+                    < midpoint_z
+                    < float(target_z) - 1e-12
+                ):
+                    raise RuntimeError(
+                        "adaptive retract cannot subdivide joint-slew "
+                        "violation any further"
+                    ) from exc
+
+                next_depth = int(subdivision_depth) + 1
+
+                print(
+                    f"[{motion_label} SUBDIVIDE] "
+                    f"nominal={nominal_index}/{nominal_segment_count} "
+                    f"from={from_z:+.3f}mm "
+                    f"rejected={float(target_z):+.3f}mm "
+                    f"retry={midpoint_z:+.3f}mm "
+                    f"depth={next_depth} "
+                    f"limit={exc.limit_deg:.2f}deg/send"
+                )
+
+                events.append(
+                    {
+                        "event": f"{event_name}_subdivide",
+                        "nominal_segment": int(nominal_index),
+                        "nominal_segment_count": int(nominal_segment_count),
+                        "subdivision_depth": int(next_depth),
+                        "from_z_mm": float(from_z),
+                        "rejected_target_z_mm": float(target_z),
+                        "retry_target_z_mm": float(midpoint_z),
+                        "joint_slew_limit_deg": float(exc.limit_deg),
+                        "violations": [
+                            {
+                                "joint": str(name),
+                                "delta_deg": float(delta_deg),
+                            }
+                            for name, delta_deg in exc.violations
+                        ],
+                    }
+                )
+
+                pending_targets.append(
+                    (float(target_z), next_depth)
+                )
+                pending_targets.append(
+                    (float(midpoint_z), next_depth)
+                )
+                continue
+
+            state = candidate_state
+            actual_segment += 1
+
+            events.append(
+                {
+                    "event": event_name,
+                    "segment": int(actual_segment),
+                    "nominal_segment": int(nominal_index),
+                    "nominal_segment_count": int(nominal_segment_count),
+                    "subdivision_depth": int(subdivision_depth),
+                    "xyz_mm": [float(v) for v in state.xyz_mm],
+                    "predicted_delta_mm": [
+                        float(v)
+                        for v in plan.predicted_delta_mm
+                    ],
+                }
+            )
 
     if abs(float(state.z_mm)) > 1e-12:
-        raise RuntimeError("bounded retract did not finish at Z=0")
+        raise RuntimeError(
+            f"bounded {event_name} did not finish at Z=0"
+        )
 
     return state
 
@@ -451,7 +564,7 @@ def _normalize_released_character(value) -> str | None:
     if value is None:
         return None
     text = str(value).strip().upper()
-    if len(text) != 1:
+    if not text:
         return None
     if not text.isascii() or not text.isalnum():
         return None
@@ -467,7 +580,7 @@ def _vote_released_characters(
         raise ValueError("at least one released-character observation is required")
 
     expected = _normalize_released_character(target)
-    if expected is None:
+    if expected is None or len(expected) != 1:
         raise ValueError(
             "Phase-8 released-character verification currently requires "
             "one ASCII alphanumeric target"
@@ -651,7 +764,7 @@ def _capture_released_character_verification(
                 str(artifact_dir / f"released_char_{index:02d}.png"),
                 crop,
             )
-            raw_character, confidence = char_ocr.recognize_character(crop)
+            raw_character, confidence = char_ocr.recognize_characters(crop)
 
         character = _normalize_released_character(raw_character)
         characters.append(character)
@@ -796,7 +909,9 @@ def _run_full_deterministic_press(
 
     state = phase5.FixedAnchorXYZCommandState.at_anchor(
         anchor,
-        max_xy_norm_mm=phase5.MAX_XY_CORRECTION_MM,
+        # No independent Phase-8 35 mm XY radius.  The total 80 mm
+        # fixed-anchor XYZ sphere is authoritative.
+        max_xy_norm_mm=phase5.MAX_COMMAND_NORM_MM,
         max_xyz_norm_mm=phase5.MAX_COMMAND_NORM_MM,
     )
     sent_state_tracker = phase5.LatestSentXYZCommandState(state)
@@ -1036,10 +1151,12 @@ def _run_full_deterministic_press(
             }
         )
 
-        release_target_z = min(
-            0.0,
-            float(state.z_mm) + float(phase5.SCREEN_EVENT_RELEASE_MM),
-        )
+        # A fixed +20 commanded-mm release is not a physical key-release
+        # guarantee on SO101 because backlash/compliance can leave the key held.
+        # Once SIDE latches a press event, do not pause for OCR at an arbitrary
+        # intermediate Z. Escape all the way to the known pre-press fixed-anchor
+        # Z=0 first, using the same adaptive joint-slew-safe retreat path.
+        release_target_z = 0.0
         release_directive = controller.on_screen_event(
             release_z_target_mm=release_target_z,
         )
@@ -1049,38 +1166,18 @@ def _run_full_deterministic_press(
         ):
             raise RuntimeError("SIDE event did not enter release state")
 
-        release_index = 0
+        state = _retract_to_z0(
+            robot=robot,
+            planner=planner,
+            state=state,
+            motor_names=motor_names,
+            sent_state_tracker=sent_state_tracker,
+            events=events,
+            label_prefix="RELEASE",
+            nominal_step_mm=phase5.SCREEN_EVENT_RELEASE_STEP_MM,
+            event_capture_timestamp=event_details.get("capture_timestamp"),
+        )
         last_release_timestamp = time.monotonic()
-        while state.z_mm < release_target_z - 1e-12:
-            release_index += 1
-            next_z = min(
-                release_target_z,
-                state.z_mm + float(phase5.SCREEN_EVENT_RELEASE_STEP_MM),
-            )
-            state = state.with_z_level(next_z)
-            last_release_timestamp, plan = phase5.send_command_state(
-                robot,
-                planner,
-                state,
-                motor_names,
-                label=f"RELEASE {release_index}",
-                sent_state_tracker=sent_state_tracker,
-                event_capture_timestamp=(
-                    event_details.get("capture_timestamp")
-                    if release_index == 1
-                    else None
-                ),
-            )
-            events.append(
-                {
-                    "event": "release",
-                    "segment": int(release_index),
-                    "xyz_mm": [float(v) for v in state.xyz_mm],
-                    "predicted_delta_mm": [
-                        float(v) for v in plan.predicted_delta_mm
-                    ],
-                }
-            )
 
         directive = controller.on_release_complete()
         result, side_frame_id, records = (
@@ -1220,7 +1317,7 @@ def main() -> None:
     if not 1 <= args.n_action_steps <= CHUNK_SIZE:
         raise ValueError(f"--n-action-steps must be in [1, {CHUNK_SIZE}]")
 
-    autonomous_worst_case_norm_mm = _validate_autonomous_safety_contract()
+    workspace_norm_limit_mm = _validate_autonomous_safety_contract()
 
     handoff_contract = HandoffEndpointContract.load(
         HANDOFF_ENDPOINT_CONTRACT
@@ -1263,8 +1360,8 @@ def main() -> None:
     print("autonomous Z fuse    :", f"-{AUTONOMOUS_MAX_DESCENT_MM:.1f} commanded-mm")
     print(
         "workspace envelope   :",
-        f"hypot(XY {phase5.MAX_XY_CORRECTION_MM:.1f}, Z {AUTONOMOUS_MAX_DESCENT_MM:.1f}) "
-        f"= {autonomous_worst_case_norm_mm:.2f} < {phase5.MAX_COMMAND_NORM_MM:.1f} mm",
+        f"cumulative XYZ norm <= {workspace_norm_limit_mm:.1f} commanded-mm; "
+        "no separate Phase-8 35 mm XY budget",
     )
     print("Ctrl+C safety        : local fixed-anchor retract -> HOME; hold if retract fails")
     print("joint safety limit   :", f"{MAX_RELATIVE_TARGET_DEG:.1f} deg/send")
