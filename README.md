@@ -126,9 +126,30 @@ three non-blocking limitations are explicitly deferred:
 - occasional repeated key output when release is physically slower than the host
   keyboard repeat behavior.
 
-The active project work now moves to **Phase 9 — Multi-Key Typing**: repeatedly
-execute the accepted single-key primitive for short strings, verify after every
-character, and let the supervisor decide whether to continue or recover.
+**Phase 9 — Multi-Key Typing — is now in active hardware integration.**
+The current runtime repeatedly reuses the accepted Phase-8 single-key primitive
+inside one persistent session: robot connection, cameras, ACT policy/checkpoint,
+and processor stack stay alive across successful characters, while target-specific
+dynamic state, handoff state, deterministic press state, SIDE baseline/event
+watcher, and OCR evidence are reset for every key. Successful intermediate keys do
+not HOME or reconnect; the sequence performs one final safe HOME/recovery when it
+finishes or stops.
+
+The current continuous `GOD` hardware checkpoint reached all three physical key
+presses in one session. `G` and `O` completed software SUCCESS. The final `D`
+was physically pressed correctly and appeared on the editor, but the released
+single-character Tesseract path misclassified the clean lowercase `d` as `A`
+with high confidence, so the supervisor correctly stopped with `WRONG_KEY`.
+Phase 9 is therefore **not accepted yet**: the demonstrated blocker is now
+target-independent screen semantic verification rather than ACT approach, WRIST
+alignment, SIDE event detection, release, session reuse, or HOME recovery.
+
+Phase-9 hardening so far includes a dynamic typing-line SIDE event gate,
+event-anchored temporal released-text extraction, preservation of repeated
+same-line evidence such as `QQ`, fail-closed handling of zero-confidence OCR
+mismatches, and a bounded WRIST geometry-outlier streak so persistent bad tracking
+cannot reobserve forever. The current software regression suite passes
+**310 / 310** tests.
 
 Phase 6 established a generic episode pipeline rather than a task-specific
 collector. Start-state coverage is an **external collection strategy/SOP**; the
@@ -2998,9 +3019,13 @@ character.
 
 ## Phase 9 — Multi-Key Typing
 
+Status: **ACTIVE — hardware integration in progress, not yet accepted.**
+
 Goal:
 
-> Repeatedly execute the single-key primitive for short strings.
+> Repeatedly execute the accepted single-key primitive for short strings while
+> preserving one persistent runtime session and resetting only per-character
+> dynamic state.
 
 Initial examples:
 
@@ -3012,7 +3037,175 @@ ROBOT
 VISION
 ```
 
-Verify after every character.
+### Current runtime contract
+
+One Phase-9 task keeps the expensive/static resources alive:
+
+``` text
+robot connection          KEEP
+TOP / WRIST / SIDE        KEEP
+ACT policy/checkpoint     KEEP
+pre/post processors       KEEP
+```
+
+Every character gets fresh dynamic state:
+
+``` text
+target / encoding         RESET
+ACT queue/runtime state   RESET
+semantic target lock      RESET
+handoff confirmations     RESET
+fixed Goal anchor context RESET
+LatestSentXYZ state       RESET
+press controller          RESET
+SIDE baseline/watcher     FRESH
+OCR evidence/logging      RESET
+```
+
+The intended normal path is:
+
+``` text
+target character
+      ↓
+ACT coarse approach
+      ↓
+verified endpoint handoff + settled recheck
+      ↓
+deterministic WRIST ownership
+      ↓
+fixed Goal-space XY/Z control
+      ↓
+SIDE press event
+      ↓
+release first to command-space Z=0
+      ↓
+independent screen semantic verification
+      ├── SUCCESS   → keep session/pose and continue
+      ├── WRONG     → stop sequence and recover
+      └── UNCERTAIN → bounded reobserve, then stop/recover if unresolved
+```
+
+There is no inter-key HOME on the successful path. A failure or the final
+character owns the one real HOME/recovery and teardown.
+
+### Hardware checkpoint — continuous `GOD`
+
+The run
+
+``` text
+artifacts/phase9_multi_key_typing/run_20260930_233002_god
+```
+
+demonstrated the shared-session architecture through three real physical key
+presses:
+
+- `G`: physical press + semantic SUCCESS;
+- `O`: physical press + semantic SUCCESS, with HOME and teardown deferred;
+- `D`: the correct lowercase `d` physically appeared on the editor, but the
+  released single-character OCR returned `A` at high confidence;
+- the supervisor stopped instead of advancing on unverified evidence;
+- final recovery HOME completed successfully.
+
+The software-verified prefix was therefore `GO`, while the physically observed
+screen reached `GOD`. This run is strong integration evidence but is **not** a
+Phase-9 acceptance PASS.
+
+### Perception hardening and lessons learned
+
+Phase 9 exposed several failures that must remain separated instead of being
+collapsed into one generic "typing failed" label.
+
+1. **A SIDE event can be wrong even when WRIST/control are correct.**
+   A previous false event came from a persistent arm/screen intrusion outside the
+   active text row. The event detector now derives a vertical typing-line gate
+   from the fresh baseline rather than using a fixed screen Y range.
+
+2. **A correct press can still become a false WRONG through crop contamination.**
+   The first post-release temporal implementation kept every persistent component
+   above a minimum area. A real `O` press therefore picked up an unrelated stable
+   component and Tesseract returned `Y` at confidence 0. The released-text path
+   now anchors persistent-component selection to the actual press-event bbox,
+   grows only through nearby same-line evidence, and preserves original post-event
+   pixels for recognition.
+
+3. **Repeated characters must stay observable.**
+   Multi-character evidence such as `QQ` must not be collapsed to a single
+   expected character or treated as unreadable. Repetition remains explicit WRONG
+   evidence when only one keypress was expected.
+
+4. **OCR confidence is evidence, not ground truth.**
+   A non-matching OCR observation with non-finite or zero confidence is no longer
+   strong enough to assert WRONG; it becomes UNCERTAIN. Conversely, the latest
+   clean lowercase `d` example shows the opposite failure mode: Tesseract can be
+   confidently wrong (`d -> A` at high confidence). Therefore confidence alone
+   cannot solve semantic verification.
+
+5. **Do not repair OCR by per-key exceptions.**
+   Offline tests showed that changing one global Tesseract page-segmentation mode
+   can fix one glyph while breaking another already-working glyph. The project
+   must not introduce `D -> A` patches, expected-target-biased recognition, or
+   per-letter OCR tuning.
+
+6. **Persistent WRIST outliers must fail closed.**
+   A geometry-tracking failure at nonzero Z previously allowed the outer alignment
+   loop to keep reobserving indefinitely. Five consecutive geometry outliers now
+   terminate that attempt instead of creating an unbounded loop; accepted
+   non-outlier observations reset the streak.
+
+These lessons reinforce the same architecture used since Phase 5/8:
+
+``` text
+SIDE fast event  → decides WHEN to release
+screen semantics → decides WHAT actually appeared
+supervisor       → decides whether to continue or recover
+```
+
+Physical success and semantic software success remain distinct signals.
+
+### Next step
+
+The next screen-verification experiment is **target-independent whole-line
+before/after semantic delta**.
+
+Instead of asking Tesseract to classify one isolated released glyph, capture a
+stable screen line before the press and a stable line after release:
+
+``` text
+before line
+    ↓
+physical press + release
+    ↓
+after line
+    ↓
+compare stable semantic prefix/suffix relationship
+    ↓
+infer the newly appended text
+```
+
+For example, if OCR produces:
+
+``` text
+before = "GO"
+after  = "GOD"
+```
+
+the appended semantic observation is `D`. If the before/after relationship is
+not stable enough to infer an append, the result must remain UNCERTAIN rather than
+guessing from the requested target. The existing single-character path should be
+retained as independent fallback evidence during evaluation, not silently
+rewritten toward the expected answer.
+
+After that verifier is implemented and regression-tested:
+
+1. rerun continuous `GOD`;
+2. run additional short strings without inter-key HOME/restart;
+3. require software-verified physical characters for the entire string;
+4. require one final safe HOME/recovery;
+5. close Phase 9 only after repeated short-string acceptance without per-key
+   control or OCR tuning.
+
+Automatic correction/backspace remains Phase 10 work and must not be pulled into
+Phase 9 simply to hide a semantic-verification failure.
 
 ------------------------------------------------------------------------
 
