@@ -27,6 +27,11 @@ class FastScreenChangeConfig:
     dark_threshold: int = 185
     baseline_dilate_px: int = 5
     continuation_overlap_px: int = 14
+
+    # Dynamic typing-line vertical gate. Derived from the fresh
+    # SIDE baseline for each key; independent of target identity.
+    line_vertical_margin_px: int = 20
+
     min_novel_pixels: int = 45
     min_component_area_px: int = 18
 
@@ -59,6 +64,8 @@ class FastScreenChangeModel:
         *,
         baseline_safe_mask: np.ndarray,
         continuation_x0: int,
+        line_y0: int | None = None,
+        line_y1: int | None = None,
         config: FastScreenChangeConfig | None = None,
     ) -> None:
         cfg = config or FastScreenChangeConfig()
@@ -70,6 +77,25 @@ class FastScreenChangeModel:
         self.config = cfg
         self.baseline_safe_mask = mask.astype(bool, copy=True)
         self.continuation_x0 = int(continuation_x0)
+
+        roi_height = int(mask.shape[0])
+        if (line_y0 is None) != (line_y1 is None):
+            raise ValueError("line_y0 and line_y1 must be provided together")
+
+        if line_y0 is None:
+            self.line_y0 = 0
+            self.line_y1 = roi_height
+        else:
+            y0 = int(line_y0)
+            y1 = int(line_y1)
+            if not (0 <= y0 < y1 <= roi_height):
+                raise ValueError(
+                    "typing-line y gate must satisfy "
+                    f"0 <= y0 < y1 <= {roi_height}, got {y0}, {y1}"
+                )
+            self.line_y0 = y0
+            self.line_y1 = y1
+
         self._streak = 0
         self._triggered = False
 
@@ -88,6 +114,8 @@ class FastScreenChangeModel:
         shape = rois[0].shape[:2]
         union = np.zeros(shape, dtype=np.uint8)
         line_right_edges: list[int] = []
+        line_top_edges: list[int] = []
+        line_bottom_edges: list[int] = []
 
         for roi in rois:
             if roi.shape[:2] != shape:
@@ -104,6 +132,8 @@ class FastScreenChangeModel:
             if boxes:
                 box = max(boxes, key=lambda item: item.width)
                 line_right_edges.append(box.x + box.width - 1)
+                line_top_edges.append(int(box.y))
+                line_bottom_edges.append(int(box.y + box.height))
 
         if not line_right_edges:
             columns = np.flatnonzero(np.count_nonzero(union, axis=0) >= 2)
@@ -118,6 +148,20 @@ class FastScreenChangeModel:
             baseline_right - int(cfg.continuation_overlap_px),
         )
 
+        if line_top_edges:
+            vertical_margin = max(0, int(cfg.line_vertical_margin_px))
+            line_y0 = max(
+                0,
+                int(round(float(np.median(line_top_edges)))) - vertical_margin,
+            )
+            line_y1 = min(
+                int(shape[0]),
+                int(round(float(np.median(line_bottom_edges)))) + vertical_margin,
+            )
+        else:
+            line_y0 = 0
+            line_y1 = int(shape[0])
+
         radius = max(0, int(cfg.baseline_dilate_px))
         if radius:
             size = radius * 2 + 1
@@ -129,6 +173,8 @@ class FastScreenChangeModel:
         return cls(
             baseline_safe_mask=safe,
             continuation_x0=continuation_x0,
+            line_y0=line_y0,
+            line_y1=line_y1,
             config=cfg,
         )
 
@@ -140,6 +186,8 @@ class FastScreenChangeModel:
         dark = gray < self.config.dark_threshold
         novel = dark & ~self.baseline_safe_mask
         novel[:, : self.continuation_x0] = False
+        novel[: self.line_y0, :] = False
+        novel[self.line_y1 :, :] = False
 
         mask = (novel.astype(np.uint8) * 255)
         mask = cv2.morphologyEx(
@@ -331,6 +379,8 @@ class FastSidePressEventWatcher:
             "first_frame_id": first_id,
             "last_frame_id": last_id,
             "continuation_x0": self.model.continuation_x0,
+            "line_y0": self.model.line_y0,
+            "line_y1": self.model.line_y1,
         }
 
     def _run(self) -> None:
@@ -379,6 +429,8 @@ class FastSidePressEventWatcher:
                         "strong_changed": observation.strong_changed,
                         "consecutive_frames": observation.consecutive_frames,
                         "continuation_x0": observation.continuation_x0,
+                        "line_y0": self.model.line_y0,
+                        "line_y1": self.model.line_y1,
                         "bbox_xywh": observation.bbox_xywh,
                     }
 

@@ -181,9 +181,13 @@ WRIST_SETTLE_MIN_SAMPLES = 10
 WRIST_SETTLE_P90_PX = 3.0
 
 # After descent has started, one 2 mm Z step cannot legitimately move
-# an already aligned target tens of pixels.  Reject such observations
+# an already aligned target tens of pixels. Reject such observations
 # and re-observe without commanding motion.
 LOCAL_WRIST_OUTLIER_PX = 40.0
+
+# A transient bad WRIST observation is allowed to recover, but persistent
+# geometry outliers must never leave the robot holding forever.
+MAX_CONSECUTIVE_WRIST_OUTLIERS = 5
 
 SCREEN_FRAME_COUNT = 9
 SCREEN_MIN_VOTE_FRACTION = 0.60
@@ -1335,6 +1339,7 @@ def align_wrist(
 
     stable_frames = 0
     commands_sent = 0
+    consecutive_outliers = 0
 
     while True:
         observation, frame = (
@@ -1404,18 +1409,35 @@ def align_wrist(
             and error_norm
             > LOCAL_WRIST_OUTLIER_PX
         ):
+            consecutive_outliers += 1
+
             print(
                 "[WRIST OUTLIER] "
                 f"geometry error={error_norm:.2f}px "
                 f"at Z={state.z_mm:+.2f}mm; "
+                f"streak={consecutive_outliers}/"
+                f"{MAX_CONSECUTIVE_WRIST_OUTLIERS}; "
                 "holding position and re-observing"
             )
+
+            if (
+                consecutive_outliers
+                >= MAX_CONSECUTIVE_WRIST_OUTLIERS
+            ):
+                raise RuntimeError(
+                    "WRIST_TRACK_LOST: "
+                    f"{consecutive_outliers} consecutive geometry "
+                    f"outliers > {LOCAL_WRIST_OUTLIER_PX:.1f}px "
+                    f"at Z={state.z_mm:+.2f}mm"
+                )
 
             stable_frames = 0
             last_frame_id = int(
                 frame.frame_id
             )
             continue
+
+        consecutive_outliers = 0
 
         print(
             "[WRIST] "

@@ -40,6 +40,46 @@ def make_roi(*, cursor=False, character=False):
     return image
 
 
+def make_tall_roi(*, cursor=False, character=False, off_line_occlusion=False):
+    image = np.full((240, 520, 3), 255, dtype=np.uint8)
+    cv2.putText(
+        image,
+        "KEYPRESS",
+        (20, 90),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.8,
+        (0, 0, 0),
+        3,
+        cv2.LINE_AA,
+    )
+
+    if cursor:
+        cv2.line(image, (282, 42), (282, 96), (0, 0, 0), 2)
+
+    if character:
+        cv2.putText(
+            image,
+            "g",
+            (288, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.8,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+
+    if off_line_occlusion:
+        cv2.rectangle(
+            image,
+            (310, 160),
+            (316, 223),
+            (0, 0, 0),
+            -1,
+        )
+
+    return image
+
+
 class TestFastScreenChange(unittest.TestCase):
     def make_model(self):
         baseline = [
@@ -108,6 +148,61 @@ class TestFastScreenChange(unittest.TestCase):
             first.consecutive_frames,
             1,
         )
+
+
+    def test_strong_off_line_occlusion_is_ignored(self):
+        baseline = [
+            make_tall_roi(cursor=False),
+            make_tall_roi(cursor=True),
+            make_tall_roi(cursor=False),
+            make_tall_roi(cursor=True),
+        ]
+
+        model = FastScreenChangeModel.from_baseline_rois(
+            baseline,
+            config=FastScreenChangeConfig(
+                strong_min_novel_pixels=300,
+                strong_min_component_area_px=250,
+                required_consecutive_frames=2,
+            ),
+        )
+
+        self.assertLess(model.line_y1, 160)
+
+        observation = model.observe(
+            make_tall_roi(off_line_occlusion=True)
+        )
+
+        self.assertFalse(observation.changed)
+        self.assertFalse(observation.strong_changed)
+        self.assertFalse(observation.triggered)
+        self.assertEqual(observation.novel_pixels, 0)
+
+    def test_strong_in_line_character_still_triggers_immediately_with_y_gate(self):
+        baseline = [
+            make_tall_roi(cursor=False),
+            make_tall_roi(cursor=True),
+            make_tall_roi(cursor=False),
+            make_tall_roi(cursor=True),
+        ]
+
+        model = FastScreenChangeModel.from_baseline_rois(
+            baseline,
+            config=FastScreenChangeConfig(
+                strong_min_novel_pixels=300,
+                strong_min_component_area_px=250,
+                required_consecutive_frames=2,
+            ),
+        )
+
+        observation = model.observe(
+            make_tall_roi(character=True)
+        )
+
+        self.assertTrue(observation.changed)
+        self.assertTrue(observation.strong_changed)
+        self.assertTrue(observation.triggered)
+        self.assertEqual(observation.consecutive_frames, 1)
 
 
 if __name__ == "__main__":

@@ -48,5 +48,56 @@ class Phase8ReleasedCharacterTests(unittest.TestCase):
         self.assertEqual(result.uncertain_votes, 5)
 
 
+    def test_zero_confidence_wrong_character_is_uncertain_evidence(self):
+        observed = phase8._released_character_for_verdict(
+            "Y",
+            0.0,
+            target="O",
+        )
+        self.assertIsNone(observed)
+
+        result = phase8._vote_released_characters(
+            [observed],
+            target="O",
+        )
+        self.assertEqual(
+            result.status,
+            phase5.ScreenVerificationStatus.UNCERTAIN,
+        )
+
+    def test_zero_confidence_expected_character_is_not_rejected(self):
+        observed = phase8._released_character_for_verdict(
+            "O",
+            0.0,
+            target="O",
+        )
+        self.assertEqual(observed, "O")
+
+    def test_zero_confidence_repeat_of_expected_remains_wrong_evidence(self):
+        observed = phase8._released_character_for_verdict(
+            "QQ",
+            0.0,
+            target="Q",
+        )
+        self.assertEqual(observed, "QQ")
+
+        result = phase8._vote_released_characters(
+            [observed],
+            target="Q",
+        )
+        self.assertEqual(
+            result.status,
+            phase5.ScreenVerificationStatus.CONFIRMED_WRONG,
+        )
+
+    def test_positive_confidence_wrong_character_is_preserved(self):
+        observed = phase8._released_character_for_verdict(
+            "Y",
+            1.0,
+            target="O",
+        )
+        self.assertEqual(observed, "Y")
+
+
 if __name__ == "__main__":
     unittest.main()

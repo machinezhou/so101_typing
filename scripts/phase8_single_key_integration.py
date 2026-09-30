@@ -45,6 +45,9 @@ from so101_typing.control.handoff_endpoint import (
 from so101_typing.control.tool_reference import ToolReferenceCalibration
 from so101_typing.perception.glyph_runtime import RuntimeHOGGlyphRecognizer
 from so101_typing.perception.semantic_target_lock import SemanticTargetLock
+from so101_typing.perception.released_text import (
+    build_temporal_clean_text,
+)
 from so101_typing.perception.wrist_target import (
     observe_glyph_candidates,
     select_target_observation,
@@ -78,6 +81,12 @@ PHASE5_CAPTURE_REFERENCE_THRESHOLD_PX = float(
 HANDOFF_CANDIDATE_MIN_KEYCAPS = 4
 SCREEN_NO_EVENT_CONFIRM_S = 0.35
 SCREEN_NO_EVENT_MIN_FRESH_FRAMES = 4
+
+RELEASED_TEXT_GUARD_S = 0.20
+RELEASED_TEXT_CAPTURE_S = 1.20
+RELEASED_TEXT_MIN_FRESH_FRAMES = 12
+RELEASED_TEXT_PERSISTENCE_FRACTION = 0.70
+RELEASED_TEXT_CROP_MARGIN_PX = 10
 
 # Phase-8 autonomous cumulative-depth fuse.
 #
@@ -286,6 +295,29 @@ def _processor_reset(processor) -> None:
     reset = getattr(processor, "reset", None)
     if callable(reset):
         reset()
+
+
+def _reset_single_key_attempt_state(
+    *,
+    target: str,
+    policy,
+    preprocessor,
+    postprocessor,
+) -> str:
+    """Reset state that must never leak from one key attempt to the next."""
+    normalized = str(target).strip().upper()
+    if normalized not in TARGET_VOCAB[:26]:
+        raise ValueError("single-key attempt target must be A-Z")
+
+    phase5.TARGET = normalized
+    phase5.ACTIVE_SCREEN_WATCHER = None
+    phase5.SEMANTIC_REENTRY_GUARDED = False
+
+    policy.reset()
+    _processor_reset(preprocessor)
+    _processor_reset(postprocessor)
+
+    return normalized
 
 
 def _capture_settled_endpoint(
@@ -571,6 +603,53 @@ def _normalize_released_character(value) -> str | None:
     return text
 
 
+def _released_character_for_verdict(
+    value,
+    confidence,
+    *,
+    target: str,
+) -> str | None:
+    """Convert OCR output into semantic verdict evidence.
+
+    The raw recognizer output is preserved. This function only decides whether
+    that observation is strong enough to support a semantic verdict.
+
+    - expected target observations remain usable even at confidence 0.0;
+      accepted hardware evidence showed correct glyphs can have low confidence.
+    - repeated expected text such as QQ remains explicit WRONG evidence.
+    - a different observation with non-finite or <=0 confidence is too weak
+      to prove WRONG and is downgraded to UNCERTAIN.
+    """
+    observed = _normalize_released_character(value)
+    expected = _normalize_released_character(target)
+
+    if expected is None or len(expected) != 1:
+        raise ValueError(
+            "released-character verdict requires one ASCII alphanumeric target"
+        )
+
+    if observed is None:
+        return None
+
+    if observed == expected:
+        return observed
+
+    if (
+        len(observed) > 1
+        and all(character == expected for character in observed)
+    ):
+        return observed
+
+    confidence_value = float(confidence)
+    if (
+        not math.isfinite(confidence_value)
+        or confidence_value <= 0.0
+    ):
+        return None
+
+    return observed
+
+
 def _vote_released_characters(
     observed_characters: list[str | None],
     *,
@@ -731,69 +810,157 @@ def _capture_released_character_verification(
     after_frame_id: int,
     min_timestamp: float,
     artifact_dir: Path,
+    event_bbox_xywh,
 ):
-    """Classify only the newly appeared character; no fixed prefix is used."""
-    characters: list[str | None] = []
-    records: list[dict] = []
     last_frame_id = int(after_frame_id)
 
     print()
-    print("===== SIDE RELEASED-CHAR VERIFY =====")
+    print("===== SIDE RELEASED-TEXT TEMPORAL VERIFY =====")
 
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    capture_dir = (
+        artifact_dir
+        / f"released_temporal_after_{last_frame_id:06d}"
+    )
+    capture_dir.mkdir(parents=True, exist_ok=False)
 
-    for index in range(1, phase5.SCREEN_EVENT_CHAR_FRAMES + 1):
+    time.sleep(RELEASED_TEXT_GUARD_S)
+    capture_start = time.monotonic()
+    capture_deadline = capture_start + RELEASED_TEXT_CAPTURE_S
+    effective_min_timestamp = max(
+        float(min_timestamp),
+        float(capture_start),
+    )
+
+    post_rois: list[np.ndarray] = []
+    frame_ids: list[int] = []
+
+    while time.monotonic() < capture_deadline:
         frame = phase5.fresh_camera_frame(
             side_camera,
             after_frame_id=last_frame_id,
-            min_timestamp=min_timestamp,
+            min_timestamp=effective_min_timestamp,
         )
         last_frame_id = int(frame.frame_id)
 
         rectified = calibration.rectify(frame.image)
         roi = calibration.crop_text_roi(rectified)
         if roi is None:
-            raise RuntimeError("screen text ROI is missing during event verify")
-
-        crop, change = change_model.extract_novel_crop(roi)
-        raw_character = None
-        confidence = 0.0
-
-        if crop is not None:
-            cv2.imwrite(
-                str(artifact_dir / f"released_char_{index:02d}.png"),
-                crop,
+            raise RuntimeError(
+                "screen text ROI is missing during released-text verification"
             )
-            raw_character, confidence = char_ocr.recognize_characters(crop)
 
-        character = _normalize_released_character(raw_character)
-        characters.append(character)
-        records.append(
-            {
-                "frame_id": int(frame.frame_id),
-                "raw_character": raw_character,
-                "character": character,
-                "confidence": float(confidence),
-                "novel_pixels": int(change.novel_pixels),
-                "max_component_area_px": int(change.max_component_area_px),
-            }
+        post_rois.append(roi.copy())
+        frame_ids.append(int(frame.frame_id))
+
+        roi_path = (
+            capture_dir
+            / f"released_roi_{len(post_rois):03d}_frame_{frame.frame_id}.png"
+        )
+        if not cv2.imwrite(str(roi_path), roi):
+            raise RuntimeError(f"failed to save {roi_path}")
+
+    if len(post_rois) < RELEASED_TEXT_MIN_FRESH_FRAMES:
+        raise RuntimeError(
+            "released-text temporal verification did not collect enough "
+            f"fresh SIDE frames: {len(post_rois)} < "
+            f"{RELEASED_TEXT_MIN_FRESH_FRAMES}"
         )
 
+    clean = build_temporal_clean_text(
+        change_model,
+        post_rois,
+        persistence_fraction=RELEASED_TEXT_PERSISTENCE_FRACTION,
+        crop_margin_px=RELEASED_TEXT_CROP_MARGIN_PX,
+        event_bbox_xywh=event_bbox_xywh,
+    )
+
+    frequency_image = np.clip(
+        clean.frequency * 255.0,
+        0,
+        255,
+    ).astype(np.uint8)
+
+    debug_images = {
+        "temporal_frequency.png": frequency_image,
+        "persistent_mask.png": clean.persistent_mask,
+        "selected_stable_new_text_mask.png": clean.selected_mask,
+        "median_post_roi.png": clean.median_roi,
+        "clean_new_text.png": clean.clean_crop,
+    }
+
+    for name, image in debug_images.items():
+        path = capture_dir / name
+        if not cv2.imwrite(str(path), image):
+            raise RuntimeError(f"failed to save {path}")
+
+    raw_character, confidence = char_ocr.recognize_characters(
+        clean.clean_crop
+    )
+    character = _normalize_released_character(raw_character)
+    verdict_character = _released_character_for_verdict(
+        raw_character,
+        confidence,
+        target=target,
+    )
+
+    if character is not None and verdict_character is None:
         print(
-            f"[SIDE EVENT OCR] {index}/{phase5.SCREEN_EVENT_CHAR_FRAMES} "
-            f"frame={frame.frame_id} char={character!r} "
-            f"conf={confidence:.1f} novel={change.novel_pixels}"
+            "[SIDE OCR GUARD] "
+            f"observation={character!r} "
+            f"conf={confidence:.1f} -> UNCERTAIN; "
+            "insufficient evidence for WRONG"
         )
 
-    result = _vote_released_characters(characters, target=target)
+    result = _vote_released_characters(
+        [verdict_character],
+        target=target,
+    )
 
+    records = [
+        {
+            "evidence_type": "temporal_aggregate",
+            "source_frame_count": len(post_rois),
+            "first_frame_id": int(frame_ids[0]),
+            "last_frame_id": int(frame_ids[-1]),
+            "raw_character": raw_character,
+            "character": character,
+            "verdict_character": verdict_character,
+            "confidence": float(confidence),
+            "persistence_fraction": float(
+                RELEASED_TEXT_PERSISTENCE_FRACTION
+            ),
+            "stable_bbox_xywh": [
+                int(v) for v in clean.stable_bbox_xywh
+            ],
+            "crop_bbox_xywh": [
+                int(v) for v in clean.crop_bbox_xywh
+            ],
+            "components": [
+                dict(component)
+                for component in clean.components
+            ],
+            "recognition_padding_px": int(
+                clean.recognition_padding_px
+            ),
+            "artifact_dir": str(capture_dir),
+        }
+    ]
+
+    print(
+        "[SIDE CLEAN OCR] "
+        f"frames={len(post_rois)} "
+        f"char={character!r} "
+        f"conf={confidence:.1f} "
+        f"components={len(clean.components)} "
+        f"stable_bbox={clean.stable_bbox_xywh} "
+        f"ocr_pad={clean.recognition_padding_px}px"
+    )
     print()
     print(
         "[SIDE EVENT RESULT] "
         f"{result.status} "
-        f"success={result.success_votes}/{result.total_frames} "
-        f"wrong={result.wrong_votes}/{result.total_frames} "
-        f"uncertain={result.uncertain_votes}/{result.total_frames} "
+        f"observation={character!r} "
+        f"verdict_observation={verdict_character!r} "
         f"wrong_char={result.wrong_character}"
     )
 
@@ -1192,6 +1359,7 @@ def _run_full_deterministic_press(
                 ),
                 min_timestamp=last_release_timestamp,
                 artifact_dir=(phase5.ARTIFACT_DIR / "side_event"),
+                event_bbox_xywh=event_details.get("bbox_xywh"),
             )
         )
         screen_records.append(
@@ -1215,6 +1383,7 @@ def _run_full_deterministic_press(
                     after_frame_id=side_frame_id,
                     min_timestamp=last_release_timestamp,
                     artifact_dir=(phase5.ARTIFACT_DIR / "side_event"),
+                    event_bbox_xywh=event_details.get("bbox_xywh"),
                 )
             )
             screen_records.append(
@@ -1286,6 +1455,145 @@ def _run_full_deterministic_press(
     print("saved            :", result_path)
 
     return result
+
+
+def _start_runtime_devices(
+    *,
+    top,
+    wrist,
+    side,
+    robot,
+    home_baseline: dict,
+    screen_calibration,
+    run_dir: Path,
+) -> tuple[list[str], list[str], dict]:
+    """Start cameras, capture the initial SIDE baseline, and connect the robot.
+
+    This is the accepted Phase-8 startup sequence extracted without changing
+    ordering. Session-level resources remain open after this function returns.
+    """
+    top.start()
+    wrist.start()
+    side.start()
+    _wait_initial_frames(top, wrist)
+
+    side_deadline = time.monotonic() + 5.0
+    while time.monotonic() < side_deadline:
+        if side.latest() is not None:
+            break
+        time.sleep(0.02)
+    else:
+        raise RuntimeError("SIDE did not produce an initial frame")
+
+    time.sleep(0.5)
+    print()
+    print("===== DYNAMIC SIDE BASELINE =====")
+    screen_baseline, _ = _capture_dynamic_side_snapshot(
+        side_camera=side,
+        calibration=screen_calibration,
+        run_dir=run_dir,
+    )
+
+    robot.connect()
+    motor_names = list(robot.bus.motors.keys())
+    if len(motor_names) != 6:
+        raise RuntimeError(f"Expected 6 motors, got {motor_names}")
+
+    keys = [_action_key(name) for name in motor_names]
+    missing_home = [key for key in keys if key not in home_baseline]
+    if missing_home:
+        raise RuntimeError(f"Recovery HOME missing keys: {missing_home}")
+
+    expected_order = [
+        "shoulder_pan.pos",
+        "shoulder_lift.pos",
+        "elbow_flex.pos",
+        "wrist_flex.pos",
+        "wrist_roll.pos",
+        "gripper.pos",
+    ]
+    if keys != expected_order:
+        raise RuntimeError(
+            "Follower motor order no longer matches the Phase-6 dataset action order: "
+            f"{keys} != {expected_order}"
+        )
+
+    return motor_names, keys, screen_baseline
+
+
+def _stop_runtime_devices(
+    *,
+    top,
+    wrist,
+    side,
+    robot,
+    original_raise_if_screen_event,
+    original_wait_motion_stable,
+    signal_installed: bool,
+    previous_sigint,
+) -> None:
+    """Stop session-level resources and restore global hooks.
+
+    This preserves the accepted Phase-8 teardown ordering exactly.
+    """
+    phase5.ACTIVE_SCREEN_WATCHER = None
+    top.stop()
+    wrist.stop()
+    side.stop()
+
+    phase5.raise_if_screen_event = original_raise_if_screen_event
+    phase5.wait_motion_stable = original_wait_motion_stable
+    if signal_installed:
+        signal.signal(signal.SIGINT, previous_sigint)
+
+    if robot.is_connected:
+        robot.disconnect()
+
+
+def _restore_canonical_home(
+    *,
+    robot,
+    motor_names: list[str],
+    home_baseline: dict,
+    home_stop: Event,
+) -> dict:
+    """Restore the explicit recovery HOME pose.
+
+    This is a mechanical extraction of the accepted Phase-8 final HOME path.
+    It intentionally preserves the existing synchronize -> restore -> verify
+    ordering and the two operator-stop checks.
+    """
+    home_hold = _synchronize_goal_to_present(
+        robot=robot,
+        motor_names=motor_names,
+        max_sent_diff_deg=STARTUP_SENT_DIFF_DEG,
+    )
+    if home_stop.is_set():
+        raise HomeStop("operator emergency stop during HOME recovery")
+
+    home_restore = _auto_restore_recorded_start(
+        robot=robot,
+        baseline=home_baseline,
+        motor_names=motor_names,
+        step_deg=HOME_STEP_DEG,
+        max_sent_diff_deg=STARTUP_SENT_DIFF_DEG,
+        label="RECOVERY HOME",
+    )
+    home_diff = _verify_home(
+        robot=robot,
+        motor_names=motor_names,
+        home_baseline=home_baseline,
+        max_diff_deg=STARTUP_SENT_DIFF_DEG,
+    )
+    if home_stop.is_set():
+        raise HomeStop("operator emergency stop during HOME verification")
+
+    return {
+        "status": "PASS",
+        "present_hold": home_hold,
+        "restore": home_restore,
+        "final_goal_diff_deg": float(home_diff),
+    }
 
 
 def main() -> None:
@@ -1559,50 +1867,15 @@ def main() -> None:
         )
         print("[AUTO START] camera/baseline checks begin without operator input")
 
-        top.start()
-        wrist.start()
-        side.start()
-        _wait_initial_frames(top, wrist)
-        side_deadline = time.monotonic() + 5.0
-        while time.monotonic() < side_deadline:
-            if side.latest() is not None:
-                break
-            time.sleep(0.02)
-        else:
-            raise RuntimeError("SIDE did not produce an initial frame")
-
-        time.sleep(0.5)
-        print()
-        print("===== DYNAMIC SIDE BASELINE =====")
-        screen_baseline, _ = _capture_dynamic_side_snapshot(
-            side_camera=side,
-            calibration=screen_calibration,
+        motor_names, keys, screen_baseline = _start_runtime_devices(
+            top=top,
+            wrist=wrist,
+            side=side,
+            robot=robot,
+            home_baseline=home_baseline,
+            screen_calibration=screen_calibration,
             run_dir=run_dir,
         )
-
-        robot.connect()
-        motor_names = list(robot.bus.motors.keys())
-        if len(motor_names) != 6:
-            raise RuntimeError(f"Expected 6 motors, got {motor_names}")
-        keys = [_action_key(name) for name in motor_names]
-
-        missing_home = [key for key in keys if key not in home_baseline]
-        if missing_home:
-            raise RuntimeError(f"Recovery HOME missing keys: {missing_home}")
-
-        expected_order = [
-            "shoulder_pan.pos",
-            "shoulder_lift.pos",
-            "elbow_flex.pos",
-            "wrist_flex.pos",
-            "wrist_roll.pos",
-            "gripper.pos",
-        ]
-        if keys != expected_order:
-            raise RuntimeError(
-                "Follower motor order no longer matches the Phase-6 dataset action order: "
-                f"{keys} != {expected_order}"
-            )
 
         signal.signal(signal.SIGINT, on_sigint)
         signal_installed = True
@@ -1634,9 +1907,12 @@ def main() -> None:
             _ = postprocessor(warm_action)
 
         # Important: warmup must not leak a precomputed ACT queue into rollout.
-        policy.reset()
-        _processor_reset(preprocessor)
-        _processor_reset(postprocessor)
+        _reset_single_key_attempt_state(
+            target=target,
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+        )
 
         writer.start()
         writer_started = True
@@ -2615,37 +2891,17 @@ def main() -> None:
 
             else:
                 try:
-                    home_hold = _synchronize_goal_to_present(
-                        robot=robot,
-                        motor_names=motor_names,
-                        max_sent_diff_deg=STARTUP_SENT_DIFF_DEG,
-                    )
-                    if home_stop.is_set():
-                        raise HomeStop("operator emergency stop during HOME recovery")
-
-                    home_restore = _auto_restore_recorded_start(
-                        robot=robot,
-                        baseline=home_baseline,
-                        motor_names=motor_names,
-                        step_deg=HOME_STEP_DEG,
-                        max_sent_diff_deg=STARTUP_SENT_DIFF_DEG,
-                        label="RECOVERY HOME",
-                    )
-                    home_diff = _verify_home(
+                    home_result = _restore_canonical_home(
                         robot=robot,
                         motor_names=motor_names,
                         home_baseline=home_baseline,
-                        max_diff_deg=STARTUP_SENT_DIFF_DEG,
+                        home_stop=home_stop,
                     )
-                    if home_stop.is_set():
-                        raise HomeStop("operator emergency stop during HOME verification")
-                    home_result = {
-                        "status": "PASS",
-                        "present_hold": home_hold,
-                        "restore": home_restore,
-                        "final_goal_diff_deg": float(home_diff),
-                    }
-                    print(f"[HOME RESTORED] final Goal diff={home_diff:.3f}deg")
+                    print(
+                        "[HOME RESTORED] "
+                        f"final Goal diff="
+                        f"{home_result['final_goal_diff_deg']:.3f}deg"
+                    )
 
                 except BaseException as exc:
                     home_result = {
@@ -2662,18 +2918,16 @@ def main() -> None:
                         signal.signal(signal.SIGINT, previous_sigint)
                         signal_installed = False
                     _emergency_hold_until_operator(robot, home_result["error"])
-        phase5.ACTIVE_SCREEN_WATCHER = None
-        top.stop()
-        wrist.stop()
-        side.stop()
-
-        phase5.raise_if_screen_event = original_raise_if_screen_event
-        phase5.wait_motion_stable = original_wait_motion_stable
-        if signal_installed:
-            signal.signal(signal.SIGINT, previous_sigint)
-
-        if robot.is_connected:
-            robot.disconnect()
+        _stop_runtime_devices(
+            top=top,
+            wrist=wrist,
+            side=side,
+            robot=robot,
+            original_raise_if_screen_event=original_raise_if_screen_event,
+            original_wait_motion_stable=original_wait_motion_stable,
+            signal_installed=signal_installed,
+            previous_sigint=previous_sigint,
+        )
 
         if rollout_start is not None and rollout_stop is None:
             rollout_stop = time.perf_counter()
